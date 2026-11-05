@@ -15,7 +15,7 @@ from datetime import datetime
 
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import calculate_dish_nutrition
-from db_history import init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, get_user_history_stats, update_calorie_target
+from db_history import init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, get_user_history_stats, update_calorie_target, update_user_theme
 
 init_user_history_tables()
 
@@ -26,127 +26,207 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Styling Konsep A: Clean Apple Healthtech (Serba Putih Lembut, Hijau Emerald, Kartu Soft Shadow)
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
-    }
-
-    /* Background Utama */
-    .stApp {
-        background-color: #f8fafc;
-    }
-    
-    /* Apple Health Ring Card */
-    .apple-ring-card {
-        background: #ffffff;
-        border-radius: 24px;
-        padding: 1.8rem;
-        box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05), 0 2px 6px -1px rgba(0, 0, 0, 0.02);
-        border: 1px solid #e2e8f0;
-        margin-bottom: 1.5rem;
-    }
-    
-    .ring-title {
-        font-size: 0.88rem;
-        font-weight: 700;
-        color: #64748b;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-    }
-    
-    .ring-val {
-        font-size: 2.3rem;
-        font-weight: 800;
-        color: #0f172a;
-        margin: 0.3rem 0;
-    }
-    
-    .ring-sub {
-        font-size: 0.95rem;
-        color: #64748b;
-    }
-
-    /* Modern Macro Cards (Gaya Apple Health) */
-    .macro-pill {
-        background: #ffffff;
-        border-radius: 20px;
-        padding: 1.2rem 1rem;
-        border: 1px solid #edf2f7;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.03);
-        text-align: center;
-    }
-    .macro-num {
-        font-size: 1.6rem;
-        font-weight: 800;
-        margin: 0.2rem 0;
-    }
-    .macro-lbl {
-        font-size: 0.78rem;
-        font-weight: 700;
-        color: #64748b;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-
-    /* Tip Alert */
-    .apple-tip {
-        background: #f0fdf4;
-        border: 1px solid #bbf7d0;
-        border-left: 5px solid #10b981;
-        border-radius: 14px;
-        padding: 1rem 1.2rem;
-        color: #166534;
-        font-size: 0.93rem;
-        line-height: 1.5;
-        margin: 1.2rem 0;
-    }
-    
-    /* Tab Styling: Super Jelas, Besar & Modern */
-    div[data-baseweb="tab-list"] {
-        gap: 12px;
-        background-color: #e2e8f0;
-        padding: 6px;
-        border-radius: 18px;
-        margin-bottom: 1.5rem;
-    }
-    
-    button[data-baseweb="tab"] {
-        border-radius: 14px !important;
-        font-size: 1.05rem !important;
-        font-weight: 700 !important;
-        padding: 0.75rem 1.6rem !important;
-        color: #475569 !important;
-        background-color: transparent !important;
-        border: none !important;
-        transition: all 0.2s ease !important;
-    }
-    
-    button[data-baseweb="tab"][aria-selected="true"] {
-        background-color: #ffffff !important;
-        color: #0f172a !important;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08) !important;
-    }
-
-    /* Tombol Bersih */
-    .stButton>button {
-        border-radius: 14px;
-        font-weight: 700;
-        padding: 0.6rem 1.4rem;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Sesi Akun Pengguna
+# Inisialisasi Sesi Akun Pengguna Terlebih Dahulu (Agar Tema Tersimpan Dapat Dimuat)
 if "user" not in st.session_state:
     st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
 
 if "nutrition_data" not in st.session_state:
     st.session_state["nutrition_data"] = None
+
+# Deteksi Tema Tersimpan Milik Pengguna
+current_user = st.session_state["user"]
+user_theme = current_user.get("theme_preference") or "System Default"
+
+# Definisi Palet Tema Lengkap & Kontras Tinggi (Font Selalu Terbaca Tajam)
+THEME_STYLES = {
+    "System Default": """
+        /* Ikuti Tema Sistem / Bawaan Browser */
+        .apple-ring-card {
+            background: rgba(125, 125, 125, 0.08);
+            border: 1px solid rgba(125, 125, 125, 0.2);
+            border-radius: 24px;
+            padding: 1.8rem;
+            margin-bottom: 1.5rem;
+        }
+        .macro-pill {
+            background: rgba(125, 125, 125, 0.08);
+            border-radius: 20px;
+            padding: 1.2rem 1rem;
+            border: 1px solid rgba(125, 125, 125, 0.2);
+            text-align: center;
+        }
+        .ring-title, .macro-lbl { color: inherit; opacity: 0.75; font-weight: 700; text-transform: uppercase; font-size: 0.8rem; }
+        .ring-val, .macro-num { font-weight: 800; }
+        div[data-baseweb="tab-list"] {
+            gap: 12px;
+            background-color: rgba(125, 125, 125, 0.15);
+            padding: 6px;
+            border-radius: 18px;
+            margin-bottom: 1.5rem;
+        }
+        button[data-baseweb="tab"] {
+            border-radius: 14px !important;
+            font-size: 1.05rem !important;
+            font-weight: 700 !important;
+            padding: 0.75rem 1.6rem !important;
+            background-color: transparent !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] {
+            background-color: rgba(125, 125, 125, 0.3) !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1) !important;
+        }
+    """,
+    "Apple Light": """
+        .stApp { background-color: #f8fafc; color: #0f172a; }
+        .apple-ring-card {
+            background: #ffffff;
+            border-radius: 24px;
+            padding: 1.8rem;
+            box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
+            border: 1px solid #e2e8f0;
+            margin-bottom: 1.5rem;
+        }
+        .macro-pill {
+            background: #ffffff;
+            border-radius: 20px;
+            padding: 1.2rem 1rem;
+            border: 1px solid #edf2f7;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+            text-align: center;
+        }
+        .ring-title, .macro-lbl { font-size: 0.8rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
+        .ring-val { font-size: 2.3rem; font-weight: 800; color: #0f172a; margin: 0.3rem 0; }
+        .macro-num { font-size: 1.6rem; font-weight: 800; color: #0f172a; margin: 0.2rem 0; }
+        div[data-baseweb="tab-list"] {
+            gap: 12px;
+            background-color: #e2e8f0;
+            padding: 6px;
+            border-radius: 18px;
+            margin-bottom: 1.5rem;
+        }
+        button[data-baseweb="tab"] {
+            border-radius: 14px !important;
+            font-size: 1.05rem !important;
+            font-weight: 700 !important;
+            padding: 0.75rem 1.6rem !important;
+            color: #475569 !important;
+            background-color: transparent !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] {
+            background-color: #ffffff !important;
+            color: #0f172a !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08) !important;
+        }
+    """,
+    "Cal AI Dark": """
+        .stApp { background-color: #090a0f; color: #f8fafc; }
+        .apple-ring-card {
+            background: #131722;
+            border-radius: 24px;
+            padding: 1.8rem;
+            border: 1px solid #232936;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        .macro-pill {
+            background: #131722;
+            border-radius: 20px;
+            padding: 1.2rem 1rem;
+            border: 1px solid #232936;
+            text-align: center;
+        }
+        .ring-title, .macro-lbl { font-size: 0.8rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+        .ring-val { font-size: 2.3rem; font-weight: 800; color: #ffffff; margin: 0.3rem 0; }
+        .macro-num { font-size: 1.6rem; font-weight: 800; color: #ffffff; margin: 0.2rem 0; }
+        div[data-baseweb="tab-list"] {
+            gap: 12px;
+            background-color: #1e2538;
+            padding: 6px;
+            border-radius: 18px;
+            margin-bottom: 1.5rem;
+        }
+        button[data-baseweb="tab"] {
+            border-radius: 14px !important;
+            font-size: 1.05rem !important;
+            font-weight: 700 !important;
+            padding: 0.75rem 1.6rem !important;
+            color: #94a3b8 !important;
+            background-color: transparent !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] {
+            background-color: #00f5a0 !important;
+            color: #090a0f !important;
+            box-shadow: 0 4px 15px rgba(0, 245, 160, 0.3) !important;
+        }
+    """,
+    "Mint Fresh": """
+        .stApp { background-color: #f0fdf4; color: #064e3b; }
+        .apple-ring-card {
+            background: #ffffff;
+            border-radius: 24px;
+            padding: 1.8rem;
+            border: 1px solid #bbf7d0;
+            box-shadow: 0 8px 24px rgba(16, 185, 129, 0.08);
+            margin-bottom: 1.5rem;
+        }
+        .macro-pill {
+            background: #ffffff;
+            border-radius: 20px;
+            padding: 1.2rem 1rem;
+            border: 1px solid #bbf7d0;
+            text-align: center;
+        }
+        .ring-title, .macro-lbl { font-size: 0.8rem; font-weight: 700; color: #059669; text-transform: uppercase; letter-spacing: 0.05em; }
+        .ring-val { font-size: 2.3rem; font-weight: 800; color: #064e3b; margin: 0.3rem 0; }
+        .macro-num { font-size: 1.6rem; font-weight: 800; color: #064e3b; margin: 0.2rem 0; }
+        div[data-baseweb="tab-list"] {
+            gap: 12px;
+            background-color: #dcfce7;
+            padding: 6px;
+            border-radius: 18px;
+            margin-bottom: 1.5rem;
+        }
+        button[data-baseweb="tab"] {
+            border-radius: 14px !important;
+            font-size: 1.05rem !important;
+            font-weight: 700 !important;
+            padding: 0.75rem 1.6rem !important;
+            color: #065f46 !important;
+            background-color: transparent !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] {
+            background-color: #10b981 !important;
+            color: #ffffff !important;
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25) !important;
+        }
+    """
+}
+
+# Terapkan CSS Dinamis Sesuai Preferensi
+st.markdown(f"""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+    html, body, [class*="css"] {{
+        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    }}
+    .apple-tip {{
+        background: rgba(16, 185, 129, 0.12);
+        border: 1px solid rgba(16, 185, 129, 0.3);
+        border-left: 5px solid #10b981;
+        border-radius: 14px;
+        padding: 1rem 1.2rem;
+        font-size: 0.93rem;
+        line-height: 1.5;
+        margin: 1.2rem 0;
+    }}
+    .stButton>button {{
+        border-radius: 14px;
+        font-weight: 700;
+        padding: 0.6rem 1.4rem;
+    }}
+    {THEME_STYLES.get(user_theme, THEME_STYLES["System Default"])}
+</style>
+""", unsafe_allow_html=True)
 
 # Sidebar: Akun Pribadi & Target Harian
 with st.sidebar:
@@ -161,6 +241,18 @@ with st.sidebar:
         st.caption(f"Akun Google: `{current_user['user_id']}`")
     else:
         st.info(f"👤 Pengguna Aktif: **{current_user['display_name']}**")
+
+    # Pengaturan Tema Tampilan (Tersimpan Permanen ke Akun Pengguna)
+    st.markdown("---")
+    st.markdown("### 🎨 **Pilihan Tema Tampilan (UI)**")
+    theme_options = ["System Default", "Apple Light", "Cal AI Dark", "Mint Fresh"]
+    current_idx = theme_options.index(user_theme) if user_theme in theme_options else 0
+    selected_theme = st.selectbox("Pilih Gaya Tampilan:", theme_options, index=current_idx)
+    if selected_theme != user_theme:
+        update_user_theme(current_user["user_id"], selected_theme)
+        st.session_state["user"]["theme_preference"] = selected_theme
+        st.toast(f"Tema diubah ke {selected_theme}!")
+        st.rerun()
         
     with st.expander("🔑 Masuk / Ganti Akun Pribadi"):
         st.markdown("**Opsi 1: Kaitkan Akun Google**")

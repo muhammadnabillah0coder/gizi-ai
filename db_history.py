@@ -13,7 +13,7 @@ def init_user_history_tables():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     
-    # Tabel Pengguna (Mendukung Username & Google Account Email)
+    # Tabel Pengguna (Mendukung Username, Google Email, dan Preferensi Tema UI)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -21,10 +21,16 @@ def init_user_history_tables():
             display_name TEXT,
             avatar_url TEXT,
             auth_provider TEXT DEFAULT 'local', -- 'google' atau 'local'
+            theme_preference TEXT DEFAULT 'Apple Light', -- 'Apple Light', 'Cal AI Dark', 'Mint Fresh'
             daily_calorie_target REAL DEFAULT 2000.0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Migrasi kolom theme_preference jika belum ada
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN theme_preference TEXT DEFAULT 'Apple Light'")
+    except:
+        pass
     
     # Tabel Log Makanan
     cur.execute("""
@@ -74,6 +80,14 @@ def update_calorie_target(user_id: str, target_kcal: float):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("UPDATE users SET daily_calorie_target = ? WHERE user_id = ?", (target_kcal, user_id))
+    conn.commit()
+    conn.close()
+
+def update_user_theme(user_id: str, theme_name: str):
+    """Menyimpan tema pilihan pengguna ke database permanen."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET theme_preference = ? WHERE user_id = ?", (theme_name, user_id))
     conn.commit()
     conn.close()
 
