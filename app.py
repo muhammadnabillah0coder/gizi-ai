@@ -165,10 +165,38 @@ with st.sidebar:
         st.session_state["user"]["daily_calorie_target"] = float(new_target)
         st.toast("Target kalori diperbarui!")
 
-# Navigasi Menu Atas (Clean Tabs)
+# Header Brand Utama dengan Logo Menonjol
+st.markdown("""
+<div style="display: flex; align-items: center; gap: 18px; margin-bottom: 1.5rem; padding: 0.5rem 0;">
+    <div style="
+        font-size: 3.2rem;
+        background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+        width: 76px;
+        height: 76px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 22px;
+        box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.4);
+    ">🥗</div>
+    <div>
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <h1 style="font-size: 2.3rem; font-weight: 800; color: #0f172a; margin: 0; letter-spacing: -0.02em;">Gizi.AI</h1>
+            <span style="background: rgba(16, 185, 129, 0.12); color: #059669; font-size: 0.78rem; font-weight: 800; padding: 0.3rem 0.75rem; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid rgba(16, 185, 129, 0.25);">
+                LAB KEMENKES
+            </span>
+        </div>
+        <p style="margin: 0.15rem 0 0 0; color: #64748b; font-size: 0.98rem; font-weight: 500;">
+            Kalkulator & Diary Nutrisi Makanan Indonesia Berbasis Data Uji Lab Resmi
+        </p>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# Navigasi Menu Atas (Clean Tabs dengan Ikon Jelas)
 tab_diary, tab_scanner = st.tabs([
-    "📈  Dashboard & Rekapan (Hari / Minggu / Bulan)",
-    "🥗  Catat Makanan Baru (Foto & Teks)"
+    "📊  DASHBOARD REKAPAN (HARI / MINGGU / BULAN)",
+    "📸  CATAT MAKANAN BARU (FOTO & TEKS)"
 ])
 
 # Ambil statistik riwayat akun
