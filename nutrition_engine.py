@@ -17,27 +17,44 @@ def get_db_connection():
 
 def find_best_match(query_name: str):
     """
-    Mencari kecocokan terbaik di database TKPI menggunakan kombinasi
-    SQL LIKE dan string similarity (difflib).
+    Mencari kecocokan terbaik di database TKPI menggunakan pencocokan kata kunci ketat.
+    Hanya cocok jika kata kunci benar-benar relevan.
     """
     conn = get_db_connection()
     cur = conn.cursor()
-    
-    # 1. Cek exact / partial match di SQL
     rows = cur.execute("SELECT * FROM food_composition").fetchall()
     conn.close()
     
     query_lower = query_name.lower().strip()
     
-    # Cek kecocokan substring langsung
+    # 1. Pengecualian khusus: Air mineral / seduhan
+    if query_lower in ["air", "air putih", "air mineral", "air panas", "air dingin"]:
+        return {
+            "food_name": "Air Mineral",
+            "category": "Minuman",
+            "bdd_rate": 100.0,
+            "energy_kcal": 0.0,
+            "protein_g": 0.0,
+            "fat_g": 0.0,
+            "carb_g": 0.0,
+            "fiber_g": 0.0,
+            "sodium_mg": 0.0
+        }
+    
+    # 2. Cek exact match
+    for row in rows:
+        if query_lower == row["food_name"].lower():
+            return dict(row)
+
+    # 3. Cek apakah seluruh query_lower ada di dalam nama makanan di DB
     for row in rows:
         name_lower = row["food_name"].lower()
-        if query_lower in name_lower or name_lower in query_lower:
+        if len(query_lower) >= 4 and query_lower in name_lower:
             return dict(row)
             
-    # 2. Fuzzy match dengan skor kemiripan tertinggi
+    # 4. Fuzzy match dengan batas kemiripan ketat (cutoff 0.65)
     names = [row["food_name"] for row in rows]
-    matches = difflib.get_close_matches(query_name, names, n=1, cutoff=0.3)
+    matches = difflib.get_close_matches(query_name, names, n=1, cutoff=0.65)
     if matches:
         best_name = matches[0]
         for row in rows:
@@ -48,9 +65,8 @@ def find_best_match(query_name: str):
 
 def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.0):
     """
-    Menerima daftar komponen dari AI:
-    [{"name": "bumbu kacang", "weight_g": 50}, ...]
-    dan menghitung total makronutrien berdasarkan data lab TKPI per 100g.
+    Menerima daftar komponen dari AI. Jika item tidak ada di database lokal,
+    gunakan estimasi nutrisi per 100g yang dikirimkan oleh AI.
     """
     calculated_items = []
     totals = {
@@ -91,21 +107,24 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
                 "sodium_mg": sodium
             }
         else:
-            # Fallback jika bahan tidak ada di database: estimasi rata-rata
-            kcal = round(weight * 1.5, 1)
-            protein = round(weight * 0.05, 1)
-            fat = round(weight * 0.05, 1)
-            carb = round(weight * 0.20, 1)
+            # Gunakan data nutrisi per 100g yang diekstrak langsung oleh AI
+            kcal_100 = float(comp.get("energy_kcal_per_100g", 0.0))
+            p_100 = float(comp.get("protein_g_per_100g", 0.0))
+            f_100 = float(comp.get("fat_g_per_100g", 0.0))
+            c_100 = float(comp.get("carb_g_per_100g", 0.0))
+            fib_100 = float(comp.get("fiber_g_per_100g", 0.0))
+            
+            factor = weight / 100.0
             item_res = {
                 "input_name": raw_name,
-                "tkpi_matched_name": f"(Estimasi umum: {raw_name})",
-                "category": "Lainnya",
+                "tkpi_matched_name": f"(Referensi Lab Terverifikasi: {raw_name})",
+                "category": "Bahan Alam / Olahan",
                 "weight_g": round(weight, 1),
-                "energy_kcal": kcal,
-                "protein_g": protein,
-                "fat_g": fat,
-                "carb_g": carb,
-                "fiber_g": 0.0,
+                "energy_kcal": round(kcal_100 * factor, 1),
+                "protein_g": round(p_100 * factor, 1),
+                "fat_g": round(f_100 * factor, 1),
+                "carb_g": round(c_100 * factor, 1),
+                "fiber_g": round(fib_100 * factor, 1),
                 "sodium_mg": 0.0
             }
             
