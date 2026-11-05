@@ -43,7 +43,7 @@ def get_gemini_client(api_key: str = None):
         return None
     genai.configure(api_key=key)
     return genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
+        model_name="gemini-3.5-flash-lite",
         system_instruction=SYSTEM_INSTRUCTION,
         generation_config={
             "response_mime_type": "application/json",
