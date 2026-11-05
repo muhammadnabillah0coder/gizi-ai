@@ -23,11 +23,25 @@ st.markdown("""
 Didukung oleh **Google AI Studio (Gemini Flash)** dengan arsitektur **Hybrid Hemat Token**.
 """)
 
-# Sidebar: Pengaturan API Key & Info
+# Ambil API key otomatis dari secrets Streamlit Cloud atau file .env
+configured_api_key = os.environ.get("GEMINI_API_KEY", "")
+if not configured_api_key and hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+    configured_api_key = st.secrets["GEMINI_API_KEY"]
+
+# Sidebar: Info & Pengaturan Lanjutan (Sembunyikan API key jika sudah terpasang)
 with st.sidebar:
-    st.header("⚙️ Konfigurasi")
-    api_key = st.text_input("Google AI Studio API Key:", type="password", value=os.environ.get("GEMINI_API_KEY", ""))
-    st.caption("Dapatkan API Key gratis di [aistudio.google.com](https://aistudio.google.com)")
+    st.header("⚙️ Status Sistem")
+    if configured_api_key:
+        st.success("🟢 AI Engine Siap Digunakan")
+        api_key = configured_api_key
+        with st.expander("Ganti Custom API Key (Opsional)"):
+            custom_key = st.text_input("Ganti API Key:", type="password")
+            if custom_key:
+                api_key = custom_key
+    else:
+        st.warning("⚠️ API Key belum terkonfigurasi")
+        api_key = st.text_input("Google AI Studio API Key:", type="password")
+        st.caption("Dapatkan API Key di [aistudio.google.com](https://aistudio.google.com)")
     
     st.markdown("---")
     st.subheader("📚 Sumber Data Terpercaya")
