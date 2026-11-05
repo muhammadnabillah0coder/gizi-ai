@@ -102,6 +102,17 @@ def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0
     conn.close()
     return True
 
+def delete_meal_log(log_id: int, user_id: str):
+    """
+    Menghapus satu catatan makan berdasarkan ID milik user yang sedang aktif.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM meal_logs WHERE id = ? AND user_id = ?", (log_id, user_id))
+    conn.commit()
+    conn.close()
+    return True
+
 def get_user_history_stats(user_id: str):
     """
     Mengambil rekapan nutrisi:

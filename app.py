@@ -15,7 +15,7 @@ from datetime import datetime
 
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import calculate_dish_nutrition
-from db_history import init_user_history_tables, get_or_create_user, log_meal, get_user_history_stats, update_calorie_target
+from db_history import init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, get_user_history_stats, update_calorie_target
 
 init_user_history_tables()
 
@@ -181,7 +181,7 @@ with st.sidebar:
                 st.session_state["user"] = get_or_create_user(local_user.strip(), auth_provider="local")
                 st.rerun()
 
-    # Target Kalori Harian
+    # Target Kalori Harian & Kalkulator BMR/TDEE Otomatis
     st.markdown("---")
     st.markdown("### 🎯 **Target Kalori Harian**")
     current_target = float(current_user.get("daily_calorie_target") or 2000.0)
@@ -190,6 +190,52 @@ with st.sidebar:
         update_calorie_target(current_user["user_id"], float(new_target))
         st.session_state["user"]["daily_calorie_target"] = float(new_target)
         st.toast("Target kalori diperbarui!")
+        
+    with st.expander("🧮 Hitung Target Ideal (BMR/TDEE)"):
+        st.caption("Hitung target kalori berdasarkan rumus standar Mifflin-St Jeor / Kemenkes RI:")
+        gender = st.radio("Jenis Kelamin:", ["Pria", "Wanita"], horizontal=True)
+        bb = st.number_input("Berat Badan (kg):", value=65.0, step=1.0)
+        tb = st.number_input("Tinggi Badan (cm):", value=170.0, step=1.0)
+        usia = st.number_input("Usia (tahun):", value=25, step=1)
+        aktivitas = st.selectbox("Aktivitas Harian:", [
+            "Sedentari (Jarang olahraga / di depan laptop)",
+            "Ringan (Olahraga 1-3 hari/minggu)",
+            "Sedang (Olahraga 3-5 hari/minggu)",
+            "Sangat Aktif (Latihan intensif setiap hari)"
+        ])
+        tujuan = st.selectbox("Tujuan Program:", [
+            "Turunkan Berat Badan (Defisit 400 kkal)",
+            "Jaga Berat Badan Ideal (Maintenance)",
+            "Tambah Berat / Massa Otot (Surplus 400 kkal)"
+        ])
+        
+        if st.button("Hitung & Terapkan Target", use_container_width=True):
+            # Formula Mifflin - St Jeor
+            if gender == "Pria":
+                bmr = (10 * bb) + (6.25 * tb) - (5 * usia) + 5
+            else:
+                bmr = (10 * bb) + (6.25 * tb) - (5 * usia) - 161
+                
+            mult_map = {
+                "Sedentari (Jarang olahraga / di depan laptop)": 1.2,
+                "Ringan (Olahraga 1-3 hari/minggu)": 1.375,
+                "Sedang (Olahraga 3-5 hari/minggu)": 1.55,
+                "Sangat Aktif (Latihan intensif setiap hari)": 1.725
+            }
+            tdee = bmr * mult_map[aktivitas]
+            
+            if "Turunkan" in tujuan:
+                recom_target = round(tdee - 400.0)
+            elif "Tambah" in tujuan:
+                recom_target = round(tdee + 400.0)
+            else:
+                recom_target = round(tdee)
+                
+            recom_target = max(1200, min(3800, recom_target))
+            update_calorie_target(current_user["user_id"], float(recom_target))
+            st.session_state["user"]["daily_calorie_target"] = float(recom_target)
+            st.success(f"🎯 Target kalori berhasil diatur menjadi **{recom_target} kkal/hari**!")
+            st.rerun()
 
 # Header Brand Utama dengan Logo Menonjol & Kotak Login Akun Langsung di Halaman Utama
 current_user = st.session_state["user"]
@@ -334,22 +380,24 @@ with tab_diary:
         </div>
         """, unsafe_allow_html=True)
 
-    # Riwayat Makan Hari Ini
+    # Riwayat Makan Hari Ini & Tombol Hapus Baris
     st.markdown("### 📝 **Buku Harian Makan Hari Ini**")
     if stats["today_meals"]:
-        diary_rows = []
         for m in stats["today_meals"]:
             time_str = datetime.strptime(m["logged_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M") if " " in m["logged_at"] else m["logged_at"]
-            diary_rows.append({
-                "Jam": time_str,
-                "Nama Makanan": m["dish_name"],
-                "Kalori": f"{m['energy_kcal']} kkal",
-                "Protein": f"{m['protein_g']} g",
-                "Lemak": f"{m['fat_g']} g",
-                "Karbo": f"{m['carb_g']} g",
-                "Keterangan": m["photo_caption"] or "-"
-            })
-        st.dataframe(diary_rows, use_container_width=True, hide_index=True)
+            col_row1, col_row2, col_row3 = st.columns([3, 2, 1], vertical_alignment="center")
+            with col_row1:
+                st.markdown(f"**{m['dish_name']}**")
+                sub_cap = f"_{m['photo_caption']}_" if m['photo_caption'] else ""
+                st.caption(f"🕒 {time_str} {sub_cap}")
+            with col_row2:
+                st.markdown(f"**{m['energy_kcal']} kkal** | P: {m['protein_g']}g | L: {m['fat_g']}g | K: {m['carb_g']}g")
+            with col_row3:
+                if st.button("🗑️ Hapus", key=f"del_{m['id']}", use_container_width=True):
+                    delete_meal_log(m["id"], st.session_state["user"]["user_id"])
+                    st.toast("Catatan makanan berhasil dihapus.")
+                    st.rerun()
+            st.divider()
     else:
         st.caption("Belum ada makanan yang dicatat hari ini.")
 
@@ -360,7 +408,7 @@ with tab_scanner:
     if not api_key and hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
 
-    subtab_foto, subtab_teks = st.tabs(["📸 Ambil / Unggah Foto", "✍️ Tulis Menu Harian"])
+    subtab_foto, subtab_kamera, subtab_teks = st.tabs(["📁 Unggah Foto Galeri", "📸 Jepret Kamera HP", "✍️ Tulis Menu Harian"])
     
     with subtab_foto:
         c_up1, c_up2 = st.columns([1, 1], gap="large")
@@ -387,6 +435,31 @@ with tab_scanner:
                             st.error(f"Gagal memproses gambar: {e}")
             else:
                 st.info("💡 **Tips:** Foto piring makan dari atas agar semua lauk dan sayuran tampak jelas.")
+
+    with subtab_kamera:
+        c_cam1, c_cam2 = st.columns([1, 1], gap="large")
+        with c_cam1:
+            cam_file = st.camera_input("Arahkan kamera ke piring makanan:")
+            if cam_file:
+                im_cam = Image.open(cam_file)
+                cam_caption = st.text_input("💬 Catatan / Keterangan (Opsional):", placeholder="Contoh: Tanpa santan / porsi setengah", key="c_cap")
+            else:
+                cam_caption = ""
+        with c_cam2:
+            if cam_file:
+                st.markdown("#### Foto Terambil!")
+                st.caption("Klik tombol di bawah untuk langsung menghitung gizi dan kalori foto jepretan Anda.")
+                if st.button("🚀 Analisis Jepretan Kamera", type="primary", use_container_width=True, key="btn_cam"):
+                    with st.spinner("Menganalisis foto kamera..."):
+                        try:
+                            res = analyze_food_image(im_cam, caption=cam_caption, api_key=api_key)
+                            res["user_caption"] = cam_caption
+                            st.session_state["nutrition_data"] = res
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Gagal memproses gambar kamera: {e}")
+            else:
+                st.info("📷 **Kamera Langsung:** Fitur ini membuka kamera HP Anda seketika tanpa perlu menyimpan foto ke galeri.")
 
     with subtab_teks:
         t_input = st.text_area("Tuliskan menu makanan:", placeholder="Contoh: 1 piring gado-gado lontong pakai telur rebus dan bumbu kacang", height=100)
