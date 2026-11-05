@@ -32,7 +32,7 @@ def init_user_history_tables():
     except:
         pass
     
-    # Tabel Log Makanan
+    # Tabel Log Makanan (Mendukung Kategori Waktu Makan)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meal_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,9 +45,15 @@ def init_user_history_tables():
             fiber_g REAL NOT NULL,
             portion_multiplier REAL DEFAULT 1.0,
             photo_caption TEXT,
+            meal_type TEXT DEFAULT 'Makan Siang', -- 'Sarapan', 'Makan Siang', 'Makan Malam', 'Camilan'
             logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Migrasi kolom meal_type jika belum ada
+    try:
+        cur.execute("ALTER TABLE meal_logs ADD COLUMN meal_type TEXT DEFAULT 'Makan Siang'")
+    except:
+        pass
     cur.execute("CREATE INDEX IF NOT EXISTS idx_meal_user ON meal_logs(user_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_meal_date ON meal_logs(logged_at)")
     
@@ -91,16 +97,16 @@ def update_user_theme(user_id: str, theme_name: str):
     conn.commit()
     conn.close()
 
-def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0, caption: str = ""):
+def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0, caption: str = "", meal_type: str = "Makan Siang"):
     """
-    Menyimpan satu catatan makan ke buku harian pengguna.
+    Menyimpan satu catatan makan ke buku harian pengguna dengan kategori waktu makan.
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO meal_logs 
-        (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, portion_multiplier, photo_caption)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, portion_multiplier, photo_caption, meal_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id,
         dish_name,
@@ -110,7 +116,8 @@ def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0
         totals.get("carb_g", 0.0),
         totals.get("fiber_g", 0.0),
         multiplier,
-        caption
+        caption,
+        meal_type
     ))
     conn.commit()
     conn.close()

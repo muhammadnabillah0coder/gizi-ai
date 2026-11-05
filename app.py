@@ -12,6 +12,7 @@ import os
 import json
 import pandas as pd
 from datetime import datetime
+import urllib.parse
 
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import calculate_dish_nutrition
@@ -474,22 +475,71 @@ with tab_diary:
 
     # Riwayat Makan Hari Ini & Tombol Hapus Baris
     st.markdown("### 📝 **Buku Harian Makan Hari Ini**")
+    
+    # Tombol Bagikan ke WhatsApp & Ekspor
     if stats["today_meals"]:
+        wa_text = (
+            f"🥗 *Laporan Gizi Harian Saya ({datetime.now().strftime('%d %B %Y')})*\n"
+            f"👤 Akun: {current_user['display_name']}\n"
+            f"🔥 *Total Kalori:* {today_kcal} / {target_kcal:.0f} kkal ({pct_today}%)\n"
+            f"🥩 Protein: {stats['today_totals']['protein_g']}g | 🥑 Lemak: {stats['today_totals']['fat_g']}g | 🍚 Karbo: {stats['today_totals']['carb_g']}g\n\n"
+            f"📋 *Menu Hari Ini:*\n"
+        )
+        for idx, m in enumerate(stats["today_meals"], 1):
+            m_type = m.get("meal_type") or "Makan"
+            wa_text += f"{idx}. [{m_type}] {m['dish_name']} ({m['energy_kcal']} kkal)\n"
+        wa_text += "\nCek & hitung nutrisi makananmu di: https://gizi-ai-idn.streamlit.app"
+        
+        wa_encoded = urllib.parse.quote(wa_text)
+        wa_url = f"https://api.whatsapp.com/send?text={wa_encoded}"
+        
+        col_share1, col_share2 = st.columns([1, 1])
+        with col_share1:
+            st.markdown(f"""
+            <a href="{wa_url}" target="_blank" style="text-decoration: none;">
+                <div style="background-color: #25d366; color: white; padding: 0.55rem 1rem; border-radius: 12px; font-weight: 700; text-align: center; box-shadow: 0 4px 12px rgba(37, 211, 102, 0.25);">
+                    📲 Bagikan Laporan ke WhatsApp
+                </div>
+            </a>
+            """, unsafe_allow_html=True)
+            
+        with col_share2:
+            # Unduh CSV
+            df_export = pd.DataFrame(stats["today_meals"])
+            if not df_export.empty:
+                cols_to_export = [c for c in ["logged_at", "meal_type", "dish_name", "energy_kcal", "protein_g", "fat_g", "carb_g", "fiber_g", "photo_caption"] if c in df_export.columns]
+                csv_data = df_export[cols_to_export].to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Unduh Rekap (CSV/Excel)", data=csv_data, file_name=f"gizi_harian_{datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Kelompokkan per Waktu Makan
+        grouped_meals = {}
         for m in stats["today_meals"]:
-            time_str = datetime.strptime(m["logged_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M") if " " in m["logged_at"] else m["logged_at"]
-            col_row1, col_row2, col_row3 = st.columns([3, 2, 1], vertical_alignment="center")
-            with col_row1:
-                st.markdown(f"**{m['dish_name']}**")
-                sub_cap = f"_{m['photo_caption']}_" if m['photo_caption'] else ""
-                st.caption(f"🕒 {time_str} {sub_cap}")
-            with col_row2:
-                st.markdown(f"**{m['energy_kcal']} kkal** | P: {m['protein_g']}g | L: {m['fat_g']}g | K: {m['carb_g']}g")
-            with col_row3:
-                if st.button("🗑️ Hapus", key=f"del_{m['id']}", use_container_width=True):
-                    delete_meal_log(m["id"], st.session_state["user"]["user_id"])
-                    st.toast("Catatan makanan berhasil dihapus.")
-                    st.rerun()
-            st.divider()
+            mtype = m.get("meal_type") or "Lainnya"
+            if mtype not in grouped_meals:
+                grouped_meals[mtype] = []
+            grouped_meals[mtype].append(m)
+
+        for mtype, meals_in_group in grouped_meals.items():
+            subtotal_kcal = sum(x["energy_kcal"] for x in meals_in_group)
+            st.markdown(f"##### {mtype} <span style='font-size: 0.88rem; color: #10b981; font-weight: 700;'>({subtotal_kcal:,.1f} kkal)</span>", unsafe_allow_html=True)
+            
+            for m in meals_in_group:
+                time_str = datetime.strptime(m["logged_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M") if " " in m["logged_at"] else m["logged_at"]
+                col_row1, col_row2, col_row3 = st.columns([3, 2, 1], vertical_alignment="center")
+                with col_row1:
+                    st.markdown(f"**{m['dish_name']}**")
+                    sub_cap = f"_{m['photo_caption']}_" if m['photo_caption'] else ""
+                    st.caption(f"🕒 {time_str} {sub_cap}")
+                with col_row2:
+                    st.markdown(f"**{m['energy_kcal']} kkal** | P: {m['protein_g']}g | L: {m['fat_g']}g | K: {m['carb_g']}g")
+                with col_row3:
+                    if st.button("🗑️ Hapus", key=f"del_{m['id']}", use_container_width=True):
+                        delete_meal_log(m["id"], st.session_state["user"]["user_id"])
+                        st.toast("Catatan makanan berhasil dihapus.")
+                        st.rerun()
+                st.divider()
     else:
         st.caption("Belum ada makanan yang dicatat hari ini.")
 
@@ -605,6 +655,16 @@ with tab_scanner:
         c3.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#d97706;'>{t_tot['fat_g']}g</div><div class='macro-lbl'>Lemak</div></div>", unsafe_allow_html=True)
         c4.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#059669;'>{t_tot['carb_g']}g</div><div class='macro-lbl'>Karbohidrat</div></div>", unsafe_allow_html=True)
         
+        # Pilihan Kategori Waktu Makan
+        st.markdown("##### 🕒 Waktu Makan:")
+        sel_meal_type = st.radio(
+            "Kategori:",
+            ["🌅 Sarapan", "☀️ Makan Siang", "🌙 Makan Malam", "🥪 Camilan"],
+            horizontal=True,
+            index=1,
+            label_visibility="collapsed"
+        )
+        
         # Tombol Simpan ke Akun Pribadi
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button(f"💾 Simpan ke Buku Harian ({st.session_state['user']['display_name']})", type="primary", use_container_width=True):
@@ -613,8 +673,9 @@ with tab_scanner:
                 dish_name=data.get("dish_name", "Menu Sehat"),
                 totals=t_tot,
                 multiplier=p_mult,
-                caption=data.get("user_caption", "")
+                caption=data.get("user_caption", ""),
+                meal_type=sel_meal_type
             )
-            st.success(f"Berhasil dicatat ke akun {st.session_state['user']['display_name']}! Silakan cek tab Dashboard.")
+            st.success(f"Berhasil dicatat ke sesi {sel_meal_type} akun {st.session_state['user']['display_name']}! Silakan cek tab Dashboard.")
             st.session_state["nutrition_data"] = None
             st.rerun()
