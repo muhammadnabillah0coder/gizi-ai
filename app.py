@@ -178,17 +178,24 @@ with tab_foto:
         if uploaded_file:
             img = Image.open(uploaded_file)
             st.image(img, caption="Preview Foto Makanan", use_container_width=True)
+            photo_caption = st.text_input(
+                "💬 Tambahkan keterangan / catatan (Opsional):",
+                placeholder="Contoh: Tanpa kuah santan / ayamnya bagian dada / bumbu kacang setengah saja",
+                help="Catatan ini membantu AI mendeteksi bahan tersembunyi atau porsi khusus yang tidak terlihat di kamera."
+            )
+        else:
+            photo_caption = ""
     with col_up2:
         if uploaded_file:
             st.markdown("#### Siap Menganalisis?")
-            st.caption("AI akan memindai objek piring, jenis lauk, sayuran, dan bumbu pelengkap.")
+            st.caption("AI akan memadukan visual foto + catatan keteranganmu untuk hasil paling presisi.")
             if st.button("🚀 Analisis Gizi Foto Sekarang", type="primary", use_container_width=True):
                 if not api_key:
                     st.error("Silakan masukkan Google AI Studio API Key terlebih dahulu.")
                 else:
                     with st.spinner("🔍 Memindai foto & mencocokkan ke 1.194 data lab Kemenkes..."):
                         try:
-                            res = analyze_food_image(img, api_key=api_key)
+                            res = analyze_food_image(img, caption=photo_caption, api_key=api_key)
                             st.session_state["nutrition_data"] = res
                             st.rerun()
                         except Exception as e:

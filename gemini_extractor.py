@@ -53,9 +53,9 @@ def get_gemini_client(api_key: str = None):
         }
     )
 
-def analyze_food_image(image_input, api_key: str = None):
+def analyze_food_image(image_input, caption: str = "", api_key: str = None):
     """
-    Menganalisis gambar makanan (PIL Image atau path file)
+    Menganalisis gambar makanan (PIL Image atau path file) beserta caption/keterangan tambahan opsional
     dan mengembalikan struktur JSON bahan & taksiran gram.
     """
     model = get_gemini_client(api_key)
@@ -73,6 +73,9 @@ def analyze_food_image(image_input, api_key: str = None):
         img.thumbnail((max_dim, max_dim))
 
     prompt = "Identifikasi makanan pada foto ini dan berikan taksiran porsi serta berat bahan-bahannya sesuai format JSON."
+    if caption and caption.strip():
+        prompt += f"\nCatatan/keterangan tambahan dari pengguna: '{caption.strip()}' (Gunakan catatan ini untuk memperjelas bahan tersembunyi, bumbu, atau taksiran porsi riil)."
+
     response = model.generate_content([prompt, img])
     
     return json.loads(response.text)
