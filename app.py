@@ -16,7 +16,7 @@ import urllib.parse
 
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import calculate_dish_nutrition
-from db_history import init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, get_user_history_stats, update_calorie_target, update_user_theme
+from db_history import init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, get_user_history_stats, update_calorie_target, update_user_theme, add_custom_food, get_custom_foods, delete_custom_food
 
 init_user_history_tables()
 
@@ -550,7 +550,12 @@ with tab_scanner:
     if not api_key and hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
 
-    subtab_foto, subtab_kamera, subtab_teks = st.tabs(["📁 Unggah Foto Galeri", "📸 Jepret Kamera HP", "✍️ Tulis Menu Harian"])
+    subtab_foto, subtab_kamera, subtab_teks, subtab_manual = st.tabs([
+        "📁 Unggah Foto Galeri", 
+        "📸 Jepret Kamera HP", 
+        "✍️ Tulis Menu Harian", 
+        "➕ Input Manual Sendiri"
+    ])
     
     with subtab_foto:
         c_up1, c_up2 = st.columns([1, 1], gap="large")
@@ -615,6 +620,69 @@ with tab_scanner:
                         st.rerun()
                     except Exception as e:
                         st.error(f"Gagal memproses teks: {e}")
+
+    with subtab_manual:
+        st.markdown("#### ➕ Catat Makanan / Produk Kemasan Sendiri")
+        st.caption("Masukkan informasi dari label gizi kemasan (misal: susu, roti, suplemen) atau resep khusus buatanmu.")
+        
+        col_m1, col_m2 = st.columns([1.5, 1], gap="large")
+        with col_m1:
+            m_food_name = st.text_input("Nama Makanan / Produk:", placeholder="Contoh: Susu Ultra Milk Cokelat 250ml")
+            m_serving = st.text_input("Ukuran Porsi:", placeholder="1 kotak (250ml)")
+            col_nut1, col_nut2 = st.columns(2)
+            with col_nut1:
+                m_kcal = st.number_input("Total Kalori (kkal):", min_value=0.0, value=160.0, step=10.0)
+                m_prot = st.number_input("Protein (gram):", min_value=0.0, value=8.0, step=1.0)
+            with col_nut2:
+                m_fat = st.number_input("Lemak (gram):", min_value=0.0, value=4.0, step=1.0)
+                m_carb = st.number_input("Karbohidrat (gram):", min_value=0.0, value=24.0, step=1.0)
+            
+            m_meal_time = st.selectbox("Waktu Makan:", ["🌅 Sarapan", "☀️ Makan Siang", "🌙 Makan Malam", "🥪 Camilan"], key="sel_manual_time")
+            
+            if st.button("💾 Simpan Langsung ke Diary Hari Ini", type="primary", use_container_width=True):
+                if m_food_name.strip():
+                    log_meal(
+                        user_id=st.session_state["user"]["user_id"],
+                        dish_name=m_food_name.strip(),
+                        totals={"energy_kcal": m_kcal, "protein_g": m_prot, "fat_g": m_fat, "carb_g": m_carb, "fiber_g": 0.0},
+                        multiplier=1.0,
+                        caption=f"Manual Input ({m_serving})",
+                        meal_type=m_meal_time
+                    )
+                    # Simpan juga ke katalog pribadi user
+                    add_custom_food(st.session_state["user"]["user_id"], m_food_name.strip(), m_serving, m_kcal, m_prot, m_fat, m_carb)
+                    st.success(f"Berhasil dicatat ke sesi {m_meal_time}!")
+                    st.rerun()
+                else:
+                    st.warning("Mohon isi nama makanan terlebih dahulu.")
+                    
+        with col_m2:
+            st.markdown("##### 📚 Koleksi Makanan Manual Tersimpan")
+            saved_custom = get_custom_foods(st.session_state["user"]["user_id"])
+            if saved_custom:
+                for c_item in saved_custom:
+                    with st.container(border=True):
+                        st.markdown(f"**{c_item['food_name']}** ({c_item['serving_size']})")
+                        st.caption(f"🔥 {c_item['energy_kcal']} kkal | P: {c_item['protein_g']}g | L: {c_item['fat_g']}g | K: {c_item['carb_g']}g")
+                        col_cbtn1, col_cbtn2 = st.columns([2, 1])
+                        with col_cbtn1:
+                            if st.button("➕ Catat Lagi", key=f"quick_log_{c_item['id']}", use_container_width=True):
+                                log_meal(
+                                    user_id=st.session_state["user"]["user_id"],
+                                    dish_name=c_item["food_name"],
+                                    totals={"energy_kcal": c_item["energy_kcal"], "protein_g": c_item["protein_g"], "fat_g": c_item["fat_g"], "carb_g": c_item["carb_g"], "fiber_g": 0.0},
+                                    multiplier=1.0,
+                                    caption="Koleksi Pribadi",
+                                    meal_type=m_meal_time
+                                )
+                                st.toast(f"Berhasil mencatat {c_item['food_name']}!")
+                                st.rerun()
+                        with col_cbtn2:
+                            if st.button("🗑️", key=f"del_c_{c_item['id']}"):
+                                delete_custom_food(c_item["id"], st.session_state["user"]["user_id"])
+                                st.rerun()
+            else:
+                st.info("Belum ada makanan kustom tersimpan. Makanan yang Anda tambahkan di sebelah kiri akan tersimpan di sini agar bisa dicatat cepat kapan saja tanpa mengetik ulang.")
 
     # HASIL ANALISIS MAKANAN & TOMBOL SIMPAN
     if st.session_state["nutrition_data"]:

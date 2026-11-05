@@ -54,8 +54,21 @@ def init_user_history_tables():
         cur.execute("ALTER TABLE meal_logs ADD COLUMN meal_type TEXT DEFAULT 'Makan Siang'")
     except:
         pass
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_meal_user ON meal_logs(user_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_meal_date ON meal_logs(logged_at)")
+    # Tabel Makanan Kustom Pribadi (Fitur Input Manual User)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS custom_foods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            food_name TEXT NOT NULL,
+            serving_size TEXT DEFAULT '1 porsi',
+            energy_kcal REAL NOT NULL,
+            protein_g REAL DEFAULT 0.0,
+            fat_g REAL DEFAULT 0.0,
+            carb_g REAL DEFAULT 0.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_custom_food_user ON custom_foods(user_id)")
     
     conn.commit()
     conn.close()
@@ -81,6 +94,35 @@ def get_or_create_user(user_id: str, display_name: str = "", auth_provider: str 
     user_dict = dict(row)
     conn.close()
     return user_dict
+
+def add_custom_food(user_id: str, food_name: str, serving_size: str, kcal: float, protein: float, fat: float, carb: float):
+    """Menyimpan makanan manual buatan pengguna sendiri."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO custom_foods (user_id, food_name, serving_size, energy_kcal, protein_g, fat_g, carb_g)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, food_name, serving_size, kcal, protein, fat, carb))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_custom_foods(user_id: str):
+    """Mengambil daftar makanan kustom yang pernah disimpan pengguna."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    rows = cur.execute("SELECT * FROM custom_foods WHERE user_id = ? ORDER BY id DESC", (user_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def delete_custom_food(food_id: int, user_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM custom_foods WHERE id = ? AND user_id = ?", (food_id, user_id))
+    conn.commit()
+    conn.close()
+    return True
 
 def update_calorie_target(user_id: str, target_kcal: float):
     conn = sqlite3.connect(DB_PATH)
