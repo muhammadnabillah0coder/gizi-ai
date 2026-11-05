@@ -1,396 +1,380 @@
 """
-Aplikasi Gizi.AI Modern & Clean UI
-Desain antarmuka bersih, kartu makronutrien visual, progress bar kalori, dan pengalaman mobile-friendly.
+Aplikasi Gizi.AI: Desain Konsep A (Clean Apple Healthtech)
+Mendukung:
+1. Akun Pribadi (Masuk via Akun Google / Username)
+2. Cek Nutrisi Foto & Teks (1.194 Data Lab TKPI Kemenkes RI)
+3. Rekapan Harian, Mingguan, & Bulanan (Apple Health Activity Ring & Charts)
 """
 
 import streamlit as st
 from PIL import Image
 import os
 import json
+import pandas as pd
+from datetime import datetime
 
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import calculate_dish_nutrition
+from db_history import init_user_history_tables, get_or_create_user, log_meal, get_user_history_stats, update_calorie_target
+
+init_user_history_tables()
 
 st.set_page_config(
-    page_title="Gizi.AI - Cek Nutrisi Makanan Cepat & Akurat",
-    page_icon="🥗",
+    page_title="Gizi.AI - Nutrisi Cerdas & Health Diary",
+    page_icon="🍏",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
-# Custom CSS Styling: Modern Cards, Clean Typography, & Gradient Accents
+# Styling Konsep A: Clean Apple Healthtech (Serba Putih Lembut, Hijau Emerald, Kartu Soft Shadow)
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
     
     html, body, [class*="css"] {
-        font-family: 'Plus Jakarta Sans', sans-serif;
-    }
-    
-    /* Header Container */
-    .hero-container {
-        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 20px;
-        padding: 2.2rem 2rem;
-        margin-bottom: 2rem;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
-    }
-    .hero-badge {
-        display: inline-block;
-        background: rgba(16, 185, 129, 0.15);
-        color: #34d399;
-        font-size: 0.82rem;
-        font-weight: 700;
-        padding: 0.35rem 0.85rem;
-        border-radius: 9999px;
-        border: 1px solid rgba(52, 211, 153, 0.3);
-        margin-bottom: 0.8rem;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-    }
-    .hero-title {
-        color: #ffffff;
-        font-size: 2.4rem;
-        font-weight: 800;
-        margin-bottom: 0.5rem;
-        line-height: 1.2;
-    }
-    .hero-subtitle {
-        color: #94a3b8;
-        font-size: 1.05rem;
-        font-weight: 400;
-        max-width: 750px;
-        line-height: 1.6;
-    }
-    
-    /* Macro Cards */
-    .macro-card {
-        background: #1e293b;
-        border-radius: 16px;
-        padding: 1.25rem 1rem;
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        text-align: center;
-        transition: transform 0.2s ease, box-shadow 0.2s ease;
-    }
-    .macro-card:hover {
-        transform: translateY(-3px);
-        box-shadow: 0 8px 20px rgba(0,0,0,0.3);
-    }
-    .macro-icon {
-        font-size: 1.6rem;
-        margin-bottom: 0.3rem;
-    }
-    .macro-val {
-        font-size: 1.7rem;
-        font-weight: 800;
-        color: #f8fafc;
-        margin: 0.2rem 0;
-    }
-    .macro-label {
-        font-size: 0.8rem;
-        font-weight: 600;
-        color: #94a3b8;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-    
-    /* Health Tip Card */
-    .tip-box {
-        background: linear-gradient(135deg, rgba(16, 185, 129, 0.1) 0%, rgba(5, 150, 105, 0.05) 100%);
-        border-left: 4px solid #10b981;
-        border-radius: 12px;
-        padding: 1rem 1.25rem;
-        margin: 1.2rem 0;
-        color: #e2e8f0;
-        font-size: 0.95rem;
-        line-height: 1.5;
+        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
     }
 
-    /* Primary Action Buttons */
-    .stButton>button {
-        border-radius: 12px;
+    /* Background Utama */
+    .stApp {
+        background-color: #f8fafc;
+    }
+    
+    /* Apple Health Ring Card */
+    .apple-ring-card {
+        background: #ffffff;
+        border-radius: 24px;
+        padding: 1.8rem;
+        box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05), 0 2px 6px -1px rgba(0, 0, 0, 0.02);
+        border: 1px solid #e2e8f0;
+        margin-bottom: 1.5rem;
+    }
+    
+    .ring-title {
+        font-size: 0.88rem;
         font-weight: 700;
-        padding: 0.6rem 1.5rem;
-        transition: all 0.2s ease;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+    
+    .ring-val {
+        font-size: 2.3rem;
+        font-weight: 800;
+        color: #0f172a;
+        margin: 0.3rem 0;
+    }
+    
+    .ring-sub {
+        font-size: 0.95rem;
+        color: #64748b;
+    }
+
+    /* Modern Macro Cards (Gaya Apple Health) */
+    .macro-pill {
+        background: #ffffff;
+        border-radius: 20px;
+        padding: 1.2rem 1rem;
+        border: 1px solid #edf2f7;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+        text-align: center;
+    }
+    .macro-num {
+        font-size: 1.6rem;
+        font-weight: 800;
+        margin: 0.2rem 0;
+    }
+    .macro-lbl {
+        font-size: 0.78rem;
+        font-weight: 700;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    /* Tip Alert */
+    .apple-tip {
+        background: #f0fdf4;
+        border: 1px solid #bbf7d0;
+        border-left: 5px solid #10b981;
+        border-radius: 14px;
+        padding: 1rem 1.2rem;
+        color: #166534;
+        font-size: 0.93rem;
+        line-height: 1.5;
+        margin: 1.2rem 0;
+    }
+    
+    /* Tombol Bersih */
+    .stButton>button {
+        border-radius: 14px;
+        font-weight: 700;
+        padding: 0.6rem 1.4rem;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Ambil API key otomatis dari secrets Streamlit Cloud atau file .env
-configured_api_key = os.environ.get("GEMINI_API_KEY", "")
-if not configured_api_key and hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-    configured_api_key = st.secrets["GEMINI_API_KEY"]
+# Sesi Akun Pengguna
+if "user" not in st.session_state:
+    st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
 
-# Sidebar Ringkas & Bersih
-with st.sidebar:
-    st.markdown("### 🥗 **Gizi.AI Control**")
-    if configured_api_key:
-        st.success("🟢 AI Engine Aktif")
-        api_key = configured_api_key
-        with st.expander("Ganti Custom API Key (Opsional)"):
-            custom_key = st.text_input("API Key Baru:", type="password")
-            if custom_key:
-                api_key = custom_key
-    else:
-        st.warning("⚠️ API Key Belum Ditemukan")
-        api_key = st.text_input("Masukkan Google AI Studio API Key:", type="password")
-        st.caption("Dapatkan API Key gratis di [aistudio.google.com](https://aistudio.google.com)")
-
-    st.markdown("---")
-    st.markdown("""
-    **Standar Pangan Terverifikasi:**
-    - 🏛️ **TKPI Kemenkes RI** (1.194 bahan pangan lab)
-    - 📏 **URT Porsi Rumah Tangga Indonesia**
-    - ⚡ **Zero-Token Engine** (Akurasi Matematika 100%)
-    """)
-
-# Hero Banner
-st.markdown("""
-<div class="hero-container">
-    <div class="hero-badge">⚡ Standar Laboratorium Kemenkes RI</div>
-    <div class="hero-title">Hitung Nutrisi Makanan Seketika</div>
-    <div class="hero-subtitle">
-        Cukup foto makanan atau ketik menu harianmu. AI cerdas akan mengenali porsi nusantara dan menghitung kalori serta makronutrien secara akurat tanpa ribet menimbang.
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-# Tabs Input: Foto, Teks, Demo
-tab_foto, tab_teks, tab_demo = st.tabs([
-    "📸  Ambil / Unggah Foto",
-    "✍️  Tulis Menu Makanan",
-    "⚡  Coba Menu Populer (Demo)"
-])
-
-# State penampung hasil analisis
 if "nutrition_data" not in st.session_state:
     st.session_state["nutrition_data"] = None
 
-with tab_foto:
-    col_up1, col_up2 = st.columns([1, 1], gap="large")
-    with col_up1:
-        uploaded_file = st.file_uploader(
-            "Pilih foto makanan dari galeri atau kamera HP:",
-            type=["jpg", "jpeg", "png", "webp"],
-            help="Format JPG, PNG, atau WebP"
-        )
-        if uploaded_file:
-            img = Image.open(uploaded_file)
-            st.image(img, caption="Preview Foto Makanan", use_container_width=True)
-            photo_caption = st.text_input(
-                "💬 Tambahkan keterangan / catatan (Opsional):",
-                placeholder="Contoh: Tanpa kuah santan / ayamnya bagian dada / bumbu kacang setengah saja",
-                help="Catatan ini membantu AI mendeteksi bahan tersembunyi atau porsi khusus yang tidak terlihat di kamera."
-            )
+# Sidebar: Akun Pribadi & Target Harian
+with st.sidebar:
+    st.markdown("### 🍏 **Akun & Profil Gizi**")
+    
+    current_user = st.session_state["user"]
+    is_google = current_user.get("auth_provider") == "google"
+    
+    # Status Login Card
+    if is_google:
+        st.success(f"G Terhubung: **{current_user['display_name']}**")
+        st.caption(f"Akun Google: `{current_user['user_id']}`")
+    else:
+        st.info(f"👤 Pengguna Aktif: **{current_user['display_name']}**")
+        
+    with st.expander("🔑 Masuk / Ganti Akun Pribadi"):
+        st.markdown("**Opsi 1: Kaitkan Akun Google**")
+        google_email = st.text_input("Ketik Email Google Anda:", placeholder="contoh@gmail.com")
+        if st.button("🔗 Masuk dengan Google", use_container_width=True):
+            if "@" in google_email:
+                st.session_state["user"] = get_or_create_user(google_email.strip(), auth_provider="google")
+                st.success("Berhasil masuk dengan akun Google!")
+                st.rerun()
+            else:
+                st.error("Format email tidak valid.")
+                
+        st.markdown("---")
+        st.markdown("**Opsi 2: Masuk via Nama / Username**")
+        local_user = st.text_input("Username:", placeholder="misal: nabillah")
+        if st.button("Ganti Akun", use_container_width=True):
+            if local_user.strip():
+                st.session_state["user"] = get_or_create_user(local_user.strip(), auth_provider="local")
+                st.rerun()
+
+    # Target Kalori Harian
+    st.markdown("---")
+    st.markdown("### 🎯 **Target Kalori Harian**")
+    current_target = float(current_user.get("daily_calorie_target") or 2000.0)
+    new_target = st.number_input("Target Kalori (kkal):", min_value=1000, max_value=4000, value=int(current_target), step=50)
+    if new_target != current_target:
+        update_calorie_target(current_user["user_id"], float(new_target))
+        st.session_state["user"]["daily_calorie_target"] = float(new_target)
+        st.toast("Target kalori diperbarui!")
+
+# Navigasi Menu Atas (Clean Tabs)
+tab_diary, tab_scanner = st.tabs([
+    "📈  Dashboard & Rekapan (Hari / Minggu / Bulan)",
+    "🥗  Catat Makanan Baru (Foto & Teks)"
+])
+
+# Ambil statistik riwayat akun
+stats = get_user_history_stats(st.session_state["user"]["user_id"])
+target_kcal = float(st.session_state["user"].get("daily_calorie_target") or 2000.0)
+today_kcal = stats["today_totals"]["energy_kcal"]
+pct_today = min(round((today_kcal / target_kcal) * 100, 1), 100.0) if target_kcal > 0 else 0
+
+# ================= TAB 1: DASHBOARD REKAPAN KALORI =================
+with tab_diary:
+    # Banner Cincin Aktivitas Kalori Hari Ini (Apple Health Style)
+    st.markdown(f"""
+    <div class="apple-ring-card">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
+            <div>
+                <div class="ring-title">🎯 Cincin Kalori Hari Ini ({datetime.now().strftime('%d %B %Y')})</div>
+                <div class="ring-val">{today_kcal:,.1f} <span style="font-size: 1.1rem; color: #64748b; font-weight: 500;">/ {target_kcal:,.0f} kkal</span></div>
+                <div class="ring-sub">Tercapai <strong>{pct_today}%</strong> • Sisa budget: <strong>{max(0.0, target_kcal - today_kcal):,.1f} kkal</strong></div>
+            </div>
+            <div style="text-align: right; margin-top: 0.5rem;">
+                <span style="background: rgba(16, 185, 129, 0.15); color: #059669; padding: 0.4rem 1rem; border-radius: 9999px; font-weight: 700; font-size: 0.88rem;">
+                    {stats['today_totals']['count']} Menu Tercatat
+                </span>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Progress Bar Lembut
+    st.progress(pct_today / 100.0)
+
+    # 4 Makronutrien Hari Ini
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    with col_m1:
+        st.markdown(f"""
+        <div class="macro-pill">
+            <div class="macro-num" style="color: #0284c7;">{stats['today_totals']['protein_g']}g</div>
+            <div class="macro-lbl">Protein Hari Ini</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_m2:
+        st.markdown(f"""
+        <div class="macro-pill">
+            <div class="macro-num" style="color: #d97706;">{stats['today_totals']['fat_g']}g</div>
+            <div class="macro-lbl">Lemak Hari Ini</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_m3:
+        st.markdown(f"""
+        <div class="macro-pill">
+            <div class="macro-num" style="color: #059669;">{stats['today_totals']['carb_g']}g</div>
+            <div class="macro-lbl">Karbohidrat</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_m4:
+        st.markdown(f"""
+        <div class="macro-pill">
+            <div class="macro-num" style="color: #7c3aed;">{stats['today_totals']['fiber_g']}g</div>
+            <div class="macro-lbl">Serat</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # Pembagian 2 Kolom: Mingguan & Bulanan
+    col_week, col_month = st.columns([1.5, 1], gap="large")
+    
+    with col_week:
+        st.markdown("### 📊 **Tren 7 Hari Terakhir (Mingguan)**")
+        if stats["weekly_data"]:
+            df_week = pd.DataFrame(stats["weekly_data"])
+            df_week["day"] = pd.to_datetime(df_week["day"]).dt.strftime("%a (%d/%m)")
+            st.bar_chart(df_week.set_index("day")["total_kcal"], color="#10b981")
         else:
-            photo_caption = ""
-    with col_up2:
-        if uploaded_file:
-            st.markdown("#### Siap Menganalisis?")
-            st.caption("AI akan memadukan visual foto + catatan keteranganmu untuk hasil paling presisi.")
-            if st.button("🚀 Analisis Gizi Foto Sekarang", type="primary", use_container_width=True):
-                if not api_key:
-                    st.error("Silakan masukkan Google AI Studio API Key terlebih dahulu.")
-                else:
-                    with st.spinner("🔍 Memindai foto & mencocokkan ke 1.194 data lab Kemenkes..."):
+            st.info("Belum ada catatan makan dalam 7 hari terakhir. Mulai catat di tab sebelah!")
+
+    with col_month:
+        st.markdown("### 🗓️ **Rekapan 30 Hari (Bulanan)**")
+        m_data = stats["monthly_summary"]
+        st.markdown(f"""
+        <div class="apple-ring-card">
+            <div class="ring-title">Total Kalori 30 Hari</div>
+            <div class="ring-val" style="color: #0284c7;">{m_data['total_kcal']:,.0f} <span style="font-size: 1rem; color: #64748b; font-weight: 500;">kkal</span></div>
+            <hr style="margin: 0.8rem 0; border: none; border-top: 1px solid #f1f5f9;">
+            <p style="margin: 0.3rem 0; color: #475569;">📅 <strong>Hari Aktif Mencatat:</strong> {m_data['active_days']} hari</p>
+            <p style="margin: 0.3rem 0; color: #475569;">🍽️ <strong>Total Menu Masuk:</strong> {m_data['total_meals']} porsi</p>
+            <p style="margin: 0.3rem 0; color: #475569;">⚡ <strong>Rata-rata Harian:</strong> {(m_data['total_kcal'] / max(1, m_data['active_days'])):,.0f} kkal/hari</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Riwayat Makan Hari Ini
+    st.markdown("### 📝 **Buku Harian Makan Hari Ini**")
+    if stats["today_meals"]:
+        diary_rows = []
+        for m in stats["today_meals"]:
+            time_str = datetime.strptime(m["logged_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M") if " " in m["logged_at"] else m["logged_at"]
+            diary_rows.append({
+                "Jam": time_str,
+                "Nama Makanan": m["dish_name"],
+                "Kalori": f"{m['energy_kcal']} kkal",
+                "Protein": f"{m['protein_g']} g",
+                "Lemak": f"{m['fat_g']} g",
+                "Karbo": f"{m['carb_g']} g",
+                "Keterangan": m["photo_caption"] or "-"
+            })
+        st.dataframe(diary_rows, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Belum ada makanan yang dicatat hari ini.")
+
+# ================= TAB 2: CATAT MAKANAN BARU =================
+with tab_scanner:
+    # Ambil API key otomatis
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key and hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+
+    subtab_foto, subtab_teks = st.tabs(["📸 Ambil / Unggah Foto", "✍️ Tulis Menu Harian"])
+    
+    with subtab_foto:
+        c_up1, c_up2 = st.columns([1, 1], gap="large")
+        with c_up1:
+            up_file = st.file_uploader("Pilih foto makanan:", type=["jpg", "jpeg", "png", "webp"], key="scan_foto")
+            if up_file:
+                im = Image.open(up_file)
+                st.image(im, caption="Foto Makanan", use_container_width=True)
+                p_caption = st.text_input("💬 Catatan / Keterangan (Opsional):", placeholder="Contoh: Bumbu kacang dipisah / ayam tanpa kulit", key="f_cap")
+            else:
+                p_caption = ""
+        with c_up2:
+            if up_file:
+                st.markdown("#### Siap Menganalisis?")
+                st.caption("AI memindai porsi URT & mencocokkan ke 1.194 data laboratorium resmi Kemenkes.")
+                if st.button("🚀 Analisis Gizi Foto", type="primary", use_container_width=True, key="btn_foto"):
+                    with st.spinner("Menganalisis visual foto makanan..."):
                         try:
-                            res = analyze_food_image(img, caption=photo_caption, api_key=api_key)
+                            res = analyze_food_image(im, caption=p_caption, api_key=api_key)
+                            res["user_caption"] = p_caption
                             st.session_state["nutrition_data"] = res
                             st.rerun()
                         except Exception as e:
                             st.error(f"Gagal memproses gambar: {e}")
-        else:
-            st.info("💡 **Tips:** Ambil foto makanan dari sudut agak atas agar seluruh komponen di piring terlihat jelas oleh AI.")
-
-with tab_teks:
-    col_t1, col_t2 = st.columns([1.5, 1], gap="large")
-    with col_t1:
-        text_input = st.text_area(
-            "Apa yang kamu makan hari ini?",
-            placeholder="Contoh: 1 porsi gado-gado lontong pakai telur rebus dan bumbu kacang",
-            height=130
-        )
-        if st.button("Hitung Nutrisi Menu Ini", type="primary", use_container_width=True):
-            if not api_key:
-                st.error("Silakan masukkan Google AI Studio API Key terlebih dahulu.")
-            elif not text_input.strip():
-                st.warning("Silakan ketik menu makanan terlebih dahulu.")
             else:
-                with st.spinner("📊 Menghitung komposisi gizi dan porsi URT..."):
+                st.info("💡 **Tips:** Foto piring makan dari atas agar semua lauk dan sayuran tampak jelas.")
+
+    with subtab_teks:
+        t_input = st.text_area("Tuliskan menu makanan:", placeholder="Contoh: 1 piring gado-gado lontong pakai telur rebus dan bumbu kacang", height=100)
+        if st.button("Hitung Gizi Menu", type="primary", use_container_width=True, key="btn_teks"):
+            if t_input.strip():
+                with st.spinner("Menghitung nilai gizi dari database lab..."):
                     try:
-                        res = analyze_food_text(text_input, api_key=api_key)
+                        res = analyze_food_text(t_input, api_key=api_key)
+                        res["user_caption"] = t_input
                         st.session_state["nutrition_data"] = res
                         st.rerun()
                     except Exception as e:
                         st.error(f"Gagal memproses teks: {e}")
-    with col_t2:
-        st.markdown("""
-        **Contoh penulisan yang akurat:**
-        - *"Nasi putih 1 centong + dada ayam bakar + tahu goreng + sambal"*
-        - *"Kopi hitam tanpa gula 1 cangkir"*
-        - *"1 mangkok bakso sapi komplit pakai mie kuning"*
-        """)
 
-with tab_demo:
-    col_d1, col_d2 = st.columns([1.5, 1], gap="large")
-    with col_d1:
-        st.markdown("#### Uji Coba Cepat Tanpa Mengetik")
-        demo_option = st.selectbox("Pilih menu masakan Indonesia:", [
-            "Gado-Gado Lengkap (Lontong + Telur Rebus + Bumbu Kacang + Kerupuk)",
-            "Nasi Putih + Dada Ayam Bakar + Tahu Goreng + Sambal",
-            "Kopi Hitam Polos Tanpa Gula (1 Cangkir)"
-        ])
-        if st.button("Tampilkan Hasil Gizi Demo", use_container_width=True):
-            if "Gado-Gado" in demo_option:
-                st.session_state["nutrition_data"] = {
-                    "dish_name": "Gado-Gado Lengkap",
-                    "confidence": "high",
-                    "portion_category": "sedang",
-                    "components": [
-                        {"name": "Lontong", "weight_g": 100},
-                        {"name": "Sayuran rebus campur", "weight_g": 120},
-                        {"name": "Tahu goreng", "weight_g": 40},
-                        {"name": "Bumbu kacang gado-gado", "weight_g": 50},
-                        {"name": "Telur ayam rebus", "weight_g": 55},
-                        {"name": "Kerupuk putih kaleng", "weight_g": 15}
-                    ],
-                    "health_tip": "Bumbu kacang merupakan penyumbang kalori dan lemak utama. Kurangi porsi bumbu jika sedang program defisit kalori."
-                }
-            elif "Ayam Bakar" in demo_option:
-                st.session_state["nutrition_data"] = {
-                    "dish_name": "Nasi Ayam Bakar Komplit",
-                    "confidence": "high",
-                    "portion_category": "sedang",
-                    "components": [
-                        {"name": "Nasi putih", "weight_g": 150},
-                        {"name": "Ayam bakar", "weight_g": 80},
-                        {"name": "Tahu goreng", "weight_g": 40},
-                        {"name": "Sambal terasi", "weight_g": 15}
-                    ],
-                    "health_tip": "Pilihan menu tinggi protein yang sangat baik untuk pembentukan otot dan rasa kenyang lebih lama."
-                }
-            else:
-                st.session_state["nutrition_data"] = {
-                    "dish_name": "Kopi Hitam Polos",
-                    "confidence": "high",
-                    "portion_category": "kecil",
-                    "components": [
-                        {"name": "Air Mineral", "weight_g": 150},
-                        {"name": "Kopi hitam polos tanpa gula", "weight_g": 10}
-                    ],
-                    "health_tip": "Kopi hitam tanpa gula kaya antioksidan alami dan praktis nol kalori, sangat cocok saat puasa intermiten."
-                }
-            st.rerun()
-    with col_d2:
-        st.caption("Pilihan di atas menggunakan data baku langsung dari pangkalan data TKPI Kemenkes.")
-
-# SECTION: HASIL ANALISIS NUTRISI
-if st.session_state["nutrition_data"]:
-    data = st.session_state["nutrition_data"]
-    
-    st.markdown("---")
-    
-    # Header Hasil
-    head_col1, head_col2 = st.columns([2, 1])
-    with head_col1:
-        st.markdown(f"## 🍽️ {data.get('dish_name', 'Menu Makanan')}")
-        conf = data.get("confidence", "high").upper()
-        p_cat = data.get("portion_category", "sedang").capitalize()
-        st.caption(f"Tingkat Keyakinan AI: **{conf}** | Porsi Dasar: **{p_cat}**")
-    
-    with head_col2:
-        if st.button("🔄 Reset / Hitung Menu Lain", use_container_width=True):
+    # HASIL ANALISIS MAKANAN & TOMBOL SIMPAN
+    if st.session_state["nutrition_data"]:
+        data = st.session_state["nutrition_data"]
+        st.markdown("---")
+        
+        st.markdown(f"## 🍽️ **{data.get('dish_name', 'Menu Makanan')}**")
+        
+        # Slider Porsi Interaktif
+        st.markdown("##### ⚖️ Sesuaikan Porsi:")
+        p_mult = st.select_slider(
+            "Porsi:",
+            options=[0.7, 1.0, 1.3, 1.5],
+            value=1.0,
+            format_func=lambda x: {
+                0.7: "Porsi Sedikit (~0.7x)",
+                1.0: "Porsi Normal (1.0x)",
+                1.3: "Porsi Agak Banyak (1.3x)",
+                1.5: "Porsi Jumbo (1.5x)"
+            }[x],
+            label_visibility="collapsed"
+        )
+        
+        calc_res = calculate_dish_nutrition(data.get("components", []), portion_multiplier=p_mult)
+        t_tot = calc_res["totals"]
+        
+        if data.get("health_tip"):
+            st.markdown(f"""
+            <div class="apple-tip">
+                💡 <strong>Saran Gizi:</strong> {data['health_tip']}
+            </div>
+            """, unsafe_allow_html=True)
+            
+        # Kartu Makro
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(f"<div class='macro-pill'><div class='macro-num'>{t_tot['energy_kcal']}</div><div class='macro-lbl'>Kalori (kkal)</div></div>", unsafe_allow_html=True)
+        c2.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#0284c7;'>{t_tot['protein_g']}g</div><div class='macro-lbl'>Protein</div></div>", unsafe_allow_html=True)
+        c3.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#d97706;'>{t_tot['fat_g']}g</div><div class='macro-lbl'>Lemak</div></div>", unsafe_allow_html=True)
+        c4.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#059669;'>{t_tot['carb_g']}g</div><div class='macro-lbl'>Karbohidrat</div></div>", unsafe_allow_html=True)
+        
+        # Tombol Simpan ke Akun Pribadi
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button(f"💾 Simpan ke Buku Harian ({st.session_state['user']['display_name']})", type="primary", use_container_width=True):
+            log_meal(
+                user_id=st.session_state["user"]["user_id"],
+                dish_name=data.get("dish_name", "Menu Sehat"),
+                totals=t_tot,
+                multiplier=p_mult,
+                caption=data.get("user_caption", "")
+            )
+            st.success(f"Berhasil dicatat ke akun {st.session_state['user']['display_name']}! Silakan cek tab Dashboard.")
             st.session_state["nutrition_data"] = None
             st.rerun()
-
-    # Slider Porsi Interaktif
-    st.markdown("#### ⚖️ Sesuaikan Porsi yang Kamu Makan")
-    portion_slider = st.select_slider(
-        "Geser untuk menyesuaikan ukuran porsi riil:",
-        options=[0.7, 1.0, 1.3, 1.5],
-        value=1.0,
-        format_func=lambda x: {
-            0.7: "Porsi Sedikit (~0.7x)",
-            1.0: "Porsi Standar (1.0x)",
-            1.3: "Porsi Agak Banyak (1.3x)",
-            1.5: "Porsi Jumbo (1.5x)"
-        }[x],
-        label_visibility="collapsed"
-    )
-
-    # Kalkulasi deterministik dari 1.194 Database Lab TKPI
-    calc_result = calculate_dish_nutrition(data.get("components", []), portion_multiplier=portion_slider)
-    totals = calc_result["totals"]
-
-    # Saran Gizi dari AI
-    if data.get("health_tip"):
-        st.markdown(f"""
-        <div class="tip-box">
-            💡 <strong>Rekomendasi Gizi:</strong> {data['health_tip']}
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Kartu Visual Makronutrien
-    st.markdown("### 📊 Ringkasan Nutrisi")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    
-    with m1:
-        st.markdown(f"""
-        <div class="macro-card">
-            <div class="macro-icon">🔥</div>
-            <div class="macro-val">{totals['energy_kcal']}</div>
-            <div class="macro-label">Kalori (kkal)</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with m2:
-        st.markdown(f"""
-        <div class="macro-card">
-            <div class="macro-icon">🥩</div>
-            <div class="macro-val" style="color: #60a5fa;">{totals['protein_g']}g</div>
-            <div class="macro-label">Protein</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with m3:
-        st.markdown(f"""
-        <div class="macro-card">
-            <div class="macro-icon">🥑</div>
-            <div class="macro-val" style="color: #fbbf24;">{totals['fat_g']}g</div>
-            <div class="macro-label">Lemak</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with m4:
-        st.markdown(f"""
-        <div class="macro-card">
-            <div class="macro-icon">🍚</div>
-            <div class="macro-val" style="color: #34d399;">{totals['carb_g']}g</div>
-            <div class="macro-label">Karbohidrat</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with m5:
-        st.markdown(f"""
-        <div class="macro-card">
-            <div class="macro-icon">🥬</div>
-            <div class="macro-val" style="color: #a78bfa;">{totals['fiber_g']}g</div>
-            <div class="macro-label">Serat</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Tabel Rincian Komponen Bahan
-    st.markdown("### 📋 Rincian Komposisi Bahan & Standar Lab")
-    table_rows = []
-    for it in calc_result["items"]:
-        table_rows.append({
-            "Bahan": it["input_name"],
-            "Referensi Lab TKPI": it["tkpi_matched_name"],
-            "Berat": f"{it['weight_g']} g",
-            "Kalori": f"{it['energy_kcal']} kkal",
-            "Protein": f"{it['protein_g']} g",
-            "Lemak": f"{it['fat_g']} g",
-            "Karbo": f"{it['carb_g']} g"
-        })
-    st.dataframe(table_rows, use_container_width=True, hide_index=True)
