@@ -1,0 +1,18 @@
+# Environment Variables & Secrets
+.env
+.env.local
+
+# Python Cache & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# SQLite Database (optional: comment out jika ingin commit database awal)
+# tkpi_nutrition.db
+
+# OS Artifacts
+.DS_Store
+Thumbs.db
