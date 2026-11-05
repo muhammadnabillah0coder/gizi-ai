@@ -105,6 +105,32 @@ st.markdown("""
         margin: 1.2rem 0;
     }
     
+    /* Tab Styling: Super Jelas, Besar & Modern */
+    div[data-baseweb="tab-list"] {
+        gap: 12px;
+        background-color: #e2e8f0;
+        padding: 6px;
+        border-radius: 18px;
+        margin-bottom: 1.5rem;
+    }
+    
+    button[data-baseweb="tab"] {
+        border-radius: 14px !important;
+        font-size: 1.05rem !important;
+        font-weight: 700 !important;
+        padding: 0.75rem 1.6rem !important;
+        color: #475569 !important;
+        background-color: transparent !important;
+        border: none !important;
+        transition: all 0.2s ease !important;
+    }
+    
+    button[data-baseweb="tab"][aria-selected="true"] {
+        background-color: #ffffff !important;
+        color: #0f172a !important;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08) !important;
+    }
+
     /* Tombol Bersih */
     .stButton>button {
         border-radius: 14px;
@@ -165,33 +191,54 @@ with st.sidebar:
         st.session_state["user"]["daily_calorie_target"] = float(new_target)
         st.toast("Target kalori diperbarui!")
 
-# Header Brand Utama dengan Logo Menonjol
-st.markdown("""
-<div style="display: flex; align-items: center; gap: 18px; margin-bottom: 1.5rem; padding: 0.5rem 0;">
-    <div style="
-        font-size: 3.2rem;
-        background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-        width: 76px;
-        height: 76px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        border-radius: 22px;
-        box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.4);
-    ">🥗</div>
-    <div>
-        <div style="display: flex; align-items: center; gap: 10px;">
-            <h1 style="font-size: 2.3rem; font-weight: 800; color: #0f172a; margin: 0; letter-spacing: -0.02em;">Gizi.AI</h1>
-            <span style="background: rgba(16, 185, 129, 0.12); color: #059669; font-size: 0.78rem; font-weight: 800; padding: 0.3rem 0.75rem; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid rgba(16, 185, 129, 0.25);">
-                LAB KEMENKES
-            </span>
+# Header Brand Utama dengan Logo Menonjol & Kotak Login Akun Langsung di Halaman Utama
+current_user = st.session_state["user"]
+is_google = current_user.get("auth_provider") == "google"
+
+col_head1, col_head2 = st.columns([2, 1.2], vertical_alignment="center")
+
+with col_head1:
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 18px; margin-bottom: 0.5rem; padding: 0.5rem 0;">
+        <div style="
+            font-size: 3.5rem;
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            width: 82px;
+            height: 82px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 24px;
+            box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.4);
+        ">🥗</div>
+        <div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <h1 style="font-size: 2.5rem; font-weight: 800; color: #0f172a; margin: 0; letter-spacing: -0.02em;">Gizi.AI</h1>
+                <span style="background: rgba(16, 185, 129, 0.12); color: #059669; font-size: 0.8rem; font-weight: 800; padding: 0.35rem 0.8rem; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid rgba(16, 185, 129, 0.25);">
+                    LAB KEMENKES
+                </span>
+            </div>
+            <p style="margin: 0.2rem 0 0 0; color: #64748b; font-size: 1.05rem; font-weight: 500;">
+                Kalkulator & Diary Nutrisi Makanan Indonesia Berbasis Data Uji Lab Resmi
+            </p>
         </div>
-        <p style="margin: 0.15rem 0 0 0; color: #64748b; font-size: 0.98rem; font-weight: 500;">
-            Kalkulator & Diary Nutrisi Makanan Indonesia Berbasis Data Uji Lab Resmi
-        </p>
     </div>
-</div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
+
+with col_head2:
+    with st.container(border=True):
+        st.markdown(f"👤 **Akun Aktif:** `{current_user['display_name']}`")
+        with st.popover("🔑 Masuk Akun Google / Username", use_container_width=True):
+            st.markdown("##### 🔗 Kaitkan Email Google Anda")
+            in_email = st.text_input("Email Google / Gmail:", placeholder="nama@gmail.com", key="pop_email")
+            if st.button("Simpan & Masuk Akun Ini", type="primary", use_container_width=True, key="pop_btn"):
+                if "@" in in_email:
+                    st.session_state["user"] = get_or_create_user(in_email.strip(), auth_provider="google")
+                    st.rerun()
+                elif in_email.strip():
+                    st.session_state["user"] = get_or_create_user(in_email.strip(), auth_provider="local")
+                    st.rerun()
+            st.caption("Data makanan harian Anda tersimpan permanen dan terikat pada email ini.")
 
 # Navigasi Menu Atas (Clean Tabs dengan Ikon Jelas)
 tab_diary, tab_scanner = st.tabs([
