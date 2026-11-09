@@ -611,12 +611,17 @@ with tab_scanner:
     with subtab_teks:
         t_input = st.text_area("Tuliskan menu makanan:", placeholder="Contoh: 1 piring gado-gado lontong pakai telur rebus dan bumbu kacang", height=100)
         if st.button("Hitung Gizi Menu", type="primary", use_container_width=True, key="btn_teks"):
-            if t_input.strip():
+            if not api_key:
+                st.error("⚠️ API Key belum terkonfigurasi. Silakan periksa pengaturan di sidebar atau secrets.")
+            elif not t_input.strip():
+                st.warning("Silakan tulis menu makanan terlebih dahulu.")
+            else:
                 with st.spinner("Menghitung nilai gizi dari database lab..."):
                     try:
                         res = analyze_food_text(t_input, api_key=api_key)
                         res["user_caption"] = t_input
                         st.session_state["nutrition_data"] = res
+                        st.toast("✅ Analisis berhasil! Gulir ke bawah untuk melihat hasil.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Gagal memproses teks: {e}")
@@ -723,6 +728,21 @@ with tab_scanner:
         c3.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#d97706;'>{t_tot['fat_g']}g</div><div class='macro-lbl'>Lemak</div></div>", unsafe_allow_html=True)
         c4.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#059669;'>{t_tot['carb_g']}g</div><div class='macro-lbl'>Karbohidrat</div></div>", unsafe_allow_html=True)
         
+        # Tabel Rincian Bahan Terdeteksi
+        st.markdown("##### 📋 Rincian Komposisi Bahan & Standar Lab")
+        table_rows = []
+        for it in calc_res["items"]:
+            table_rows.append({
+                "Bahan": it["input_name"],
+                "Referensi Lab": it["tkpi_matched_name"],
+                "Berat": f"{it['weight_g']} g",
+                "Kalori": f"{it['energy_kcal']} kkal",
+                "Protein": f"{it['protein_g']} g",
+                "Lemak": f"{it['fat_g']} g",
+                "Karbo": f"{it['carb_g']} g"
+            })
+        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+
         # Pilihan Kategori Waktu Makan
         st.markdown("##### 🕒 Waktu Makan:")
         sel_meal_type = st.radio(
@@ -733,17 +753,22 @@ with tab_scanner:
             label_visibility="collapsed"
         )
         
-        # Tombol Simpan ke Akun Pribadi
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button(f"💾 Simpan ke Buku Harian ({st.session_state['user']['display_name']})", type="primary", use_container_width=True):
-            log_meal(
-                user_id=st.session_state["user"]["user_id"],
-                dish_name=data.get("dish_name", "Menu Sehat"),
-                totals=t_tot,
-                multiplier=p_mult,
-                caption=data.get("user_caption", ""),
-                meal_type=sel_meal_type
-            )
-            st.success(f"Berhasil dicatat ke sesi {sel_meal_type} akun {st.session_state['user']['display_name']}! Silakan cek tab Dashboard.")
-            st.session_state["nutrition_data"] = None
-            st.rerun()
+        # Tombol Simpan ke Akun Pribadi & Tombol Batal
+        col_act1, col_act2 = st.columns([3, 1])
+        with col_act1:
+            if st.button(f"💾 Simpan ke Buku Harian ({st.session_state['user']['display_name']})", type="primary", use_container_width=True):
+                log_meal(
+                    user_id=st.session_state["user"]["user_id"],
+                    dish_name=data.get("dish_name", "Menu Sehat"),
+                    totals=t_tot,
+                    multiplier=p_mult,
+                    caption=data.get("user_caption", ""),
+                    meal_type=sel_meal_type
+                )
+                st.success(f"Berhasil dicatat ke sesi {sel_meal_type} akun {st.session_state['user']['display_name']}! Silakan cek tab Dashboard.")
+                st.session_state["nutrition_data"] = None
+                st.rerun()
+        with col_act2:
+            if st.button("❌ Batal / Bersihkan", use_container_width=True):
+                st.session_state["nutrition_data"] = None
+                st.rerun()
