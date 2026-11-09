@@ -37,11 +37,11 @@ st.set_page_config(
 auth_code = st.query_params.get("code", "")
 if auth_code:
     # Deteksi URL saat ini untuk redirect URI
-    redirect_uri = "https://gizi-ai-idn.streamlit.app"
+    redirect_uri = "https://nutrisi-cerdas.streamlit.app"
     user_info = exchange_code_for_user(auth_code, redirect_uri)
     if not user_info:
-        # Coba redirect URI lokal jika di localhost
-        user_info = exchange_code_for_user(auth_code, "http://localhost:8501")
+        # Coba fallback ke URL lama atau localhost jika masih transisi
+        user_info = exchange_code_for_user(auth_code, "https://gizi-ai-idn.streamlit.app") or exchange_code_for_user(auth_code, "http://localhost:8501")
         
     if user_info and user_info.get("email"):
         email = user_info["email"]
@@ -404,8 +404,8 @@ with col_head2:
         with c_acc1:
             with st.popover("🔑 Masuk Akun", use_container_width=True):
                 st.markdown("##### 🌐 Masuk Otomatis Google")
-                # URL OAuth resmi Google
-                oauth_redirect = "https://gizi-ai-idn.streamlit.app"
+                # URL OAuth resmi Google (disesuaikan dengan domain baru nutrisi-cerdas)
+                oauth_redirect = "https://nutrisi-cerdas.streamlit.app"
                 google_auth_url = get_google_auth_url(oauth_redirect)
                 
                 st.markdown(f"""
