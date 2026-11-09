@@ -38,10 +38,12 @@ auth_code = st.query_params.get("code", "")
 if auth_code:
     # Deteksi URL saat ini untuk redirect URI
     redirect_uri = "https://nutrisi-cerdas.streamlit.app"
-    user_info = exchange_code_for_user(auth_code, redirect_uri)
+    user_info, err_details = exchange_code_for_user(auth_code, redirect_uri)
     if not user_info:
         # Coba fallback ke URL lama atau localhost jika masih transisi
-        user_info = exchange_code_for_user(auth_code, "https://gizi-ai-idn.streamlit.app") or exchange_code_for_user(auth_code, "http://localhost:8501")
+        user_info, err_details = exchange_code_for_user(auth_code, "https://gizi-ai-idn.streamlit.app")
+        if not user_info:
+            user_info, err_details = exchange_code_for_user(auth_code, "http://localhost:8501")
         
     if user_info and user_info.get("email"):
         email = user_info["email"]
@@ -54,7 +56,8 @@ if auth_code:
         st.toast(f"Selamat datang, {name}! Akun Google Anda berhasil terhubung.")
         st.rerun()
     else:
-        st.error("⚠️ Gagal memverifikasi login Google. Pastikan Client ID & Secret sudah dimasukkan ke Streamlit Secrets dan Redirect URI di Google Cloud cocok dengan https://nutrisi-cerdas.streamlit.app")
+        st.error(f"⚠️ Gagal memverifikasi login Google: {err_details}")
+        st.caption("Tips: Pastikan Redirect URI di Google Cloud Console persis `https://nutrisi-cerdas.streamlit.app` dan Client ID/Secret sudah ada di Secrets.")
 
 # Inisialisasi Sesi Akun Pengguna Terlebih Dahulu (Agar Akun & Tema Tersimpan Permanen di Browser)
 saved_user_param = st.query_params.get("u", "")

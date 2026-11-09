@@ -50,7 +50,7 @@ def exchange_code_for_user(code: str, redirect_uri: str):
     """
     client_id, client_secret = get_credentials()
     if not client_id or not client_secret:
-        return None
+        return None, "CLIENT_ID atau CLIENT_SECRET belum diset di Streamlit Secrets"
         
     token_url = "https://oauth2.googleapis.com/token"
     data = {
@@ -67,8 +67,8 @@ def exchange_code_for_user(code: str, redirect_uri: str):
         
         access_token = res_json.get("access_token")
         if not access_token:
-            print(f"[OAuth Error] No access token returned: {res_json}")
-            return None
+            err_msg = res_json.get("error_description") or res_json.get("error") or str(res_json)
+            return None, f"Google Token Error: {err_msg}"
             
         userinfo_url = "https://www.googleapis.com/oauth2/v2/userinfo"
         headers = {"Authorization": f"Bearer {access_token}"}
@@ -80,7 +80,6 @@ def exchange_code_for_user(code: str, redirect_uri: str):
             "name": user_info.get("name"),
             "picture": user_info.get("picture"),
             "verified_email": user_info.get("verified_email", False)
-        }
+        }, None
     except Exception as e:
-        print(f"[OAuth Error] Failed to fetch user info: {e}")
-        return None
+        return None, f"Exception: {str(e)}"
