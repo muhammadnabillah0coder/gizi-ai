@@ -921,7 +921,14 @@ with tab_diary:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Kelompokkan per Waktu Makan
+        # Kelompokkan per Waktu Makan Terstruktur
+        MEAL_ORDER = [
+            ("Sarapan", "🌅 Sarapan Pagi"),
+            ("Makan Siang", "☀️ Makan Siang"),
+            ("Makan Malam", "🌙 Makan Malam"),
+            ("Camilan", "🍪 Camilan & Minuman"),
+        ]
+        
         grouped_meals = {}
         for m in stats["today_meals"]:
             mtype = m.get("meal_type") or "Lainnya"
@@ -929,27 +936,56 @@ with tab_diary:
                 grouped_meals[mtype] = []
             grouped_meals[mtype].append(m)
 
-        for mtype, meals_in_group in grouped_meals.items():
+        # Urutan tampil logis: Sarapan -> Siang -> Malam -> Camilan -> Lainnya
+        ordered_keys = [k for k, _ in MEAL_ORDER if k in grouped_meals]
+        for k in grouped_meals:
+            if k not in ordered_keys:
+                ordered_keys.append(k)
+
+        for mtype in ordered_keys:
+            meals_in_group = grouped_meals[mtype]
             subtotal_kcal = sum(x["energy_kcal"] for x in meals_in_group)
-            st.markdown(f"##### {mtype} <span style='font-size: 0.88rem; color: #10b981; font-weight: 700;'>({subtotal_kcal:,.1f} kkal)</span>", unsafe_allow_html=True)
+            subtotal_p = sum(x["protein_g"] for x in meals_in_group)
+            subtotal_f = sum(x["fat_g"] for x in meals_in_group)
+            subtotal_c = sum(x["carb_g"] for x in meals_in_group)
             
-            for m in meals_in_group:
-                time_str = datetime.strptime(m["logged_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M") if " " in m["logged_at"] else m["logged_at"]
-                col_row1, col_row2, col_row3 = st.columns([3, 2, 1], vertical_alignment="center")
-                with col_row1:
-                    st.markdown(f"**{m['dish_name']}**")
-                    sub_cap = f"_{m['photo_caption']}_" if m['photo_caption'] else ""
-                    st.caption(f"🕒 {time_str} {sub_cap}")
-                with col_row2:
-                    st.markdown(f"**{m['energy_kcal']} kkal** | P: {m['protein_g']}g | L: {m['fat_g']}g | K: {m['carb_g']}g")
-                with col_row3:
-                    if st.button("🗑️ Hapus", key=f"del_{m['id']}", use_container_width=True):
-                        delete_meal_log(m["id"], st.session_state["user"]["user_id"])
-                        st.toast("Catatan makanan berhasil dihapus.")
-                        st.rerun()
-                st.divider()
+            label_display = dict(MEAL_ORDER).get(mtype, f"🍽️ {mtype}")
+
+            with st.container(border=True):
+                c_mhead1, c_mhead2 = st.columns([2, 1], vertical_alignment="center")
+                with c_mhead1:
+                    st.markdown(f"#### **{label_display}**")
+                with c_mhead2:
+                    st.markdown(f"<div style='text-align: right; font-weight: 800; font-size: 1.05rem; color: #10b981;'>{subtotal_kcal:,.1f} kkal</div>", unsafe_allow_html=True)
+                    st.caption(f"<div style='text-align: right;'>P: {subtotal_p:.1f}g • L: {subtotal_f:.1f}g • K: {subtotal_c:.1f}g</div>", unsafe_allow_html=True)
+
+                st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
+
+                for m in meals_in_group:
+                    time_str = datetime.strptime(m["logged_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M") if " " in m["logged_at"] else m["logged_at"]
+                    col_row1, col_row2, col_row3 = st.columns([3, 2.2, 0.8], vertical_alignment="center")
+                    with col_row1:
+                        st.markdown(f"**{m['dish_name']}**")
+                        sub_cap = f"_{m['photo_caption']}_" if m['photo_caption'] else ""
+                        st.caption(f"🕒 {time_str} {sub_cap}")
+                    with col_row2:
+                        st.markdown(f"**{m['energy_kcal']} kkal**")
+                        st.caption(f"P: {m['protein_g']}g • L: {m['fat_g']}g • K: {m['carb_g']}g")
+                    with col_row3:
+                        if st.button("🗑️", key=f"del_{m['id']}", help="Hapus menu ini", use_container_width=True):
+                            delete_meal_log(m["id"], st.session_state["user"]["user_id"])
+                            st.toast("Catatan makanan berhasil dihapus.")
+                            st.rerun()
     else:
-        st.caption("Belum ada makanan yang dicatat hari ini.")
+        st.markdown("""
+        <div style="background: rgba(125, 125, 125, 0.05); border: 1.5px dashed rgba(125, 125, 125, 0.2); border-radius: 18px; padding: 2rem 1rem; text-align: center; margin: 1.5rem 0;">
+            <div style="font-size: 2.5rem; margin-bottom: 0.5rem;">🥗</div>
+            <div style="font-weight: 700; font-size: 1.05rem; margin-bottom: 0.3rem;">Buku Harian Masih Kosong Hari Ini</div>
+            <div style="font-size: 0.88rem; opacity: 0.75; max-width: 450px; margin: 0 auto;">
+                Gunakan kotak <strong>Catat Cepat</strong> di atas atau buka tab <strong>📸 Catat Makan</strong> untuk memotret makananmu dan melacak kalori secara akurat.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
 # ================= TAB 2: CATAT MAKANAN BARU =================
 with tab_scanner:
