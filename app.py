@@ -22,6 +22,7 @@ from db_history import (
     add_custom_food, get_custom_foods, delete_custom_food,
     get_user_scan_status, record_scan_usage, activate_pro_tier
 )
+from google_auth import get_google_auth_url, exchange_code_for_user
 
 init_user_history_tables()
 
@@ -32,8 +33,28 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Tangani Redirect Google OAuth Callback (?code=...)
+auth_code = st.query_params.get("code", "")
+if auth_code:
+    # Deteksi URL saat ini untuk redirect URI
+    redirect_uri = "https://gizi-ai-idn.streamlit.app"
+    user_info = exchange_code_for_user(auth_code, redirect_uri)
+    if not user_info:
+        # Coba redirect URI lokal jika di localhost
+        user_info = exchange_code_for_user(auth_code, "http://localhost:8501")
+        
+    if user_info and user_info.get("email"):
+        email = user_info["email"]
+        name = user_info.get("name") or email.split("@")[0]
+        u = get_or_create_user(email, display_name=name, auth_provider="google")
+        st.session_state["user"] = u
+        st.query_params.clear()
+        st.query_params["u"] = email
+        st.query_params["auth"] = "google"
+        st.toast(f"Selamat datang, {name}! Akun Google Anda berhasil terhubung.")
+        st.rerun()
+
 # Inisialisasi Sesi Akun Pengguna Terlebih Dahulu (Agar Akun & Tema Tersimpan Permanen di Browser)
-# Kita periksa query_params di URL browser untuk auto-login saat refresh/buka kembali tab
 saved_user_param = st.query_params.get("u", "")
 saved_auth_param = st.query_params.get("auth", "local")
 
@@ -405,9 +426,39 @@ with col_head2:
         c_acc1, c_acc2 = st.columns([1, 1])
         with c_acc1:
             with st.popover("🔑 Masuk Akun", use_container_width=True):
-                st.markdown("##### 🔗 Tautkan Akun Google / Email")
-                in_email = st.text_input("Email Google / Gmail:", placeholder="nama@gmail.com", key="pop_email")
-                if st.button("Simpan & Masuk", type="primary", use_container_width=True, key="pop_btn"):
+                st.markdown("##### 🌐 Masuk Otomatis Google")
+                # URL OAuth resmi Google
+                oauth_redirect = "https://gizi-ai-idn.streamlit.app"
+                google_auth_url = get_google_auth_url(oauth_redirect)
+                
+                st.markdown(f"""
+                <a href="{google_auth_url}" target="_self" style="text-decoration: none;">
+                    <div style="
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        gap: 10px;
+                        background-color: #ffffff;
+                        color: #1f2937;
+                        border: 1px solid #d1d5db;
+                        border-radius: 12px;
+                        padding: 0.6rem 1rem;
+                        font-weight: 700;
+                        font-size: 0.95rem;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.06);
+                        cursor: pointer;
+                        margin-bottom: 0.8rem;
+                    ">
+                        <img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" width="22" height="22" alt="Google">
+                        Sign in with Google
+                    </div>
+                </a>
+                """, unsafe_allow_html=True)
+                
+                st.markdown("---")
+                st.caption("Atau masukkan email / nama secara manual:")
+                in_email = st.text_input("Email Google / Username:", placeholder="nama@gmail.com", key="pop_email")
+                if st.button("Simpan & Masuk Manual", type="secondary", use_container_width=True, key="pop_btn"):
                     if "@" in in_email:
                         u = get_or_create_user(in_email.strip(), auth_provider="google")
                         st.session_state["user"] = u
@@ -420,7 +471,7 @@ with col_head2:
                         st.query_params["u"] = u["user_id"]
                         st.query_params["auth"] = "local"
                         st.rerun()
-                st.caption("Data makanan harian Anda tersimpan permanen dan terikat pada email ini.")
+                st.caption("Data makanan harian Anda tersimpan permanen dan terikat pada profil ini.")
         
         with c_acc2:
             with st.popover("⚡ Upgrade PRO", use_container_width=True):
