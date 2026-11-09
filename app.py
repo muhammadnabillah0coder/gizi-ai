@@ -664,12 +664,12 @@ if current_user["user_id"] == "Tamu (Demo)":
                         else:
                             st.error(f"❌ {res}")
 
-# Navigasi Menu Atas (Clean Tabs dengan Ikon Jelas)
+# Navigasi Menu Atas (Mobile-Friendly, Ringkas, & Modern)
 tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([
-    "📊  DASHBOARD REKAPAN (HARI / MINGGU / BULAN)",
-    "📸  CATAT MAKANAN BARU (FOTO & TEKS)",
-    "📚  SUMBER DATA & ENSIKLOPEDIA NUTRISI",
-    "📖  PANDUAN PENGGUNAAN"
+    "📊 Dashboard",
+    "📸 Catat Makan",
+    "📚 Ensiklopedia",
+    "📖 Panduan"
 ])
 
 # Ambil statistik riwayat akun
