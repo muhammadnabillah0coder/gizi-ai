@@ -702,7 +702,7 @@ with tab_scanner:
         with c_up2:
             if up_file:
                 st.markdown("#### Siap Menganalisis?")
-                st.caption("AI memindai porsi URT & mencocokkan ke 1.194 data laboratorium resmi Kemenkes.")
+                st.caption("AI memindai porsi URT & mencocokkan ke 1.300+ data laboratorium resmi TKPI Kemenkes & produk ritel.")
                 
                 if not scan_status["can_scan"]:
                     st.warning("⚠️ **Batas Scan Harian Free Tercapai (3/3).**")
@@ -964,12 +964,12 @@ with tab_sources:
         """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("### 🔍 **Pencarian Terbuka Pangkalan Data Laboratorium (1.271 Item)**")
+    st.markdown("### 🔍 **Pencarian Terbuka Pangkalan Data Laboratorium & Ritel (1.300+ Item)**")
     st.caption("Cari bahan makanan atau menu masakan apapun di database lokal untuk melihat profil nutrisi per 100 gram:")
 
     col_q1, col_q2 = st.columns([2, 1])
     with col_q1:
-        search_query = st.text_input("Ketik nama makanan:", placeholder="Contoh: ayam, nasi, telur, tempe, kopi, kangkung", key="kb_search")
+        search_query = st.text_input("Ketik nama makanan:", placeholder="Contoh: ayam, nasi, telur, ultra milk, indomie, fitbar", key="kb_search")
     with col_q2:
         # Ambil daftar kategori unik
         import sqlite3
@@ -1010,7 +1010,7 @@ with tab_sources:
                 "Natrium (mg)": r[7]
             })
         st.dataframe(table_kb, use_container_width=True, hide_index=True)
-        st.caption(f"Menampilkan {len(results)} hasil teratas dari total 1.271 entri laboratorium.")
+        st.caption(f"Menampilkan {len(results)} hasil teratas dari total 1.301 entri pangan terverifikasi.")
     else:
         st.info("Tidak ada bahan makanan yang cocok dengan kata kunci tersebut. Coba kata kunci lain.")
 
