@@ -451,25 +451,36 @@ with col_head2:
                 st.caption("Data makanan harian Anda tersimpan permanen dan terikat pada profil ini.")
         
         with c_acc2:
-            with st.popover("⚡ Upgrade PRO", use_container_width=True):
-                st.markdown("### 👑 **Nutrisi AI PRO**")
-                st.markdown("""
-                **Cuma Rp 19.000 / bulan** *(Jauh lebih hemat dari kompetitor!)*
-                - 🚀 **Scan Foto Makanan Sepuasnya (Unlimited)**
-                - 🤖 **Auto-Learning AI Prioritas**
-                - 📊 **Export Laporan Gizi Lengkap**
-                """)
-                st.info("💳 **Pembayaran Instan:** QRIS / GoPay / OVO / ShopeePay / BCA")
-                if st.button("✨ Aktifkan Uji Coba PRO Sekarang", type="primary", use_container_width=True):
-                    activate_pro_tier(current_user["user_id"], days=30)
-                    st.toast("Selamat! Akun Anda aktif sebagai PRO selama 30 hari!")
-                    st.rerun()
+            with st.popover("⚡ Upgrade / Status PRO", use_container_width=True):
+                st.markdown("### 👑 **Nutrisi Cerdas PRO**")
+                
+                if scan_status["is_pro"]:
+                    if is_admin:
+                        st.success("🌟 **Status: FOUNDER / ADMIN (Seumur Hidup)**")
+                        st.caption("Akses semua fitur tanpa batas kuota selamanya.")
+                    else:
+                        st.success(f"🎉 **Status: PRO Aktif** (Sisa ~{scan_status['days_left']} hari)")
+                        st.caption("Scan foto makanan tanpa batas dan riwayat lengkap aktif.")
+                else:
+                    st.markdown("""
+                    **Cuma Rp 19.000 / bulan** *(Jauh lebih hemat dari kompetitor!)*
+                    - 🚀 **Scan Foto Makanan Sepuasnya (Unlimited)**
+                    - 🤖 **Auto-Learning AI Prioritas**
+                    - 📊 **Export Laporan Gizi Lengkap**
+                    """)
+                    st.info("🎁 **Spesial Peluncuran:** Coba gratis 30 Hari penuh!")
+                    if st.button("✨ Klaim Uji Coba Gratis 1 Bulan PRO", type="primary", use_container_width=True):
+                        activate_pro_tier(current_user["user_id"], days=30)
+                        st.toast("Selamat! Uji Coba Gratis 1 Bulan PRO Anda sudah aktif!")
+                        st.rerun()
+                    st.caption("💳 Nanti setelah 30 hari, perpanjangan sangat murah: Rp 19rb via QRIS/GoPay/BCA.")
 
 # Navigasi Menu Atas (Clean Tabs dengan Ikon Jelas)
-tab_diary, tab_scanner, tab_sources = st.tabs([
+tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([
     "📊  DASHBOARD REKAPAN (HARI / MINGGU / BULAN)",
     "📸  CATAT MAKANAN BARU (FOTO & TEKS)",
-    "📚  SUMBER DATA & ENSIKLOPEDIA GIZI"
+    "📚  SUMBER DATA & ENSIKLOPEDIA GIZI",
+    "📖  PANDUAN PENGGUNAAN"
 ])
 
 # Ambil statistik riwayat akun
@@ -968,3 +979,63 @@ with tab_sources:
         st.caption(f"Menampilkan {len(results)} hasil teratas dari total 1.271 entri laboratorium.")
     else:
         st.info("Tidak ada bahan makanan yang cocok dengan kata kunci tersebut. Coba kata kunci lain.")
+
+# ================= TAB 4: PANDUAN PENGGUNAAN STEP BY STEP =================
+with tab_guide:
+    st.markdown("""
+    <div style="padding: 1rem 0 1.5rem 0;">
+        <h2 style="font-size: 1.8rem; font-weight: 800; margin: 0 0 0.5rem 0;">📖 Panduan Lengkap Penggunaan Nutrisi Cerdas</h2>
+        <p style="opacity: 0.8; font-size: 1.05rem;">
+            Pelajari cara memanfaatkan fitur pencatatan kalori, kalkulator defisit/surplus, dan diary gizi harian secara maksimal.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_g1, col_g2 = st.columns([1, 1], gap="large")
+
+    with col_g1:
+        with st.container(border=True):
+            st.markdown("### 1️⃣ **Mulai & Amankan Akun Anda**")
+            st.markdown("""
+            * **Langkah 1:** Klik tombol **'🔑 Masuk Akun'** di sudut kanan atas.
+            * **Langkah 2:** Klik tombol putih **'Sign in with Google'** untuk menghubungkan akun Gmail Anda, atau ketik nama Anda.
+            * **Keuntungan:** Semua riwayat makan, grafik mingguan, dan target kalori Anda akan tersimpan permanen dan tidak akan hilang saat browser ditutup.
+            """)
+
+        with st.container(border=True):
+            st.markdown("### 2️⃣ **Atur Target Kalori Harian (BMR/TDEE)**")
+            st.markdown("""
+            * **Langkah 1:** Buka panel samping (Sidebar) di sebelah kiri layar HP/Laptop.
+            * **Langkah 2:** Buka menu **'🧮 Hitung Target Ideal (BMR/TDEE)'**.
+            * **Langkah 3:** Masukkan berat badan, tinggi badan, usia, dan tujuan program Anda (Turunkan Berat Badan / Jaga Berat Badan / Naikkan Massa Otot).
+            * **Langkah 4:** Klik **'Gunakan Target Ini'**, maka Cincin Kalori di Dashboard akan otomatis menyesuaikan!
+            """)
+
+    with col_g2:
+        with st.container(border=True):
+            st.markdown("### 3️⃣ **Mencatat Makanan Harian (3 Cara Mudah)**")
+            st.markdown("""
+            Masuk ke tab **'📸 CATAT MAKANAN BARU'**:
+            * **Cara A (Jepret Kamera HP):** Arahkan kamera langsung ke piring makananmu, lalu klik *'Analisis Jepretan Kamera'*.
+            * **Cara B (Unggah Foto Galeri):** Pilih foto makanan dari galeri HP Anda.
+            * **Cara C (Tulis Teks Bebas):** Ketik apa saja yang Anda makan (misal: *'1 piring nasi padang rendang dan daun singkong'*).
+            * **Simpan ke Diary:** Di bawah hasil analisa, pilih waktu makan (Sarapan/Makan Siang/Makan Malam) lalu klik **'💾 Simpan ke Buku Harian'**.
+            """)
+
+        with st.container(border=True):
+            st.markdown("### 4️⃣ **Evaluasi Tren & Pola Makan Anda**")
+            st.markdown("""
+            * Buka tab **'📊 DASHBOARD REKAPAN'** untuk melihat:
+              * **Cincin Aktivitas Kalori Hari Ini** (berapa sisa kuota kalori Anda).
+              * **Grafik Tren 7 Hari & 30 Hari** (mendeteksi hari di mana Anda makan berlebih).
+              * **Tombol Bagikan ke WhatsApp** untuk mengirim laporan diet harian ke pelatih, teman, atau keluarga!
+            """)
+
+    st.markdown("---")
+    st.markdown("### 💡 **Pertanyaan Umum (FAQ)**")
+    with st.expander("❓ Apakah data makanan saya aman dan privat?"):
+        st.write("Ya, data riwayat makanan Anda hanya terikat pada akun Google atau username Anda sendiri dan tidak dapat diakses oleh publik.")
+    with st.expander("❓ Bagaimana cara kerja kuota scan foto makanan?"):
+        st.write("Pengguna Free mendapatkan 3x scan foto kamera/galeri setiap hari secara gratis. Pencarian database lab dan pencatatan via teks bersifat 100% tanpa batas selamanya. Anda bisa mengklaim 30 Hari Gratis PRO untuk menikmati scan foto tanpa batas.")
+    with st.expander("❓ Dari mana data kalori dan nutrisi ini diambil?"):
+        st.write("Data nutrisi kami 100% berbasis Tabel Komposisi Pangan Indonesia (TKPI) resmi Kementerian Kesehatan RI, USDA FoodData Central, dan NilaiGizi.")

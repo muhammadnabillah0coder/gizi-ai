@@ -185,6 +185,7 @@ def update_user_theme(user_id: str, theme_name: str):
 def get_user_scan_status(user_id: str):
     """
     Memeriksa kuota scan foto harian user (3x gratis per hari untuk Free member, unlimited untuk Pro).
+    Juga memeriksa apakah masa aktif PRO masih berlaku.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -193,13 +194,33 @@ def get_user_scan_status(user_id: str):
     conn.close()
     
     if not user:
-        return {"tier": "free", "scans_today": 0, "max_scans": 3, "can_scan": True, "is_pro": False}
+        return {"tier": "free", "scans_today": 0, "max_scans": 3, "can_scan": True, "is_pro": False, "days_left": 0}
         
     u_dict = dict(user)
     is_admin = is_admin_user(user_id)
-    tier = "pro" if is_admin else (u_dict.get("subscription_tier") or "free")
-    is_pro = (tier == "pro" or is_admin)
+    tier = u_dict.get("subscription_tier") or "free"
+    pro_until_str = u_dict.get("pro_until")
     
+    is_pro = False
+    days_left = 0
+    if is_admin:
+        is_pro = True
+        tier = "pro"
+        days_left = 9999
+    elif tier == "pro" and pro_until_str:
+        try:
+            expiry_dt = datetime.strptime(pro_until_str, "%Y-%m-%d %H:%M:%S")
+            now_dt = datetime.now()
+            if expiry_dt > now_dt:
+                is_pro = True
+                days_left = max(1, (expiry_dt - now_dt).days)
+            else:
+                # Masa trial/pro habis, kembalikan ke free
+                is_pro = False
+                tier = "free"
+        except:
+            is_pro = True
+            
     today_str = datetime.now().strftime("%Y-%m-%d")
     last_date = u_dict.get("last_scan_date")
     scans_today = u_dict.get("daily_scans_count") or 0
@@ -214,7 +235,8 @@ def get_user_scan_status(user_id: str):
         "scans_today": scans_today,
         "max_scans": 9999 if is_pro else 3,
         "can_scan": can_scan,
-        "is_pro": is_pro
+        "is_pro": is_pro,
+        "days_left": days_left
     }
 
 def record_scan_usage(user_id: str):
