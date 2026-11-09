@@ -27,7 +27,7 @@ from google_auth import get_google_auth_url, exchange_code_for_user
 init_user_history_tables()
 
 st.set_page_config(
-    page_title="Nutrisi AI - Pahami Pola Makanmu Berbasis TKPI Kemenkes",
+    page_title="Nutrisi Cerdas - Pahami Pola Makanmu Berbasis TKPI Kemenkes",
     page_icon="🥗",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -374,7 +374,7 @@ with col_head1:
         ">🥗</div>
         <div>
             <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-                <h1 style="font-size: 2.6rem; font-weight: 800; margin: 0; letter-spacing: -0.02em;">Nutrisi AI</h1>
+                <h1 style="font-size: 2.6rem; font-weight: 800; margin: 0; letter-spacing: -0.02em;">Nutrisi Cerdas</h1>
                 <span style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.8rem; font-weight: 800; padding: 0.35rem 0.8rem; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid rgba(16, 185, 129, 0.3);">
                     DATA RESMI TKPI KEMENKES
                 </span>
