@@ -276,7 +276,7 @@ st.markdown(f"""
 
 # Sidebar: Akun Pribadi & Target Harian
 with st.sidebar:
-    st.markdown("### 🍏 **Akun & Profil Gizi**")
+    st.markdown("### 🥗 **Akun & Profil Nutrisi**")
     
     current_user = st.session_state["user"]
     is_google = current_user.get("auth_provider") == "google"
@@ -483,7 +483,7 @@ with col_head2:
 tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([
     "📊  DASHBOARD REKAPAN (HARI / MINGGU / BULAN)",
     "📸  CATAT MAKANAN BARU (FOTO & TEKS)",
-    "📚  SUMBER DATA & ENSIKLOPEDIA GIZI",
+    "📚  SUMBER DATA & ENSIKLOPEDIA NUTRISI",
     "📖  PANDUAN PENGGUNAAN"
 ])
 
@@ -581,7 +581,7 @@ with tab_diary:
     # Tombol Bagikan ke WhatsApp & Ekspor
     if stats["today_meals"]:
         wa_text = (
-            f"🥗 *Laporan Gizi Harian Saya ({datetime.now().strftime('%d %B %Y')})*\n"
+            f"🥗 *Laporan Nutrisi Harian Saya ({datetime.now().strftime('%d %B %Y')})*\n"
             f"👤 Akun: {current_user['display_name']}\n"
             f"🔥 *Total Kalori:* {today_kcal} / {target_kcal:.0f} kkal ({pct_today}%)\n"
             f"🥩 Protein: {stats['today_totals']['protein_g']}g | 🥑 Lemak: {stats['today_totals']['fat_g']}g | 🍚 Karbo: {stats['today_totals']['carb_g']}g\n\n"
@@ -590,7 +590,7 @@ with tab_diary:
         for idx, m in enumerate(stats["today_meals"], 1):
             m_type = m.get("meal_type") or "Makan"
             wa_text += f"{idx}. [{m_type}] {m['dish_name']} ({m['energy_kcal']} kkal)\n"
-        wa_text += "\nCek & hitung nutrisi makananmu di: https://gizi-ai-idn.streamlit.app"
+        wa_text += "\nCek & hitung nutrisi makananmu di: https://nutrisi-cerdas.streamlit.app"
         
         wa_encoded = urllib.parse.quote(wa_text)
         wa_url = f"https://api.whatsapp.com/send?text={wa_encoded}"
@@ -611,7 +611,7 @@ with tab_diary:
             if not df_export.empty:
                 cols_to_export = [c for c in ["logged_at", "meal_type", "dish_name", "energy_kcal", "protein_g", "fat_g", "carb_g", "fiber_g", "photo_caption"] if c in df_export.columns]
                 csv_data = df_export[cols_to_export].to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Unduh Rekap (CSV/Excel)", data=csv_data, file_name=f"gizi_harian_{datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
+                st.download_button("📥 Unduh Rekap (CSV/Excel)", data=csv_data, file_name=f"nutrisi_harian_{datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -682,7 +682,7 @@ with tab_scanner:
                         st.toast("Akun PRO aktif! Silakan scan kembali.")
                         st.rerun()
                 else:
-                    if st.button("🚀 Analisis Gizi Foto", type="primary", use_container_width=True, key="btn_foto"):
+                    if st.button("🚀 Analisis Nutrisi Foto", type="primary", use_container_width=True, key="btn_foto"):
                         with st.spinner("Menganalisis visual foto makanan..."):
                             try:
                                 res = analyze_food_image(im, caption=p_caption, api_key=api_key)
@@ -707,7 +707,7 @@ with tab_scanner:
         with c_cam2:
             if cam_file:
                 st.markdown("#### Foto Terambil!")
-                st.caption("Klik tombol di bawah untuk langsung menghitung gizi dan kalori foto jepretan Anda.")
+                st.caption("Klik tombol di bawah untuk langsung menghitung nutrisi dan kalori foto jepretan Anda.")
                 
                 if not scan_status["can_scan"]:
                     st.warning("⚠️ **Batas Scan Harian Free Tercapai (3/3).**")
@@ -732,13 +732,13 @@ with tab_scanner:
 
     with subtab_teks:
         t_input = st.text_area("Tuliskan menu makanan:", placeholder="Contoh: 1 piring gado-gado lontong pakai telur rebus dan bumbu kacang", height=100)
-        if st.button("Hitung Gizi Menu", type="primary", use_container_width=True, key="btn_teks"):
+        if st.button("Hitung Nutrisi Menu", type="primary", use_container_width=True, key="btn_teks"):
             if not api_key:
                 st.error("⚠️ API Key belum terkonfigurasi. Silakan periksa pengaturan di sidebar atau secrets.")
             elif not t_input.strip():
                 st.warning("Silakan tulis menu makanan terlebih dahulu.")
             else:
-                with st.spinner("Menghitung nilai gizi dari database lab..."):
+                with st.spinner("Menghitung nilai nutrisi dari database lab..."):
                     try:
                         res = analyze_food_text(t_input, api_key=api_key)
                         res["user_caption"] = t_input
@@ -839,7 +839,7 @@ with tab_scanner:
         if data.get("health_tip"):
             st.markdown(f"""
             <div class="apple-tip">
-                💡 <strong>Saran Gizi:</strong> {data['health_tip']}
+                💡 <strong>Saran Nutrisi:</strong> {data['health_tip']}
             </div>
             """, unsafe_allow_html=True)
             
@@ -895,10 +895,10 @@ with tab_scanner:
                 st.session_state["nutrition_data"] = None
                 st.rerun()
 
-# ================= TAB 3: SUMBER DATA & ENSIKLOPEDIA GIZI =================
+# ================= TAB 3: SUMBER DATA & ENSIKLOPEDIA NUTRISI =================
 with tab_sources:
     st.markdown("## 📚 **Pusat Rujukan & Sumber Data Nutrisi Resmi**")
-    st.caption("Seluruh kalkulasi nilai gizi pada sistem Gizi.AI berpatokan 100% pada data uji laboratorium ilmiah dan resmi pemerintah, bukan estimasi fiksi.")
+    st.caption("Seluruh kalkulasi nilai nutrisi pada sistem Nutrisi Cerdas berpatokan 100% pada data uji laboratorium ilmiah dan resmi pemerintah, bukan estimasi fiksi.")
 
     # 3 Kartu Lembaga Sumber Resmi
     col_s1, col_s2, col_s3 = st.columns(3)
@@ -935,7 +935,7 @@ with tab_sources:
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("### 🔍 **Pencarian Terbuka Pangkalan Data Laboratorium (1.271 Item)**")
-    st.caption("Cari bahan makanan atau menu masakan apapun di database lokal untuk melihat profil gizi per 100 gram:")
+    st.caption("Cari bahan makanan atau menu masakan apapun di database lokal untuk melihat profil nutrisi per 100 gram:")
 
     col_q1, col_q2 = st.columns([2, 1])
     with col_q1:
