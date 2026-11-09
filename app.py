@@ -380,11 +380,11 @@ with col_head1:
             <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
                 <h1 style="font-size: 2.6rem; font-weight: 800; margin: 0; letter-spacing: -0.02em;">Nutrisi Cerdas</h1>
                 <span style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.8rem; font-weight: 800; padding: 0.35rem 0.8rem; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid rgba(16, 185, 129, 0.3);">
-                    DATA RESMI TKPI KEMENKES
+                    BASIS TKPI KEMENKES + USDA • PORSI ESTIMASI AI
                 </span>
             </div>
             <p style="margin: 0.2rem 0 0 0; opacity: 0.8; font-size: 1.05rem; font-weight: 500;">
-                Kalkulator & Diary Nutrisi: Pahami Pola Makanmu Berbasis Data Uji Lab Pangan
+                Kalkulator & Diary Nutrisi: Pahami Pola Makanmu Berbasis Rujukan Pangan Terverifikasi
             </p>
         </div>
     </div>
@@ -406,58 +406,58 @@ with col_head2:
         
         c_acc1, c_acc2 = st.columns([1, 1])
         with c_acc1:
-            with st.popover("🔑 Masuk Akun", use_container_width=True):
-                st.markdown("##### 🌐 Masuk Otomatis Google")
-                # URL OAuth resmi Google (disesuaikan dengan domain baru nutrisi-cerdas)
-                oauth_redirect = "https://nutrisi-cerdas.streamlit.app"
-                google_auth_url = get_google_auth_url(oauth_redirect)
+            with st.popover("🔑 Masuk / Daftar Akun", use_container_width=True):
+                sub_login, sub_reg = st.tabs(["🔐 Masuk", "📝 Buat Akun Baru"])
                 
-                from google_auth import get_credentials
-                cid, csec = get_credentials()
-                if not cid or not csec:
-                    st.warning("⚠️ **OAuth Belum Aktif:** Kunci Google Client ID / Secret belum terbaca di Streamlit Secrets. Silakan masuk manual dengan email di bawah.")
-                else:
-                    st.markdown(f"""
-                    <a href="{google_auth_url}" target="_self" style="text-decoration: none;">
-                        <div style="
-                            display: flex;
-                            align-items: center;
-                            justify-content: center;
-                            gap: 10px;
-                            background-color: #ffffff;
-                            color: #1f2937;
-                            border: 1px solid #d1d5db;
-                            border-radius: 12px;
-                            padding: 0.6rem 1rem;
-                            font-weight: 700;
-                            font-size: 0.95rem;
-                            box-shadow: 0 2px 4px rgba(0,0,0,0.06);
-                            cursor: pointer;
-                            margin-bottom: 0.8rem;
-                        ">
-                            <img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" width="22" height="22" alt="Google">
-                            Sign in with Google
-                        </div>
-                    </a>
-                    """, unsafe_allow_html=True)
-                
-                st.markdown("---")
-                st.caption("Atau masukkan email / nama secara manual:")
-                in_email = st.text_input("Email Google / Username:", placeholder="nama@gmail.com", key="pop_email")
-                if st.button("Simpan & Masuk Manual", type="secondary", use_container_width=True, key="pop_btn"):
-                    if "@" in in_email:
-                        u = get_or_create_user(in_email.strip(), auth_provider="google")
-                        st.session_state["user"] = u
-                        st.query_params["u"] = u["user_id"]
-                        st.query_params["auth"] = "google"
-                        st.rerun()
-                    elif in_email.strip():
-                        u = get_or_create_user(in_email.strip(), auth_provider="local")
-                        st.session_state["user"] = u
-                        st.query_params["u"] = u["user_id"]
-                        st.query_params["auth"] = "local"
-                        st.rerun()
-                st.caption("Data makanan harian Anda tersimpan permanen dan terikat pada profil ini.")
+                with sub_login:
+                    st.markdown("##### 🔐 Masuk ke Diary Anda")
+                    in_uid = st.text_input("Email / ID Pengguna:", placeholder="contoh@gmail.com atau username", key="login_uid")
+                    in_pin = st.text_input("PIN / Password (6 Angka/Karakter):", type="password", placeholder="******", key="login_pin")
+                    
+                    if st.button("🚀 Masuk Sekarang", type="primary", use_container_width=True, key="btn_do_login"):
+                        from db_history import authenticate_user
+                        success, res = authenticate_user(in_uid, in_pin)
+                        if success:
+                            st.session_state["user"] = res
+                            st.query_params["u"] = res["user_id"]
+                            st.query_params["auth"] = "local"
+                            st.toast(f"Selamat datang kembali, {res['display_name']}!")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {res}")
+                            
+                    st.caption("🔒 Data makanan Anda terkunci aman dengan proteksi PIN/Password.")
+                    
+                with sub_reg:
+                    st.markdown("##### 📝 Buat Akun & Hitung Target Pribadi")
+                    reg_uid = st.text_input("Email / ID Unik:", placeholder="contoh@gmail.com / nama_kamu", key="reg_uid")
+                    reg_name = st.text_input("Nama Panggilan:", placeholder="misal: Nabillah", key="reg_name")
+                    reg_pin = st.text_input("Buat PIN / Password Baru:", type="password", placeholder="Minimal 4 digit", key="reg_pin")
+                    
+                    c_r1, c_r2 = st.columns(2)
+                    with c_r1:
+                        reg_gender = st.selectbox("Gender:", ["Pria", "Wanita"], key="reg_gen")
+                        reg_bb = st.number_input("Berat Badan (kg):", value=65.0, step=1.0, key="reg_bb")
+                    with c_r2:
+                        reg_age = st.number_input("Usia (thn):", value=25, step=1, key="reg_age")
+                        reg_tb = st.number_input("Tinggi Badan (cm):", value=170.0, step=1.0, key="reg_tb")
+                        
+                    reg_target = st.number_input("Target Kalori Awal (kkal/hari):", value=2000, step=50, key="reg_kcal")
+                    
+                    if st.button("✨ Buat Akun & Aktifkan PRO 30 Hari", type="primary", use_container_width=True, key="btn_do_reg"):
+                        from db_history import register_user
+                        if not reg_pin.strip():
+                            st.error("PIN / Password wajib diisi untuk keamanan diary Anda.")
+                        else:
+                            success, res = register_user(reg_uid, reg_name, reg_pin, gender=reg_gender, bb=reg_bb, tb=reg_tb, age=int(reg_age), target_kcal=float(reg_target))
+                            if success:
+                                st.session_state["user"] = res
+                                st.query_params["u"] = res["user_id"]
+                                st.query_params["auth"] = "local"
+                                st.toast(f"Akun berhasil dibuat! Bonus Uji Coba PRO 30 Hari aktif untuk Anda.")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {res}")
         
         with c_acc2:
             with st.popover("⚡ Upgrade / Status PRO", use_container_width=True):

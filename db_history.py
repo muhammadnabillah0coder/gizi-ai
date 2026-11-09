@@ -13,19 +13,49 @@ def init_user_history_tables():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     
-    # Tabel Pengguna (Mendukung Username, Google Email, dan Preferensi Tema UI)
+    # Tabel Pengguna (Mendukung Email, Username, Password/PIN Terenkripsi)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT UNIQUE NOT NULL,      -- Bisa email Google (misal: user@gmail.com) atau username
+            user_id TEXT UNIQUE NOT NULL,      -- Email unik atau nomor WA/ID pengguna
             display_name TEXT,
+            password_hash TEXT,                -- PIN/Password aman
             avatar_url TEXT,
-            auth_provider TEXT DEFAULT 'local', -- 'google' atau 'local'
-            theme_preference TEXT DEFAULT 'Apple Light', -- 'Apple Light', 'Cal AI Dark', 'Mint Fresh'
+            auth_provider TEXT DEFAULT 'local', -- 'google', 'local', atau 'whatsapp'
+            theme_preference TEXT DEFAULT 'Apple Light',
             daily_calorie_target REAL DEFAULT 2000.0,
+            gender TEXT DEFAULT 'Pria',
+            weight_kg REAL DEFAULT 65.0,
+            height_cm REAL DEFAULT 170.0,
+            age_years INTEGER DEFAULT 25,
+            subscription_tier TEXT DEFAULT 'free',
+            pro_until TIMESTAMP,
+            daily_scans_count INTEGER DEFAULT 0,
+            last_scan_date TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Migrasi kolom password_hash jika belum ada
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+    except:
+        pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN gender TEXT DEFAULT 'Pria'")
+    except:
+        pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN weight_kg REAL DEFAULT 65.0")
+    except:
+        pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN height_cm REAL DEFAULT 170.0")
+    except:
+        pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN age_years INTEGER DEFAULT 25")
+    except:
+        pass
     # Migrasi kolom theme_preference jika belum ada
     try:
         cur.execute("ALTER TABLE users ADD COLUMN theme_preference TEXT DEFAULT 'Apple Light'")
@@ -98,7 +128,78 @@ ADMIN_IDENTIFIERS = {
     "admin"
 }
 
-def is_admin_user(user_id: str) -> bool:
+import hashlib
+
+def hash_password(password: str) -> str:
+    """Hash sederhana aman untuk PIN/Password pengguna."""
+    if not password:
+        return ""
+    return hashlib.sha256(password.strip().encode("utf-8")).hexdigest()
+
+def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str = "Pria", bb: float = 65.0, tb: float = 170.0, age: int = 25, target_kcal: float = 2000.0):
+    """
+    Mendaftarkan akun baru dengan verifikasi PIN/Password dan profil tubuh pribadi.
+    """
+    clean_id = user_id.strip().lower()
+    if not clean_id:
+        return False, "ID Pengguna / Email tidak boleh kosong."
+        
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    
+    # Cek apakah ID sudah dipakai
+    existing = cur.execute("SELECT id FROM users WHERE LOWER(user_id) = ?", (clean_id,)).fetchone()
+    if existing:
+        conn.close()
+        return False, "ID Pengguna / Email ini sudah terdaftar. Silakan login."
+        
+    p_hash = hash_password(pin_or_pass) if pin_or_pass else ""
+    is_admin = is_admin_user(clean_id)
+    initial_tier = "pro" if is_admin else "free"
+    initial_expiry = "2099-12-31 23:59:59" if is_admin else None
+    
+    cur.execute("""
+        INSERT INTO users 
+        (user_id, display_name, password_hash, auth_provider, daily_calorie_target, gender, weight_kg, height_cm, age_years, subscription_tier, pro_until)
+        VALUES (?, ?, ?, 'local', ?, ?, ?, ?, ?, ?, ?)
+    """, (clean_id, display_name or clean_id.capitalize(), p_hash, target_kcal, gender, bb, tb, age, initial_tier, initial_expiry))
+    
+    conn.commit()
+    row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ?", (clean_id,)).fetchone()
+    user_dict = dict(row)
+    conn.close()
+    return True, user_dict
+
+def authenticate_user(user_id: str, pin_or_pass: str):
+    """
+    Memverifikasi login pengguna dengan ID dan PIN/Password.
+    """
+    clean_id = user_id.strip().lower()
+    if not clean_id:
+        return False, "Ketikkan ID Pengguna / Email Anda."
+        
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    
+    user = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ?", (clean_id,)).fetchone()
+    if not user:
+        conn.close()
+        return False, "Akun tidak ditemukan. Silakan klik 'Daftar Akun Baru'."
+        
+    u_dict = dict(user)
+    saved_hash = u_dict.get("password_hash")
+    
+    # Jika user memiliki password_hash, wajib verifikasi
+    if saved_hash:
+        input_hash = hash_password(pin_or_pass)
+        if input_hash != saved_hash:
+            conn.close()
+            return False, "PIN / Password salah! Silakan periksa kembali."
+            
+    conn.close()
+    return True, u_dict
     """Mengecek apakah user adalah Founder / Admin aplikasi."""
     if not user_id:
         return False
