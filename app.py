@@ -16,7 +16,12 @@ import urllib.parse
 
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import calculate_dish_nutrition
-from db_history import init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, get_user_history_stats, update_calorie_target, update_user_theme, add_custom_food, get_custom_foods, delete_custom_food
+from db_history import (
+    init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, 
+    get_user_history_stats, update_calorie_target, update_user_theme, 
+    add_custom_food, get_custom_foods, delete_custom_food,
+    get_user_scan_status, record_scan_usage, activate_pro_tier
+)
 
 init_user_history_tables()
 
@@ -360,6 +365,7 @@ with st.sidebar:
 # Header Brand Utama dengan Logo Menonjol & Kotak Login Akun Langsung di Halaman Utama
 current_user = st.session_state["user"]
 is_google = current_user.get("auth_provider") == "google"
+scan_status = get_user_scan_status(current_user["user_id"])
 
 col_head1, col_head2 = st.columns([2, 1.2], vertical_alignment="center")
 
@@ -378,7 +384,7 @@ with col_head1:
             box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.4);
         ">🥗</div>
         <div>
-            <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
                 <h1 style="font-size: 2.5rem; font-weight: 800; color: #0f172a; margin: 0; letter-spacing: -0.02em;">Gizi.AI</h1>
                 <span style="background: rgba(16, 185, 129, 0.12); color: #059669; font-size: 0.8rem; font-weight: 800; padding: 0.35rem 0.8rem; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid rgba(16, 185, 129, 0.25);">
                     LAB KEMENKES
@@ -393,18 +399,43 @@ with col_head1:
 
 with col_head2:
     with st.container(border=True):
-        st.markdown(f"👤 **Akun Aktif:** `{current_user['display_name']}`")
-        with st.popover("🔑 Masuk Akun Google / Username", use_container_width=True):
-            st.markdown("##### 🔗 Kaitkan Email Google Anda")
-            in_email = st.text_input("Email Google / Gmail:", placeholder="nama@gmail.com", key="pop_email")
-            if st.button("Simpan & Masuk Akun Ini", type="primary", use_container_width=True, key="pop_btn"):
-                if "@" in in_email:
-                    st.session_state["user"] = get_or_create_user(in_email.strip(), auth_provider="google")
+        tier_badge = "👑 PRO (Unlimited)" if scan_status["is_pro"] else f"🌱 Free ({scan_status['scans_today']}/3 Scan Hari Ini)"
+        st.markdown(f"👤 **{current_user['display_name']}** • `{tier_badge}`")
+        
+        c_acc1, c_acc2 = st.columns([1, 1])
+        with c_acc1:
+            with st.popover("🔑 Masuk Akun", use_container_width=True):
+                st.markdown("##### 🔗 Tautkan Akun Google / Email")
+                in_email = st.text_input("Email Google / Gmail:", placeholder="nama@gmail.com", key="pop_email")
+                if st.button("Simpan & Masuk", type="primary", use_container_width=True, key="pop_btn"):
+                    if "@" in in_email:
+                        u = get_or_create_user(in_email.strip(), auth_provider="google")
+                        st.session_state["user"] = u
+                        st.query_params["u"] = u["user_id"]
+                        st.query_params["auth"] = "google"
+                        st.rerun()
+                    elif in_email.strip():
+                        u = get_or_create_user(in_email.strip(), auth_provider="local")
+                        st.session_state["user"] = u
+                        st.query_params["u"] = u["user_id"]
+                        st.query_params["auth"] = "local"
+                        st.rerun()
+                st.caption("Data makanan harian Anda tersimpan permanen dan terikat pada email ini.")
+        
+        with c_acc2:
+            with st.popover("⚡ Upgrade PRO", use_container_width=True):
+                st.markdown("### 👑 **Nutrisi AI PRO**")
+                st.markdown("""
+                **Cuma Rp 19.000 / bulan** *(Jauh lebih hemat dari kompetitor!)*
+                - 🚀 **Scan Foto Makanan Sepuasnya (Unlimited)**
+                - 🤖 **Auto-Learning AI Prioritas**
+                - 📊 **Export Laporan Gizi Lengkap**
+                """)
+                st.info("💳 **Pembayaran Instan:** QRIS / GoPay / OVO / ShopeePay / BCA")
+                if st.button("✨ Aktifkan Uji Coba PRO Sekarang", type="primary", use_container_width=True):
+                    activate_pro_tier(current_user["user_id"], days=30)
+                    st.toast("Selamat! Akun Anda aktif sebagai PRO selama 30 hari!")
                     st.rerun()
-                elif in_email.strip():
-                    st.session_state["user"] = get_or_create_user(in_email.strip(), auth_provider="local")
-                    st.rerun()
-            st.caption("Data makanan harian Anda tersimpan permanen dan terikat pada email ini.")
 
 # Navigasi Menu Atas (Clean Tabs dengan Ikon Jelas)
 tab_diary, tab_scanner, tab_sources = st.tabs([
@@ -599,15 +630,25 @@ with tab_scanner:
             if up_file:
                 st.markdown("#### Siap Menganalisis?")
                 st.caption("AI memindai porsi URT & mencocokkan ke 1.194 data laboratorium resmi Kemenkes.")
-                if st.button("🚀 Analisis Gizi Foto", type="primary", use_container_width=True, key="btn_foto"):
-                    with st.spinner("Menganalisis visual foto makanan..."):
-                        try:
-                            res = analyze_food_image(im, caption=p_caption, api_key=api_key)
-                            res["user_caption"] = p_caption
-                            st.session_state["nutrition_data"] = res
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Gagal memproses gambar: {e}")
+                
+                if not scan_status["can_scan"]:
+                    st.warning("⚠️ **Batas Scan Harian Free Tercapai (3/3).**")
+                    st.markdown("Nikmati **Scan Foto Sepuasnya** cuma **Rp 19.000/bulan**!")
+                    if st.button("👑 Buka Scan Unlimited (Uji Coba PRO)", type="primary", use_container_width=True, key="btn_up_pro1"):
+                        activate_pro_tier(current_user["user_id"], days=30)
+                        st.toast("Akun PRO aktif! Silakan scan kembali.")
+                        st.rerun()
+                else:
+                    if st.button("🚀 Analisis Gizi Foto", type="primary", use_container_width=True, key="btn_foto"):
+                        with st.spinner("Menganalisis visual foto makanan..."):
+                            try:
+                                res = analyze_food_image(im, caption=p_caption, api_key=api_key)
+                                res["user_caption"] = p_caption
+                                record_scan_usage(current_user["user_id"])
+                                st.session_state["nutrition_data"] = res
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Gagal memproses gambar: {e}")
             else:
                 st.info("💡 **Tips:** Foto piring makan dari atas agar semua lauk dan sayuran tampak jelas.")
 
@@ -624,15 +665,25 @@ with tab_scanner:
             if cam_file:
                 st.markdown("#### Foto Terambil!")
                 st.caption("Klik tombol di bawah untuk langsung menghitung gizi dan kalori foto jepretan Anda.")
-                if st.button("🚀 Analisis Jepretan Kamera", type="primary", use_container_width=True, key="btn_cam"):
-                    with st.spinner("Menganalisis foto kamera..."):
-                        try:
-                            res = analyze_food_image(im_cam, caption=cam_caption, api_key=api_key)
-                            res["user_caption"] = cam_caption
-                            st.session_state["nutrition_data"] = res
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Gagal memproses gambar kamera: {e}")
+                
+                if not scan_status["can_scan"]:
+                    st.warning("⚠️ **Batas Scan Harian Free Tercapai (3/3).**")
+                    st.markdown("Nikmati **Scan Foto Sepuasnya** cuma **Rp 19.000/bulan**!")
+                    if st.button("👑 Buka Scan Unlimited (Uji Coba PRO)", type="primary", use_container_width=True, key="btn_up_pro2"):
+                        activate_pro_tier(current_user["user_id"], days=30)
+                        st.toast("Akun PRO aktif! Silakan scan kembali.")
+                        st.rerun()
+                else:
+                    if st.button("🚀 Analisis Jepretan Kamera", type="primary", use_container_width=True, key="btn_cam"):
+                        with st.spinner("Menganalisis foto kamera..."):
+                            try:
+                                res = analyze_food_image(im_cam, caption=cam_caption, api_key=api_key)
+                                res["user_caption"] = cam_caption
+                                record_scan_usage(current_user["user_id"])
+                                st.session_state["nutrition_data"] = res
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Gagal memproses gambar kamera: {e}")
             else:
                 st.info("📷 **Kamera Langsung:** Fitur ini membuka kamera HP Anda seketika tanpa perlu menyimpan foto ke galeri.")
 

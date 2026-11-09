@@ -31,6 +31,24 @@ def init_user_history_tables():
         cur.execute("ALTER TABLE users ADD COLUMN theme_preference TEXT DEFAULT 'Apple Light'")
     except:
         pass
+        
+    # Migrasi kolom subscription_tier dan scan quota
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN subscription_tier TEXT DEFAULT 'free'")
+    except:
+        pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN pro_until TIMESTAMP")
+    except:
+        pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN daily_scans_count INTEGER DEFAULT 0")
+    except:
+        pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN last_scan_date TEXT")
+    except:
+        pass
     
     # Tabel Log Makanan (Mendukung Kategori Waktu Makan)
     cur.execute("""
@@ -138,6 +156,64 @@ def update_user_theme(user_id: str, theme_name: str):
     cur.execute("UPDATE users SET theme_preference = ? WHERE user_id = ?", (theme_name, user_id))
     conn.commit()
     conn.close()
+
+def get_user_scan_status(user_id: str):
+    """
+    Memeriksa kuota scan foto harian user (3x gratis per hari untuk Free member, unlimited untuk Pro).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    user = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    
+    if not user:
+        return {"tier": "free", "scans_today": 0, "max_scans": 3, "can_scan": True, "is_pro": False}
+        
+    u_dict = dict(user)
+    tier = u_dict.get("subscription_tier") or "free"
+    is_pro = (tier == "pro")
+    
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    last_date = u_dict.get("last_scan_date")
+    scans_today = u_dict.get("daily_scans_count") or 0
+    
+    if last_date != today_str:
+        scans_today = 0
+        
+    can_scan = True if is_pro else (scans_today < 3)
+    
+    return {
+        "tier": tier,
+        "scans_today": scans_today,
+        "max_scans": 9999 if is_pro else 3,
+        "can_scan": can_scan,
+        "is_pro": is_pro
+    }
+
+def record_scan_usage(user_id: str):
+    """Mencatat 1 kali pemakaian scan foto makanan."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    row = cur.execute("SELECT last_scan_date, daily_scans_count FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    
+    if row:
+        last_date, count = row[0], row[1] or 0
+        new_count = 1 if last_date != today_str else count + 1
+        cur.execute("UPDATE users SET last_scan_date = ?, daily_scans_count = ? WHERE user_id = ?", (today_str, new_count, user_id))
+    conn.commit()
+    conn.close()
+
+def activate_pro_tier(user_id: str, days: int = 30):
+    """Mengaktifkan langganan Pro untuk pengguna."""
+    expiry = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET subscription_tier = 'pro', pro_until = ? WHERE user_id = ?", (expiry, user_id))
+    conn.commit()
+    conn.close()
+    return expiry
 
 def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0, caption: str = "", meal_type: str = "Makan Siang"):
     """
