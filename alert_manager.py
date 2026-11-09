@@ -21,7 +21,7 @@ def send_alert_to_phone(error_message: str, context: str = "General"):
         return False
         
     text = (
-        f"🚨 *Gizi.AI Production Alert*\n"
+        f"🚨 *Nutrisi Cerdas Production Alert*\n"
         f"📌 *Context:* {context}\n"
         f"⚠️ *Error:* `{error_message[:200]}`\n"
         f"🕒 *Timestamp:* Segera periksa server log."

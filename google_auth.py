@@ -1,5 +1,5 @@
 """
-Google OAuth 2.0 Helper untuk Streamlit Gizi.AI
+Google OAuth 2.0 Helper untuk Platform Nutrisi Cerdas
 Menghandle pembuatan URL login Google dan pertukaran auth code menjadi data profil user (email, nama, foto).
 """
 

@@ -1,5 +1,5 @@
 """
-Unit Test: Memverifikasi akurasi perhitungan gizi deterministik berbasis data lab TKPI Kemenkes.
+Unit Test Nutrisi Cerdas: Memverifikasi akurasi kalkulator nutrisi deterministik berbasis data lab TKPI Kemenkes RI.
 """
 
 import sys

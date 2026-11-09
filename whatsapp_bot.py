@@ -39,7 +39,7 @@ def format_wa_reply(sender_phone: str, dish_name: str, totals: dict, advice: str
     )
     
     if advice:
-        reply += f"\n💡 *Catatan Ahli Gizi:*\n_{advice}_\n"
+        reply += f"\n💡 *Catatan Nutrisi Cerdas:*\n_{advice}_\n"
         
     reply += (
         f"\n📊 *Total Kalori Hari Ini:* {today_kcal:,.1f} kkal\n\n"
@@ -149,7 +149,7 @@ async def whatsapp_webhook(request: Request):
         except Exception as e:
             return {"reply": f"Maaf, tidak dapat menganalisis teks tersebut: {str(e)}"}
             
-    return {"reply": "Kirimkan teks nama makanan atau foto piringmu untuk saya hitung gizinya ya!"}
+    return {"reply": "Kirimkan teks nama makanan atau foto piringmu untuk saya hitung profil nutrisinya secara akurat!"}
 
 if __name__ == "__main__":
     import uvicorn

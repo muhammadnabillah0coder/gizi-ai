@@ -41,8 +41,8 @@ if auth_code:
     redirect_uri = "https://nutrisi-cerdas.streamlit.app"
     user_info, err_details = exchange_code_for_user(auth_code, redirect_uri)
     if not user_info:
-        # Coba fallback ke URL lama atau localhost jika masih transisi
-        user_info, err_details = exchange_code_for_user(auth_code, "https://gizi-ai-idn.streamlit.app")
+        # Fallback ke domain alternatif atau localhost
+        user_info, err_details = exchange_code_for_user(auth_code, "https://nutrisicerdas.streamlit.app")
         if not user_info:
             user_info, err_details = exchange_code_for_user(auth_code, "http://localhost:8501")
         
