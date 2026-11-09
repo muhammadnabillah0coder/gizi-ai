@@ -101,6 +101,54 @@ def find_best_match(query_name: str):
                 
     return None
 
+def auto_learn_food(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float, sodium_100: float = 0.0):
+    """
+    Cara 1: Auto-Learning AI / Self-Expanding Database.
+    Secara otomatis memasukkan bahan makanan baru hasil identifikasi AI yang belum ada di database lokal
+    ke dalam tkpi_nutrition.db agar ke depannya menjadi 0 token dan dapat langsung dicari lokal.
+    """
+    clean_name = food_name.strip()
+    if not clean_name or len(clean_name) < 2 or kcal_100 <= 0:
+        return None
+        
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Cek apakah nama ini persis sudah tersimpan sebelumnya
+        cur.execute("SELECT id, food_name FROM food_composition WHERE LOWER(food_name) = LOWER(?) LIMIT 1", (clean_name,))
+        existing = cur.fetchone()
+        if existing:
+            conn.close()
+            return existing["food_name"]
+            
+        # Buat kode unik otomatis
+        import time, hashlib
+        code_hash = hashlib.md5(clean_name.encode('utf-8')).hexdigest()[:6].upper()
+        food_code = f"AUTO_{code_hash}"
+        
+        cur.execute("""
+            INSERT INTO food_composition 
+            (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg)
+            VALUES (?, ?, ?, 'porsi/buah', 100.0, 100.0, ?, ?, ?, ?, ?, ?)
+        """, (
+            food_code,
+            clean_name.title(),
+            category or "Pangan Olahan (Auto-Learn AI)",
+            round(kcal_100, 1),
+            round(p_100, 1),
+            round(f_100, 1),
+            round(c_100, 1),
+            round(fib_100, 1),
+            round(sodium_100, 1)
+        ))
+        conn.commit()
+        conn.close()
+        return clean_name.title()
+    except Exception as e:
+        print(f"[AutoLearn] Gagal auto-insert {clean_name}: {e}")
+        return None
+
 def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.0):
     """
     Menerima daftar komponen dari AI. Jika item tidak ada di database lokal,
@@ -151,19 +199,24 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
             f_100 = float(comp.get("fat_g_per_100g", 0.0))
             c_100 = float(comp.get("carb_g_per_100g", 0.0))
             fib_100 = float(comp.get("fiber_g_per_100g", 0.0))
+            sod_100 = float(comp.get("sodium_mg_per_100g", 0.0))
+            
+            # Auto-Learning: Simpan otomatis ke database lokal untuk pencarian masa depan (0 token)
+            if kcal_100 > 0:
+                auto_learn_food(raw_name, "Pangan Olahan (Auto-Learn AI)", kcal_100, p_100, f_100, c_100, fib_100, sod_100)
             
             factor = weight / 100.0
             item_res = {
                 "input_name": raw_name,
-                "tkpi_matched_name": f"(Referensi Lab Terverifikasi: {raw_name})",
-                "category": "Bahan Alam / Olahan",
+                "tkpi_matched_name": f"(Auto-Learned AI: {raw_name.title()})",
+                "category": "Pangan Olahan (Auto-Learn AI)",
                 "weight_g": round(weight, 1),
                 "energy_kcal": round(kcal_100 * factor, 1),
                 "protein_g": round(p_100 * factor, 1),
                 "fat_g": round(f_100 * factor, 1),
                 "carb_g": round(c_100 * factor, 1),
                 "fiber_g": round(fib_100 * factor, 1),
-                "sodium_mg": 0.0
+                "sodium_mg": round(sod_100 * factor, 1)
             }
             
         calculated_items.append(item_res)
