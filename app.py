@@ -27,9 +27,23 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Inisialisasi Sesi Akun Pengguna Terlebih Dahulu (Agar Tema Tersimpan Dapat Dimuat)
+# Inisialisasi Sesi Akun Pengguna Terlebih Dahulu (Agar Akun & Tema Tersimpan Permanen di Browser)
+# Kita periksa query_params di URL browser untuk auto-login saat refresh/buka kembali tab
+saved_user_param = st.query_params.get("u", "")
+saved_auth_param = st.query_params.get("auth", "local")
+
 if "user" not in st.session_state:
-    st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
+    if saved_user_param:
+        st.session_state["user"] = get_or_create_user(saved_user_param.strip(), auth_provider=saved_auth_param)
+    else:
+        st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
+else:
+    # Sinkronkan query param agar URL browser selalu menyimpan identitas user
+    active_uid = st.session_state["user"]["user_id"]
+    active_auth = st.session_state["user"].get("auth_provider", "local")
+    if active_uid != "Tamu (Demo)":
+        st.query_params["u"] = active_uid
+        st.query_params["auth"] = active_auth
 
 if "nutrition_data" not in st.session_state:
     st.session_state["nutrition_data"] = None
@@ -260,8 +274,11 @@ with st.sidebar:
         google_email = st.text_input("Ketik Email Google Anda:", placeholder="contoh@gmail.com")
         if st.button("🔗 Masuk dengan Google", use_container_width=True):
             if "@" in google_email:
-                st.session_state["user"] = get_or_create_user(google_email.strip(), auth_provider="google")
-                st.success("Berhasil masuk dengan akun Google!")
+                u = get_or_create_user(google_email.strip(), auth_provider="google")
+                st.session_state["user"] = u
+                st.query_params["u"] = u["user_id"]
+                st.query_params["auth"] = "google"
+                st.success("Berhasil masuk dengan akun Google! Sesi tersimpan di URL browser Anda.")
                 st.rerun()
             else:
                 st.error("Format email tidak valid.")
@@ -271,7 +288,17 @@ with st.sidebar:
         local_user = st.text_input("Username:", placeholder="misal: nabillah")
         if st.button("Ganti Akun", use_container_width=True):
             if local_user.strip():
-                st.session_state["user"] = get_or_create_user(local_user.strip(), auth_provider="local")
+                u = get_or_create_user(local_user.strip(), auth_provider="local")
+                st.session_state["user"] = u
+                st.query_params["u"] = u["user_id"]
+                st.query_params["auth"] = "local"
+                st.rerun()
+
+        if is_google or current_user["user_id"] != "Tamu (Demo)":
+            st.markdown("---")
+            if st.button("🚪 Keluar / Logout", use_container_width=True):
+                st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
+                st.query_params.clear()
                 st.rerun()
 
     # Target Kalori Harian & Kalkulator BMR/TDEE Otomatis
