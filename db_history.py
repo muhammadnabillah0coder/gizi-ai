@@ -200,6 +200,8 @@ def authenticate_user(user_id: str, pin_or_pass: str):
             
     conn.close()
     return True, u_dict
+
+def is_admin_user(user_id: str) -> bool:
     """Mengecek apakah user adalah Founder / Admin aplikasi."""
     if not user_id:
         return False
