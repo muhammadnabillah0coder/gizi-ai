@@ -69,6 +69,13 @@ def find_best_match(query_name: str):
             "sodium_mg": 3.0
         }
     
+    # 1.5. Cek pencarian via Barcode jika input berupa angka (8-13 digit)
+    clean_digits = "".join(filter(str.isdigit, query_name))
+    if len(clean_digits) >= 8:
+        for row in rows:
+            if "barcode" in row.keys() and row["barcode"] and clean_digits in str(row["barcode"]):
+                return dict(row)
+
     # 2. Cek exact match
     for row in rows:
         if query_lower == row["food_name"].lower():

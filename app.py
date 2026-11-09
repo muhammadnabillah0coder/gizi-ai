@@ -706,10 +706,11 @@ with tab_scanner:
         st.warning("⚠️ **Mode Offline Lab Aktif (API Key Belum Disetel di Streamlit Secrets)**")
         st.info("Pencarian teks database lab (1.300+ pangan) & input manual tetap berfungsi 100%. Untuk mengaktifkan Vision AI scan foto piring, tambahkan `GEMINI_API_KEY` di menu Secrets Streamlit Cloud.")
 
-    subtab_foto, subtab_kamera, subtab_teks, subtab_manual = st.tabs([
+    subtab_foto, subtab_kamera, subtab_teks, subtab_barcode, subtab_manual = st.tabs([
         "📁 Unggah Foto Galeri", 
         "📸 Jepret Kamera HP", 
         "✍️ Tulis Menu Harian", 
+        "🏷️ Cari Barcode Kemasan",
         "➕ Input Manual Sendiri"
     ])
     
@@ -801,6 +802,41 @@ with tab_scanner:
                         st.rerun()
                     except Exception as e:
                         st.error(f"Gagal memproses teks: {e}")
+
+    with subtab_barcode:
+        st.markdown("#### 🏷️ **Cari Nutrisi Berdasarkan Nomor Barcode (EAN-13)**")
+        st.caption("Ketikkan nomor barcode 8-13 digit yang tertera di kemasan produk ritel (misal: Ultra Milk, Indomie, Fitbar, Pocari Sweat):")
+        
+        c_bar1, c_bar2 = st.columns([2, 1])
+        with c_bar1:
+            in_barcode = st.text_input("Nomor Barcode Produk:", placeholder="Contoh: 8998866200231 (Ultra Milk Cokelat) / 089686010921 (Indomie)", key="input_barcode_field")
+        with c_bar2:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            btn_barcode = st.button("🔍 Cek Nutrisi Barcode", type="primary", use_container_width=True, key="btn_check_barcode")
+            
+        if btn_barcode and in_barcode.strip():
+            from nutrition_engine import find_best_match
+            matched = find_best_match(in_barcode.strip())
+            if matched:
+                st.session_state["nutrition_data"] = {
+                    "dish_name": matched["food_name"],
+                    "confidence": "high",
+                    "portion_category": "standar kemasan",
+                    "components": [{
+                        "name": matched["food_name"],
+                        "weight_g": matched.get("default_serving_weight") or 100.0,
+                        "energy_kcal_per_100g": matched["energy_kcal"],
+                        "protein_g_per_100g": matched["protein_g"],
+                        "fat_g_per_100g": matched["fat_g"],
+                        "carb_g_per_100g": matched["carb_g"],
+                        "fiber_g_per_100g": matched["fiber_g"]
+                    }],
+                    "health_tip": f"Produk ritel resmi terverifikasi label kemasan. Ukuran saji standar: {matched.get('serving_unit', '1 porsi')}."
+                }
+                st.toast(f"✅ Produk ditemukan: {matched['food_name']}")
+                st.rerun()
+            else:
+                st.error("Nomor barcode belum terdaftar di pangkalan data ritel. Coba ketik nama produknya di tab 'Tulis Menu Harian' atau gunakan kamera.")
 
     with subtab_manual:
         st.markdown("#### ➕ Catat Makanan / Produk Kemasan Sendiri")
