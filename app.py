@@ -1,9 +1,9 @@
 """
-Aplikasi Gizi.AI: Desain Konsep A (Clean Apple Healthtech)
+Aplikasi Nutrisi Cerdas: Pahami Pola Makanmu Berbasis Rujukan Pangan Terverifikasi
 Mendukung:
-1. Akun Pribadi (Masuk via Akun Google / Username)
-2. Cek Nutrisi Foto & Teks (1.194 Data Lab TKPI Kemenkes RI)
-3. Rekapan Harian, Mingguan, & Bulanan (Apple Health Activity Ring & Charts)
+1. Akun Pribadi Terproteksi PIN/Password (Multi-User & Multi-Device)
+2. Cek Nutrisi Foto & Teks (1.300+ Data Lab TKPI Kemenkes RI, USDA, & Produk Ritel)
+3. Rekapan Harian, Mingguan, & Bulanan (Apple Health Activity Ring & Proyeksi Defisit)
 """
 
 import streamlit as st
@@ -427,6 +427,14 @@ with col_head2:
                             st.error(f"❌ {res}")
                             
                     st.caption("🔒 Data makanan Anda terkunci aman dengan proteksi PIN/Password.")
+
+                    if current_user["user_id"] != "Tamu (Demo)":
+                        st.markdown("---")
+                        if st.button("🚪 Keluar dari Akun (Logout)", use_container_width=True, key="btn_logout"):
+                            st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
+                            st.query_params.clear()
+                            st.toast("Anda telah keluar.")
+                            st.rerun()
                     
                 with sub_reg:
                     st.markdown("##### 📝 Buat Akun & Hitung Target Pribadi")
@@ -558,11 +566,24 @@ with tab_diary:
     col_week, col_month = st.columns([1.5, 1], gap="large")
     
     with col_week:
-        st.markdown("### 📊 **Tren 7 Hari Terakhir (Mingguan)**")
+        st.markdown("### 📊 **Tren 7 Hari & Proyeksi Defisit/Surplus**")
         if stats["weekly_data"]:
             df_week = pd.DataFrame(stats["weekly_data"])
             df_week["day"] = pd.to_datetime(df_week["day"]).dt.strftime("%a (%d/%m)")
             st.bar_chart(df_week.set_index("day")["total_kcal"], color="#10b981")
+            
+            # Hitung rata-rata & proyeksi berat badan
+            avg_weekly_kcal = df_week["total_kcal"].mean()
+            daily_diff = avg_weekly_kcal - target_kcal
+            # 7.700 kkal = 1 kg lemak tubuh
+            weekly_weight_change = (daily_diff * 7) / 7700.0
+            
+            if daily_diff < -100:
+                st.success(f"📉 **Proyeksi Diet:** Rata-rata asupanmu {avg_weekly_kcal:,.0f} kkal (Defisit {abs(daily_diff):,.0f} kkal/hari). Diproyeksikan turun **~{abs(weekly_weight_change):.2f} kg lemak** minggu ini!")
+            elif daily_diff > 100:
+                st.warning(f"📈 **Proyeksi Surplus:** Rata-rata asupanmu {avg_weekly_kcal:,.0f} kkal (Surplus {daily_diff:,.0f} kkal/hari). Diproyeksikan naik **~{weekly_weight_change:.2f} kg** minggu ini.")
+            else:
+                st.info(f"⚖️ **Pemeliharaan (Maintenance):** Asupanmu seimbang mendekati target ({avg_weekly_kcal:,.0f} kkal). Berat badan diproyeksikan stabil.")
         else:
             st.info("Belum ada catatan makan dalam 7 hari terakhir. Mulai catat di tab sebelah!")
 
@@ -656,6 +677,10 @@ with tab_scanner:
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key and hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
+        
+    if not api_key:
+        st.warning("⚠️ **Mode Offline Lab Aktif (API Key Belum Disetel di Streamlit Secrets)**")
+        st.info("Pencarian teks database lab (1.300+ pangan) & input manual tetap berfungsi 100%. Untuk mengaktifkan Vision AI scan foto piring, tambahkan `GEMINI_API_KEY` di menu Secrets Streamlit Cloud.")
 
     subtab_foto, subtab_kamera, subtab_teks, subtab_manual = st.tabs([
         "📁 Unggah Foto Galeri", 

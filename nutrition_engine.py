@@ -78,12 +78,15 @@ def find_best_match(query_name: str):
     # - Prioritaskan kata yang diawali dengan query (prefix)
     # - Beri penalti jika nama terlalu panjang dibanding query
     matching_substrings = []
+    query_words = [w for w in query_lower.split() if len(w) >= 3]
     for row in rows:
         name_lower = row["food_name"].lower()
         if len(query_lower) >= 3 and query_lower in name_lower:
-            # Skor lebih tinggi jika string nama diawali dengan query
             starts_bonus = 2.0 if name_lower.startswith(query_lower) else 1.0
             score = (len(query_lower) / len(name_lower)) * starts_bonus
+            matching_substrings.append((score, dict(row)))
+        elif query_words and all(w in name_lower for w in query_words):
+            score = sum(len(w) for w in query_words) / len(name_lower)
             matching_substrings.append((score, dict(row)))
             
     if matching_substrings:
