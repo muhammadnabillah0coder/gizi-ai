@@ -412,29 +412,34 @@ with col_head2:
                 oauth_redirect = "https://nutrisi-cerdas.streamlit.app"
                 google_auth_url = get_google_auth_url(oauth_redirect)
                 
-                st.markdown(f"""
-                <a href="{google_auth_url}" target="_self" style="text-decoration: none;">
-                    <div style="
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        gap: 10px;
-                        background-color: #ffffff;
-                        color: #1f2937;
-                        border: 1px solid #d1d5db;
-                        border-radius: 12px;
-                        padding: 0.6rem 1rem;
-                        font-weight: 700;
-                        font-size: 0.95rem;
-                        box-shadow: 0 2px 4px rgba(0,0,0,0.06);
-                        cursor: pointer;
-                        margin-bottom: 0.8rem;
-                    ">
-                        <img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" width="22" height="22" alt="Google">
-                        Sign in with Google
-                    </div>
-                </a>
-                """, unsafe_allow_html=True)
+                from google_auth import get_credentials
+                cid, csec = get_credentials()
+                if not cid or not csec:
+                    st.warning("⚠️ **OAuth Belum Aktif:** Kunci Google Client ID / Secret belum terbaca di Streamlit Secrets. Silakan masuk manual dengan email di bawah.")
+                else:
+                    st.markdown(f"""
+                    <a href="{google_auth_url}" target="_self" style="text-decoration: none;">
+                        <div style="
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            gap: 10px;
+                            background-color: #ffffff;
+                            color: #1f2937;
+                            border: 1px solid #d1d5db;
+                            border-radius: 12px;
+                            padding: 0.6rem 1rem;
+                            font-weight: 700;
+                            font-size: 0.95rem;
+                            box-shadow: 0 2px 4px rgba(0,0,0,0.06);
+                            cursor: pointer;
+                            margin-bottom: 0.8rem;
+                        ">
+                            <img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" width="22" height="22" alt="Google">
+                            Sign in with Google
+                        </div>
+                    </a>
+                    """, unsafe_allow_html=True)
                 
                 st.markdown("---")
                 st.caption("Atau masukkan email / nama secara manual:")
