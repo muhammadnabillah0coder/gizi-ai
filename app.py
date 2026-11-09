@@ -1232,6 +1232,27 @@ with tab_scanner:
         c3.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#d97706;'>{t_tot['fat_g']}g</div><div class='macro-lbl'>Lemak</div></div>", unsafe_allow_html=True)
         c4.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#059669;'>{t_tot['carb_g']}g</div><div class='macro-lbl'>Karbohidrat</div></div>", unsafe_allow_html=True)
         
+        # Bilah Distribusi Makronutrien Piring
+        item_macro_sum = t_tot['protein_g'] + t_tot['fat_g'] + t_tot['carb_g']
+        if item_macro_sum > 0:
+            item_p_pct = round((t_tot['protein_g'] / item_macro_sum) * 100)
+            item_f_pct = round((t_tot['fat_g'] / item_macro_sum) * 100)
+            item_c_pct = max(0, 100 - item_p_pct - item_f_pct)
+            st.markdown(f"""
+            <div style="background: rgba(125, 125, 125, 0.05); border: 1px solid rgba(125, 125, 125, 0.12); border-radius: 14px; padding: 0.75rem 1rem; margin: 0.8rem 0;">
+                <div style="display: flex; height: 8px; border-radius: 999px; overflow: hidden; margin-bottom: 0.4rem; background: rgba(125, 125, 125, 0.15);">
+                    <div style="width: {item_p_pct}%; background: #0284c7;" title="Protein {item_p_pct}%"></div>
+                    <div style="width: {item_f_pct}%; background: #d97706;" title="Lemak {item_f_pct}%"></div>
+                    <div style="width: {item_c_pct}%; background: #059669;" title="Karbohidrat {item_c_pct}%"></div>
+                </div>
+                <div style="display: flex; justify-content: space-around; font-size: 0.75rem; font-weight: 700;">
+                    <span style="color: #0284c7;">● Protein {item_p_pct}%</span>
+                    <span style="color: #d97706;">● Lemak {item_f_pct}%</span>
+                    <span style="color: #059669;">● Karbo {item_c_pct}%</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
         # Tabel Rincian Bahan Terdeteksi
         st.markdown("##### 📋 Rincian Komposisi Bahan & Standar Lab")
         table_rows = []
@@ -1247,13 +1268,23 @@ with tab_scanner:
             })
         st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
-        # Pilihan Kategori Waktu Makan
+        # Pilihan Kategori Waktu Makan Otomatis Sesuai Jam
+        curr_h = datetime.now().hour
+        if 4 <= curr_h < 11:
+            def_idx = 0
+        elif 11 <= curr_h < 16:
+            def_idx = 1
+        elif 16 <= curr_h < 21:
+            def_idx = 2
+        else:
+            def_idx = 3
+
         st.markdown("##### 🕒 Waktu Makan:")
         sel_meal_type = st.radio(
             "Kategori:",
             ["🌅 Sarapan", "☀️ Makan Siang", "🌙 Makan Malam", "🥪 Camilan"],
             horizontal=True,
-            index=1,
+            index=def_idx,
             label_visibility="collapsed"
         )
         
