@@ -91,23 +91,48 @@ def init_user_history_tables():
     conn.commit()
     conn.close()
 
+ADMIN_IDENTIFIERS = {
+    "nabillah",
+    "muhammadnabillah0coder@gmail.com",
+    "pkm tanah grogot",
+    "admin"
+}
+
+def is_admin_user(user_id: str) -> bool:
+    """Mengecek apakah user adalah Founder / Admin aplikasi."""
+    if not user_id:
+        return False
+    uid = user_id.strip().lower()
+    return uid in ADMIN_IDENTIFIERS or "nabillah" in uid or "admin" in uid
+
 def get_or_create_user(user_id: str, display_name: str = "", auth_provider: str = "local"):
     """
     Mengambil data user atau membuat profil baru jika belum ada.
+    Jika user adalah Admin / Founder (Nabillah), otomatis mendapatkan status PRO Seumur Hidup.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
+    is_admin = is_admin_user(user_id)
+    initial_tier = "pro" if is_admin else "free"
+    initial_expiry = "2099-12-31 23:59:59" if is_admin else None
+    
     row = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
     if not row:
         name = display_name or user_id.split("@")[0].capitalize()
         cur.execute("""
-            INSERT INTO users (user_id, display_name, auth_provider, daily_calorie_target)
-            VALUES (?, ?, ?, 2000.0)
-        """, (user_id, name, auth_provider))
+            INSERT INTO users (user_id, display_name, auth_provider, daily_calorie_target, subscription_tier, pro_until)
+            VALUES (?, ?, ?, 2000.0, ?, ?)
+        """, (user_id, name, auth_provider, initial_tier, initial_expiry))
         conn.commit()
         row = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    else:
+        # Jika user yang sudah ada adalah admin, pastikan statusnya selalu PRO
+        if is_admin and row["subscription_tier"] != "pro":
+            cur.execute("UPDATE users SET subscription_tier = 'pro', pro_until = '2099-12-31 23:59:59' WHERE user_id = ?", (user_id,))
+            conn.commit()
+            row = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
         
     user_dict = dict(row)
     conn.close()
@@ -171,8 +196,9 @@ def get_user_scan_status(user_id: str):
         return {"tier": "free", "scans_today": 0, "max_scans": 3, "can_scan": True, "is_pro": False}
         
     u_dict = dict(user)
-    tier = u_dict.get("subscription_tier") or "free"
-    is_pro = (tier == "pro")
+    is_admin = is_admin_user(user_id)
+    tier = "pro" if is_admin else (u_dict.get("subscription_tier") or "free")
+    is_pro = (tier == "pro" or is_admin)
     
     today_str = datetime.now().strftime("%Y-%m-%d")
     last_date = u_dict.get("last_scan_date")

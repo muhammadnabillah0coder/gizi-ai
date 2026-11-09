@@ -420,7 +420,16 @@ with col_head1:
 
 with col_head2:
     with st.container(border=True):
-        tier_badge = "👑 PRO (Unlimited)" if scan_status["is_pro"] else f"🌱 Free ({scan_status['scans_today']}/3 Scan Hari Ini)"
+        from db_history import is_admin_user
+        is_admin = is_admin_user(current_user["user_id"])
+        
+        if is_admin:
+            tier_badge = "👑 FOUNDER / ADMIN (Lifetime Unlimited)"
+        elif scan_status["is_pro"]:
+            tier_badge = "👑 PRO (Unlimited)"
+        else:
+            tier_badge = f"🌱 Free ({scan_status['scans_today']}/3 Scan Hari Ini)"
+            
         st.markdown(f"👤 **{current_user['display_name']}** • `{tier_badge}`")
         
         c_acc1, c_acc2 = st.columns([1, 1])
