@@ -380,9 +380,10 @@ with col_head2:
             st.caption("Data makanan harian Anda tersimpan permanen dan terikat pada email ini.")
 
 # Navigasi Menu Atas (Clean Tabs dengan Ikon Jelas)
-tab_diary, tab_scanner = st.tabs([
+tab_diary, tab_scanner, tab_sources = st.tabs([
     "📊  DASHBOARD REKAPAN (HARI / MINGGU / BULAN)",
-    "📸  CATAT MAKANAN BARU (FOTO & TEKS)"
+    "📸  CATAT MAKANAN BARU (FOTO & TEKS)",
+    "📚  SUMBER DATA & ENSIKLOPEDIA GIZI"
 ])
 
 # Ambil statistik riwayat akun
@@ -772,3 +773,92 @@ with tab_scanner:
             if st.button("❌ Batal / Bersihkan", use_container_width=True):
                 st.session_state["nutrition_data"] = None
                 st.rerun()
+
+# ================= TAB 3: SUMBER DATA & ENSIKLOPEDIA GIZI =================
+with tab_sources:
+    st.markdown("## 📚 **Pusat Rujukan & Sumber Data Nutrisi Resmi**")
+    st.caption("Seluruh kalkulasi nilai gizi pada sistem Gizi.AI berpatokan 100% pada data uji laboratorium ilmiah dan resmi pemerintah, bukan estimasi fiksi.")
+
+    # 3 Kartu Lembaga Sumber Resmi
+    col_s1, col_s2, col_s3 = st.columns(3)
+    with col_s1:
+        st.markdown("""
+        <div class="apple-ring-card">
+            <h4 style="margin: 0; color: #10b981;">🏛️ Kemenkes RI (TKPI)</h4>
+            <p style="font-size: 0.88rem; color: #64748b; margin-top: 0.4rem;">
+                <strong>Tabel Komposisi Pangan Indonesia</strong> (Panganku.org). Memuat lebih dari 1.100+ bahan mentah & masakan tradisional nusantara per 100g BDD (Bagian Dapat Dimakan).
+            </p>
+            <a href="https://www.panganku.org" target="_blank" style="font-weight: 700; color: #10b981; font-size: 0.85rem;">Kunjungi Panganku.org ↗</a>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_s2:
+        st.markdown("""
+        <div class="apple-ring-card">
+            <h4 style="margin: 0; color: #0284c7;">🌾 USDA FoodData Central</h4>
+            <p style="font-size: 0.88rem; color: #64748b; margin-top: 0.4rem;">
+                Standar laboratorium internasional Departemen Pertanian Amerika Serikat untuk bahan baku global, aneka jenis kopi, buah impor, dan menu modern terverifikasi.
+            </p>
+            <a href="https://fdc.nal.usda.gov" target="_blank" style="font-weight: 700; color: #0284c7; font-size: 0.85rem;">Kunjungi USDA FoodData ↗</a>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_s3:
+        st.markdown("""
+        <div class="apple-ring-card">
+            <h4 style="margin: 0; color: #d97706;">🔬 NilaiGizi.com & AKG</h4>
+            <p style="font-size: 0.88rem; color: #64748b; margin-top: 0.4rem;">
+                Platform nutrisionis nasional (AhliGizi.ID) dan acuan Angka Kecukupan Gizi (AKG Permenkes No. 28/2019) untuk validasi porsi rumah tangga (URT) Indonesia.
+            </p>
+            <a href="https://nilaigizi.com" target="_blank" style="font-weight: 700; color: #d97706; font-size: 0.85rem;">Kunjungi NilaiGizi.com ↗</a>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("### 🔍 **Pencarian Terbuka Pangkalan Data Laboratorium (1.271 Item)**")
+    st.caption("Cari bahan makanan atau menu masakan apapun di database lokal untuk melihat profil gizi per 100 gram:")
+
+    col_q1, col_q2 = st.columns([2, 1])
+    with col_q1:
+        search_query = st.text_input("Ketik nama makanan:", placeholder="Contoh: ayam, nasi, telur, tempe, kopi, kangkung", key="kb_search")
+    with col_q2:
+        # Ambil daftar kategori unik
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cats = [r[0] for r in cur.execute("SELECT DISTINCT category FROM food_composition WHERE category IS NOT NULL ORDER BY category").fetchall()]
+        sel_cat = st.selectbox("Filter Kategori:", ["Semua Kategori"] + cats, key="kb_cat")
+        conn.close()
+
+    # Query database
+    conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
+    cur = conn.cursor()
+    sql = "SELECT food_name, category, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg FROM food_composition WHERE 1=1"
+    params = []
+    if search_query.strip():
+        sql += " AND food_name LIKE ?"
+        params.append(f"%{search_query.strip()}%")
+    if sel_cat != "Semua Kategori":
+        sql += " AND category = ?"
+        params.append(sel_cat)
+    sql += " ORDER BY food_name ASC LIMIT 50"
+
+    results = cur.execute(sql, params).fetchall()
+    conn.close()
+
+    if results:
+        table_kb = []
+        for r in results:
+            table_kb.append({
+                "Nama Pangan": r[0],
+                "Kategori": r[1] or "-",
+                "Energi (kkal/100g)": r[2],
+                "Protein (g)": r[3],
+                "Lemak (g)": r[4],
+                "Karbohidrat (g)": r[5],
+                "Serat (g)": r[6],
+                "Natrium (mg)": r[7]
+            })
+        st.dataframe(table_kb, use_container_width=True, hide_index=True)
+        st.caption(f"Menampilkan {len(results)} hasil teratas dari total 1.271 entri laboratorium.")
+    else:
+        st.info("Tidak ada bahan makanan yang cocok dengan kata kunci tersebut. Coba kata kunci lain.")

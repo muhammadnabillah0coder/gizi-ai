@@ -17,8 +17,12 @@ def get_db_connection():
 
 def find_best_match(query_name: str):
     """
-    Mencari kecocokan terbaik di database TKPI menggunakan pencocokan kata kunci ketat.
-    Hanya cocok jika kata kunci benar-benar relevan.
+    Mencari kecocokan terbaik di database TKPI dengan scoring prioritas:
+    1. Special drinks (air, kopi, teh)
+    2. Exact match
+    3. Prefix / Word boundary match
+    4. Substring match (diprioritaskan pada nama yang lebih ringkas & spesifik)
+    5. Strict fuzzy match
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -40,21 +44,55 @@ def find_best_match(query_name: str):
             "fiber_g": 0.0,
             "sodium_mg": 0.0
         }
+    if query_lower in ["kopi", "kopi hitam", "kopi hitam polos", "kopi polos", "kopi tubruk tanpa gula", "kopi tanpa gula"]:
+        return {
+            "food_name": "Kopi hitam tanpa gula",
+            "category": "Minuman",
+            "bdd_rate": 100.0,
+            "energy_kcal": 2.0,
+            "protein_g": 0.1,
+            "fat_g": 0.0,
+            "carb_g": 0.3,
+            "fiber_g": 0.0,
+            "sodium_mg": 3.0
+        }
+    if query_lower in ["teh", "teh tawar", "es teh tawar", "teh hangat tawar"]:
+        return {
+            "food_name": "Es teh tawar",
+            "category": "Minuman",
+            "bdd_rate": 100.0,
+            "energy_kcal": 1.0,
+            "protein_g": 0.0,
+            "fat_g": 0.0,
+            "carb_g": 0.2,
+            "fiber_g": 0.0,
+            "sodium_mg": 3.0
+        }
     
     # 2. Cek exact match
     for row in rows:
         if query_lower == row["food_name"].lower():
             return dict(row)
 
-    # 3. Cek apakah seluruh query_lower ada di dalam nama makanan di DB
+    # 3. Cek apakah query ada di dalam nama makanan di DB, urutkan berdasarkan prioritas:
+    # - Prioritaskan kata yang diawali dengan query (prefix)
+    # - Beri penalti jika nama terlalu panjang dibanding query
+    matching_substrings = []
     for row in rows:
         name_lower = row["food_name"].lower()
-        if len(query_lower) >= 4 and query_lower in name_lower:
-            return dict(row)
+        if len(query_lower) >= 3 and query_lower in name_lower:
+            # Skor lebih tinggi jika string nama diawali dengan query
+            starts_bonus = 2.0 if name_lower.startswith(query_lower) else 1.0
+            score = (len(query_lower) / len(name_lower)) * starts_bonus
+            matching_substrings.append((score, dict(row)))
             
-    # 4. Fuzzy match dengan batas kemiripan ketat (cutoff 0.65)
+    if matching_substrings:
+        matching_substrings.sort(key=lambda x: x[0], reverse=True)
+        return matching_substrings[0][1]
+            
+    # 4. Fuzzy match dengan batas kemiripan ketat (cutoff 0.70)
     names = [row["food_name"] for row in rows]
-    matches = difflib.get_close_matches(query_name, names, n=1, cutoff=0.65)
+    matches = difflib.get_close_matches(query_name, names, n=1, cutoff=0.70)
     if matches:
         best_name = matches[0]
         for row in rows:
