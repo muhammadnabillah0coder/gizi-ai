@@ -664,6 +664,11 @@ if current_user["user_id"] == "Tamu (Demo)":
                         else:
                             st.error(f"❌ {res}")
 
+# Deteksi Gemini API Key (Global)
+api_key = os.environ.get("GEMINI_API_KEY", "")
+if not api_key and hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+
 # Navigasi Menu Atas (Mobile-Friendly, Ringkas, & Modern)
 tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([
     "📊 Dashboard",
@@ -731,6 +736,86 @@ with tab_diary:
             <div class="macro-lbl">Serat</div>
         </div>
         """, unsafe_allow_html=True)
+
+    # Visual Macro Split Ratio Bar (Cal AI Style)
+    p_g = stats['today_totals']['protein_g']
+    f_g = stats['today_totals']['fat_g']
+    c_g = stats['today_totals']['carb_g']
+    macro_sum = p_g + f_g + c_g
+    if macro_sum > 0:
+        p_pct = round((p_g / macro_sum) * 100)
+        f_pct = round((f_g / macro_sum) * 100)
+        c_pct = max(0, 100 - p_pct - f_pct)
+        st.markdown(f"""
+        <div style="background: rgba(125, 125, 125, 0.06); border: 1px solid rgba(125, 125, 125, 0.14); border-radius: 16px; padding: 0.85rem 1.2rem; margin: 1rem 0;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.45rem; font-size: 0.82rem; font-weight: 700;">
+                <span>📊 Rasio Makronutrien Hari Ini</span>
+                <span style="opacity: 0.75;">Total Nutrisi: {macro_sum:.1f}g</span>
+            </div>
+            <div style="display: flex; height: 10px; border-radius: 999px; overflow: hidden; margin-bottom: 0.55rem; background: rgba(125, 125, 125, 0.15);">
+                <div style="width: {p_pct}%; background: #0284c7;" title="Protein {p_pct}%"></div>
+                <div style="width: {f_pct}%; background: #d97706;" title="Lemak {f_pct}%"></div>
+                <div style="width: {c_pct}%; background: #059669;" title="Karbohidrat {c_pct}%"></div>
+            </div>
+            <div style="display: flex; justify-content: space-around; font-size: 0.76rem; font-weight: 700;">
+                <span style="color: #0284c7;">● Protein {p_pct}%</span>
+                <span style="color: #d97706;">● Lemak {f_pct}%</span>
+                <span style="color: #059669;">● Karbo {c_pct}%</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ⚡ Aksi Cepat Catat Makanan Langsung di Dashboard (Quick Log Bar)
+    with st.container(border=True):
+        st.markdown("##### ⚡ **Catat Cepat Menu Makan Hari Ini**")
+        qc_col1, qc_col2 = st.columns([3.2, 1.3], vertical_alignment="center")
+        with qc_col1:
+            dash_quick_text = st.text_input(
+                "Ketik menu makanan langsung:",
+                placeholder="Misal: 1 porsi soto ayam + nasi putih + telur rebus",
+                key="dash_quick_input",
+                label_visibility="collapsed"
+            )
+        with qc_col2:
+            dash_btn_calc = st.button("⚡ Hitung & Catat", type="primary", use_container_width=True, key="btn_dash_quick")
+            
+        if dash_btn_calc:
+            if not dash_quick_text.strip():
+                st.warning("Ketikkan nama menu makanan terlebih dahulu.")
+            elif not api_key:
+                st.error("⚠️ API Key belum disetel di Secrets.")
+            else:
+                with st.spinner("Menganalisis nutrisi makanan..."):
+                    try:
+                        res = analyze_food_text(dash_quick_text.strip(), api_key=api_key)
+                        res["user_caption"] = dash_quick_text.strip()
+                        calc_res = calculate_dish_nutrition(res.get("components", []), portion_multiplier=1.0)
+                        totals = calc_res["totals"]
+                        
+                        # Waktu makan otomatis berdasarkan jam lokal
+                        current_hour = datetime.now().hour
+                        if 4 <= current_hour < 11:
+                            auto_meal = "Sarapan"
+                        elif 11 <= current_hour < 16:
+                            auto_meal = "Makan Siang"
+                        elif 16 <= current_hour < 21:
+                            auto_meal = "Makan Malam"
+                        else:
+                            auto_meal = "Camilan"
+                            
+                        log_meal(
+                            user_id=st.session_state["user"]["user_id"],
+                            dish_name=res.get("dish_name", dash_quick_text.strip()),
+                            totals=totals,
+                            multiplier=1.0,
+                            caption=dash_quick_text.strip(),
+                            meal_type=auto_meal
+                        )
+                        st.balloons()
+                        st.toast(f"Berhasil mencatat {res.get('dish_name')} ({totals['energy_kcal']} kkal) ke {auto_meal}!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Gagal mencatat makanan: {e}")
 
     # Widget Pelacak Air Minum Harian (Water Intake Tracker)
     water_data = get_water_intake(st.session_state["user"]["user_id"])
