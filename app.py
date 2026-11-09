@@ -364,19 +364,18 @@ scan_status = get_user_scan_status(current_user["user_id"])
 col_head1, col_head2 = st.columns([2, 1.2], vertical_alignment="center")
 
 with col_head1:
-    st.markdown("""
+    import base64
+    logo_base64 = ""
+    logo_path = os.path.join(os.path.dirname(__file__), "logo_nutrisi_cerdas_512.png")
+    if os.path.exists(logo_path):
+        with open(logo_path, "rb") as f:
+            logo_base64 = base64.b64encode(f.read()).decode()
+            
+    logo_img_html = f'<img src="data:image/png;base64,{logo_base64}" style="width: 82px; height: 82px; border-radius: 24px; box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.4);" />' if logo_base64 else '<div style="font-size: 3.5rem; background: linear-gradient(135deg, #10b981 0%, #059669 100%); width: 82px; height: 82px; display: flex; align-items: center; justify-content: center; border-radius: 24px; box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.4);">🥗</div>'
+
+    st.markdown(f"""
     <div style="display: flex; align-items: center; gap: 18px; margin-bottom: 0.5rem; padding: 0.5rem 0;">
-        <div style="
-            font-size: 3.5rem;
-            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-            width: 82px;
-            height: 82px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            border-radius: 24px;
-            box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.4);
-        ">🥗</div>
+        {logo_img_html}
         <div>
             <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
                 <h1 style="font-size: 2.6rem; font-weight: 800; margin: 0; letter-spacing: -0.02em;">Nutrisi Cerdas</h1>
