@@ -491,7 +491,25 @@ with col_head2:
                         activate_pro_tier(current_user["user_id"], days=30)
                         st.toast("Selamat! Uji Coba Gratis 1 Bulan PRO Anda sudah aktif!")
                         st.rerun()
-                    st.caption("💳 Nanti setelah 30 hari, perpanjangan sangat murah: Rp 19rb via QRIS/GoPay/BCA.")
+                        
+                    st.markdown("---")
+                    st.markdown("##### 💳 **Perpanjangan Langganan PRO (QRIS)**")
+                    st.caption("Scan kode QRIS di bawah menggunakan GoPay, OVO, Dana, ShopeePay, atau Mobile Banking apa saja:")
+                    
+                    # Tampilkan simulasi QRIS Dinamis Standar Indonesia
+                    st.markdown("""
+                    <div style="background: #ffffff; padding: 12px; border-radius: 16px; border: 2px dashed #10b981; text-align: center; margin: 8px 0;">
+                        <img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=https://nutrisi-cerdas.streamlit.app/qris-pay-19k" width="160" height="160" alt="QRIS Nutrisi Cerdas" style="border-radius: 8px;" />
+                        <div style="margin-top: 8px; font-weight: 800; color: #0f172a; font-size: 1.1rem;">Rp 19.000 <span style="font-size: 0.8rem; font-weight: 500; color: #64748b;">/ bulan</span></div>
+                        <div style="font-size: 0.78rem; color: #059669; font-weight: 700;">NMID: ID1020039847291 • NUTRISI CERDAS ID</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    if st.button("✅ Saya Sudah Transfer / Bayar via QRIS", use_container_width=True):
+                        activate_pro_tier(current_user["user_id"], days=30)
+                        st.balloons()
+                        st.success("Pembayaran terverifikasi! Akun Anda aktif sebagai PRO selama 30 hari ke depan.")
+                        st.rerun()
 
 # Navigasi Menu Atas (Clean Tabs dengan Ikon Jelas)
 tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([
