@@ -53,6 +53,8 @@ if auth_code:
         st.query_params["auth"] = "google"
         st.toast(f"Selamat datang, {name}! Akun Google Anda berhasil terhubung.")
         st.rerun()
+    else:
+        st.error("⚠️ Gagal memverifikasi login Google. Pastikan Client ID & Secret sudah dimasukkan ke Streamlit Secrets dan Redirect URI di Google Cloud cocok dengan https://nutrisi-cerdas.streamlit.app")
 
 # Inisialisasi Sesi Akun Pengguna Terlebih Dahulu (Agar Akun & Tema Tersimpan Permanen di Browser)
 saved_user_param = st.query_params.get("u", "")
