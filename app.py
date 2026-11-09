@@ -21,7 +21,8 @@ from db_history import (
     get_user_history_stats, update_calorie_target, update_user_theme, 
     add_custom_food, get_custom_foods, delete_custom_food,
     get_user_scan_status, record_scan_usage, activate_pro_tier,
-    log_water_intake, get_water_intake
+    log_water_intake, get_water_intake,
+    is_admin_user, register_user, authenticate_user
 )
 from google_auth import get_google_auth_url, exchange_code_for_user
 
@@ -275,61 +276,80 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# Sidebar: Akun Pribadi & Target Harian
+# Pre-fetch status user untuk sidebar & header
+current_user = st.session_state["user"]
+is_google = current_user.get("auth_provider") == "google"
+is_admin = is_admin_user(current_user["user_id"])
+scan_status = get_user_scan_status(current_user["user_id"])
+
+# Sidebar: Akun Pribadi & Target Harian (Efisien, Bersih, & Kompak)
 with st.sidebar:
-    st.markdown("### 🥗 **Akun & Profil Nutrisi**")
+    # 1. Branding Header Ramping
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 0.8rem; padding-bottom: 0.5rem; border-bottom: 1px solid rgba(125, 125, 125, 0.15);">
+        <span style="font-size: 1.8rem;">🥗</span>
+        <div>
+            <div style="font-weight: 800; font-size: 1.15rem; line-height: 1.15;">Nutrisi Cerdas</div>
+            <div style="font-size: 0.72rem; color: #10b981; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;">TKPI Kemenkes + USDA</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
     
-    current_user = st.session_state["user"]
-    is_google = current_user.get("auth_provider") == "google"
-    
-    # Status Login Card
-    if is_google:
-        st.success(f"G Terhubung: **{current_user['display_name']}**")
-        st.caption(f"Akun Google: `{current_user['user_id']}`")
+    # 2. Status Akun Ringkas
+    if current_user["user_id"] == "Tamu (Demo)":
+        st.markdown("""
+        <div style="background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 14px; padding: 0.75rem 0.9rem; margin-bottom: 0.8rem;">
+            <div style="font-size: 0.76rem; font-weight: 800; color: #d97706; text-transform: uppercase;">🌱 Status: Tamu (Demo)</div>
+            <div style="font-size: 0.83rem; margin-top: 0.25rem; line-height: 1.35;">
+                Riwayat makan belum tersimpan permanen. Buat akun gratis untuk mengunci progres Anda.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
     else:
-        st.info(f"👤 Pengguna Aktif: **{current_user['display_name']}**")
+        if is_admin:
+            badge_html = '<span style="background: rgba(245, 158, 11, 0.2); color: #d97706; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px;">👑 FOUNDER / ADMIN</span>'
+        elif scan_status["is_pro"]:
+            badge_html = f'<span style="background: rgba(16, 185, 129, 0.2); color: #059669; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px;">👑 PRO ({scan_status["days_left"]} Hari)</span>'
+        else:
+            badge_html = f'<span style="background: rgba(59, 130, 246, 0.2); color: #2563eb; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px;">🌱 Free ({scan_status["scans_today"]}/3 Scan)</span>'
 
-    # Pengaturan Tema Tampilan (Tersimpan Permanen ke Akun Pengguna)
-    st.markdown("---")
-    st.markdown("### 🎨 **Pilihan Tema Tampilan (UI)**")
-    theme_options = ["System Default", "Apple Light", "Cal AI Dark", "Mint Fresh"]
-    current_idx = theme_options.index(user_theme) if user_theme in theme_options else 0
-    selected_theme = st.selectbox("Pilih Gaya Tampilan:", theme_options, index=current_idx)
-    if selected_theme != user_theme:
-        update_user_theme(current_user["user_id"], selected_theme)
-        st.session_state["user"]["theme_preference"] = selected_theme
-        st.toast(f"Tema diubah ke {selected_theme}!")
-        st.rerun()
+        st.markdown(f"""
+        <div style="background: rgba(125, 125, 125, 0.08); border: 1px solid rgba(125, 125, 125, 0.16); border-radius: 14px; padding: 0.75rem 0.9rem; margin-bottom: 0.8rem;">
+            <div style="font-weight: 700; font-size: 0.92rem;">👤 {current_user['display_name']}</div>
+            <div style="margin-top: 0.35rem;">{badge_html}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # Target Kalori Harian & Kalkulator BMR/TDEE Otomatis
-    st.markdown("---")
-    st.markdown("### 🎯 **Target Kalori Harian**")
+    # 3. Target Kalori Harian (Cepat & Praktis)
+    st.markdown("##### 🎯 **Target Kalori Harian**")
     current_target = float(current_user.get("daily_calorie_target") or 2000.0)
-    new_target = st.number_input("Target Kalori (kkal):", min_value=1000, max_value=4000, value=int(current_target), step=50)
+    new_target = st.number_input("Target Kalori (kkal/hari):", min_value=1000, max_value=4000, value=int(current_target), step=50, key="sb_target_kcal")
     if new_target != current_target:
         update_calorie_target(current_user["user_id"], float(new_target))
         st.session_state["user"]["daily_calorie_target"] = float(new_target)
         st.toast("Target kalori diperbarui!")
-        
-    with st.expander("🧮 Hitung Target Ideal (BMR/TDEE)"):
+        st.rerun()
+
+    # Expander Tersembunyi untuk Kalibrasi Ulang Target BMR/TDEE
+    with st.expander("🧮 Hitung Ulang Target Ideal (BMR)", expanded=False):
         st.caption("Hitung target kalori berdasarkan rumus standar Mifflin-St Jeor / Kemenkes RI:")
-        gender = st.radio("Jenis Kelamin:", ["Pria", "Wanita"], horizontal=True)
-        bb = st.number_input("Berat Badan (kg):", value=65.0, step=1.0)
-        tb = st.number_input("Tinggi Badan (cm):", value=170.0, step=1.0)
-        usia = st.number_input("Usia (tahun):", value=25, step=1)
+        gender = st.radio("Jenis Kelamin:", ["Pria", "Wanita"], horizontal=True, key="sb_bmr_gen")
+        bb = st.number_input("Berat Badan (kg):", value=65.0, step=1.0, key="sb_bmr_bb")
+        tb = st.number_input("Tinggi Badan (cm):", value=170.0, step=1.0, key="sb_bmr_tb")
+        usia = st.number_input("Usia (tahun):", value=25, step=1, key="sb_bmr_age")
         aktivitas = st.selectbox("Aktivitas Harian:", [
             "Sedentari (Jarang olahraga / di depan laptop)",
             "Ringan (Olahraga 1-3 hari/minggu)",
             "Sedang (Olahraga 3-5 hari/minggu)",
             "Sangat Aktif (Latihan intensif setiap hari)"
-        ])
+        ], key="sb_bmr_act")
         tujuan = st.selectbox("Tujuan Program:", [
             "Turunkan Berat Badan (Defisit 400 kkal)",
             "Jaga Berat Badan Ideal (Maintenance)",
             "Tambah Berat / Massa Otot (Surplus 400 kkal)"
-        ])
+        ], key="sb_bmr_goal")
         
-        if st.button("Hitung & Terapkan Target", use_container_width=True):
+        if st.button("Terapkan Target Kalori", use_container_width=True, key="sb_btn_apply_bmr"):
             # Formula Mifflin - St Jeor
             if gender == "Pria":
                 bmr = (10 * bb) + (6.25 * tb) - (5 * usia) + 5
@@ -355,6 +375,29 @@ with st.sidebar:
             update_calorie_target(current_user["user_id"], float(recom_target))
             st.session_state["user"]["daily_calorie_target"] = float(recom_target)
             st.success(f"🎯 Target kalori berhasil diatur menjadi **{recom_target} kkal/hari**!")
+            st.rerun()
+
+    # 4. Ringkasan Tips Efektif
+    st.markdown("---")
+    st.markdown("""
+    <div style="font-size: 0.82rem; opacity: 0.82; line-height: 1.45;">
+        💡 <strong>Tips Nutrisi:</strong><br/>
+        • Foto makanan dari atas dengan cahaya terang.<br/>
+        • Minum 8 gelas (2.000 ml) air putih tiap hari.<br/>
+        • Porsi sayur & protein bantu rasa kenyang lebih lama.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 5. Pengaturan Tema Tampilan (Dipindahkan ke Footer Sidebar agar Tidak Menghabiskan Ruang)
+    st.markdown("---")
+    with st.expander("🎨 Pilihan Tema Tampilan (UI)", expanded=False):
+        theme_options = ["System Default", "Apple Light", "Cal AI Dark", "Mint Fresh"]
+        current_idx = theme_options.index(user_theme) if user_theme in theme_options else 0
+        selected_theme = st.selectbox("Gaya Tampilan:", theme_options, index=current_idx, key="sb_theme_picker")
+        if selected_theme != user_theme:
+            update_user_theme(current_user["user_id"], selected_theme)
+            st.session_state["user"]["theme_preference"] = selected_theme
+            st.toast(f"Tema diubah ke {selected_theme}!")
             st.rerun()
 
 # Header Brand Utama dengan Logo Menonjol & Kotak Login Akun Langsung di Halaman Utama
@@ -451,19 +494,46 @@ with col_head2:
                         reg_age = st.number_input("Usia (thn):", value=25, step=1, key="reg_age")
                         reg_tb = st.number_input("Tinggi Badan (cm):", value=170.0, step=1.0, key="reg_tb")
                         
-                    reg_target = st.number_input("Target Kalori Awal (kkal/hari):", value=2000, step=50, key="reg_kcal")
+                    reg_goal = st.selectbox("Tujuan Program:", [
+                        "🔥 Turunkan Berat Badan (Defisit Sehat -400 kkal)",
+                        "⚖️ Jaga Berat Badan Ideal (Maintenance)",
+                        "💪 Tambah Berat / Massa Otot (Surplus +400 kkal)"
+                    ], key="reg_goal")
+                    
+                    # Formula Mifflin - St Jeor Real-time
+                    if reg_gender == "Pria":
+                        calc_bmr = (10 * reg_bb) + (6.25 * reg_tb) - (5 * reg_age) + 5
+                    else:
+                        calc_bmr = (10 * reg_bb) + (6.25 * reg_tb) - (5 * reg_age) - 161
+                    calc_tdee = calc_bmr * 1.375
+                    if "Turunkan" in reg_goal:
+                        auto_target = round(calc_tdee - 400.0)
+                    elif "Tambah" in reg_goal:
+                        auto_target = round(calc_tdee + 400.0)
+                    else:
+                        auto_target = round(calc_tdee)
+                    auto_target = max(1200, min(3800, auto_target))
+                    
+                    st.markdown(f"""
+                    <div style="background: rgba(16, 185, 129, 0.12); border-left: 3px solid #10b981; padding: 0.5rem 0.8rem; border-radius: 8px; margin: 0.5rem 0; font-size: 0.85rem;">
+                        🎯 Rekomendasi Target Tubuhmu: <strong>{auto_target} kkal/hari</strong> (BMR: {round(calc_bmr)} kkal)
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    reg_target = st.number_input("Target Kalori Disepakati (kkal/hari):", min_value=1000, max_value=4000, value=int(auto_target), step=50, key="reg_kcal")
                     
                     if st.button("✨ Buat Akun & Aktifkan PRO 30 Hari", type="primary", use_container_width=True, key="btn_do_reg"):
-                        from db_history import register_user
                         if not reg_pin.strip():
                             st.error("PIN / Password wajib diisi untuk keamanan diary Anda.")
                         else:
                             success, res = register_user(reg_uid, reg_name, reg_pin, gender=reg_gender, bb=reg_bb, tb=reg_tb, age=int(reg_age), target_kcal=float(reg_target))
                             if success:
-                                st.session_state["user"] = res
+                                activate_pro_tier(res["user_id"], days=30)
+                                st.session_state["user"] = get_or_create_user(res["user_id"], display_name=res["display_name"], auth_provider="local")
                                 st.query_params["u"] = res["user_id"]
                                 st.query_params["auth"] = "local"
-                                st.toast(f"Akun berhasil dibuat! Bonus Uji Coba PRO 30 Hari aktif untuk Anda.")
+                                st.balloons()
+                                st.toast("Akun berhasil dibuat! Bonus Uji Coba PRO 30 Hari aktif untuk Anda.")
                                 st.rerun()
                             else:
                                 st.error(f"❌ {res}")
@@ -510,6 +580,89 @@ with col_head2:
                         st.balloons()
                         st.success("Pembayaran terverifikasi! Akun Anda aktif sebagai PRO selama 30 hari ke depan.")
                         st.rerun()
+
+# Smart Hero Banner untuk Pengunjung Tamu (Conversion Call to Action)
+if current_user["user_id"] == "Tamu (Demo)":
+    with st.container(border=True):
+        c_hero_txt, c_hero_act = st.columns([2.3, 1.2], vertical_alignment="center")
+        with c_hero_txt:
+            st.markdown("""
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                <span style="background: #10b981; color: #ffffff; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.04em;">Mode Tamu (Demo)</span>
+                <span style="color: #059669; font-size: 0.85rem; font-weight: 700;">🎁 Bonus 30 Hari PRO Gratis Tersedia</span>
+            </div>
+            <h3 style="margin: 0.2rem 0; font-size: 1.25rem; font-weight: 800; letter-spacing: -0.01em;">
+                Kunci Riwayat Makan & Target Dietmu di HP Ini
+            </h3>
+            <p style="margin: 0; font-size: 0.88rem; opacity: 0.85; line-height: 1.45;">
+                Catatan makan mode tamu akan hilang saat browser ditutup. <strong>Buat akun gratis dalam 30 detik</strong> (cukup nama & 4-6 digit PIN) agar diary gizi dan grafik penurunan berat badanmu tersimpan permanen.
+            </p>
+            """, unsafe_allow_html=True)
+            
+        with c_hero_act:
+            with st.popover("🚀 Buat Akun & Kunci Data (30 Detik)", type="primary", use_container_width=True):
+                st.markdown("##### 📝 Pendaftaran Akun Cepat")
+                st.caption("Hitung target kalori otomatis & aktifkan 30 Hari PRO:")
+                h_uid = st.text_input("Email / ID Unik:", placeholder="contoh@gmail.com / nama_kamu", key="h_reg_uid")
+                h_name = st.text_input("Nama Panggilan:", placeholder="misal: Nabillah", key="h_reg_name")
+                h_pin = st.text_input("Buat PIN / Password Baru:", type="password", placeholder="Minimal 4 digit", key="h_reg_pin")
+                
+                hc_1, hc_2 = st.columns(2)
+                with hc_1:
+                    h_gender = st.selectbox("Gender:", ["Pria", "Wanita"], key="h_reg_gen")
+                    h_bb = st.number_input("Berat (kg):", value=65.0, step=1.0, key="h_reg_bb")
+                with hc_2:
+                    h_age = st.number_input("Usia (thn):", value=25, step=1, key="h_reg_age")
+                    h_tb = st.number_input("Tinggi (cm):", value=170.0, step=1.0, key="h_reg_tb")
+                    
+                h_goal = st.selectbox("Tujuan Program:", [
+                    "🔥 Turunkan Berat Badan (Defisit Sehat -400 kkal)",
+                    "⚖️ Jaga Berat Badan Ideal (Maintenance)",
+                    "💪 Tambah Berat / Massa Otot (Surplus +400 kkal)"
+                ], key="h_reg_goal")
+                
+                # Formula Mifflin-St Jeor Real-time
+                if h_gender == "Pria":
+                    h_bmr = (10 * h_bb) + (6.25 * h_tb) - (5 * h_age) + 5
+                else:
+                    h_bmr = (10 * h_bb) + (6.25 * h_tb) - (5 * h_age) - 161
+                
+                h_tdee = h_bmr * 1.375
+                if "Turunkan" in h_goal:
+                    h_target = round(h_tdee - 400.0)
+                elif "Tambah" in h_goal:
+                    h_target = round(h_tdee + 400.0)
+                else:
+                    h_target = round(h_tdee)
+                h_target = max(1200, min(3800, h_target))
+                
+                st.markdown(f"""
+                <div style="background: rgba(16, 185, 129, 0.12); border-left: 3px solid #10b981; padding: 0.5rem 0.8rem; border-radius: 8px; margin: 0.5rem 0; font-size: 0.85rem;">
+                    🎯 Target Kalori Dihitung: <strong>{h_target} kkal/hari</strong> (BMR: {round(h_bmr)} kkal)
+                </div>
+                """, unsafe_allow_html=True)
+                
+                h_custom_target = st.number_input("Target Kalori Awal (kkal/hari):", min_value=1000, max_value=4000, value=int(h_target), step=50, key="h_reg_target")
+                
+                if st.button("✨ Buat Akun & Dapatkan 30 Hari PRO", type="primary", use_container_width=True, key="h_btn_submit"):
+                    if not h_uid.strip() or not h_pin.strip():
+                        st.error("ID / Email dan PIN wajib diisi!")
+                    else:
+                        success, res = register_user(
+                            h_uid, h_name, h_pin,
+                            gender=h_gender, bb=h_bb, tb=h_tb,
+                            age=int(h_age), target_kcal=float(h_custom_target)
+                        )
+                        if success:
+                            activate_pro_tier(res["user_id"], days=30)
+                            st.session_state["user"] = get_or_create_user(res["user_id"], display_name=res["display_name"], auth_provider="local")
+                            st.query_params["u"] = res["user_id"]
+                            st.query_params["auth"] = "local"
+                            st.balloons()
+                            st.toast("🎉 Akun berhasil dibuat! Bonus 30 Hari PRO Gratis telah aktif.")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {res}")
 
 # Navigasi Menu Atas (Clean Tabs dengan Ikon Jelas)
 tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([

@@ -170,8 +170,13 @@ def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str
         
     p_hash = hash_password(pin_or_pass) if pin_or_pass else ""
     is_admin = is_admin_user(clean_id)
-    initial_tier = "pro" if is_admin else "free"
-    initial_expiry = "2099-12-31 23:59:59" if is_admin else None
+    if is_admin:
+        initial_tier = "pro"
+        initial_expiry = "2099-12-31 23:59:59"
+    else:
+        # Bonus Sambutan: 30 Hari PRO gratis untuk setiap akun baru terdaftar
+        initial_tier = "pro"
+        initial_expiry = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
     
     cur.execute("""
         INSERT INTO users 
