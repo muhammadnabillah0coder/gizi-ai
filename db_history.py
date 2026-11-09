@@ -102,6 +102,20 @@ def init_user_history_tables():
         cur.execute("ALTER TABLE meal_logs ADD COLUMN meal_type TEXT DEFAULT 'Makan Siang'")
     except:
         pass
+        
+    # Tabel Log Asupan Air Harian (Water Intake Tracker)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS water_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            log_date TEXT NOT NULL,
+            glasses_count INTEGER DEFAULT 0,
+            target_glasses INTEGER DEFAULT 8,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, log_date)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_water_user_date ON water_logs(user_id, log_date)")
     # Tabel Makanan Kustom Pribadi (Fitur Input Manual User)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS custom_foods (
@@ -284,6 +298,37 @@ def update_user_theme(user_id: str, theme_name: str):
     cur.execute("UPDATE users SET theme_preference = ? WHERE user_id = ?", (theme_name, user_id))
     conn.commit()
     conn.close()
+
+def log_water_intake(user_id: str, delta_glasses: int = 1):
+    """Menambah atau mengurangi asupan air minum hari ini (+1 atau -1 gelas)."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    cur.execute("SELECT glasses_count FROM water_logs WHERE user_id = ? AND log_date = ?", (user_id, today_str))
+    row = cur.fetchone()
+    if row:
+        new_count = max(0, row[0] + delta_glasses)
+        cur.execute("UPDATE water_logs SET glasses_count = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND log_date = ?", (new_count, user_id, today_str))
+    else:
+        new_count = max(0, delta_glasses)
+        cur.execute("INSERT INTO water_logs (user_id, log_date, glasses_count, target_glasses) VALUES (?, ?, ?, 8)", (user_id, today_str, new_count))
+        
+    conn.commit()
+    conn.close()
+    return new_count
+
+def get_water_intake(user_id: str):
+    """Mengambil progres air minum hari ini."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT glasses_count, target_glasses FROM water_logs WHERE user_id = ? AND log_date = ?", (user_id, today_str))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return {"glasses": row[0], "target": row[1], "ml": row[0] * 250, "target_ml": row[1] * 250}
+    return {"glasses": 0, "target": 8, "ml": 0, "target_ml": 2000}
 
 def get_user_scan_status(user_id: str):
     """

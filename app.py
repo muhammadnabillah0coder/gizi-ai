@@ -20,7 +20,8 @@ from db_history import (
     init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, 
     get_user_history_stats, update_calorie_target, update_user_theme, 
     add_custom_food, get_custom_foods, delete_custom_food,
-    get_user_scan_status, record_scan_usage, activate_pro_tier
+    get_user_scan_status, record_scan_usage, activate_pro_tier,
+    log_water_intake, get_water_intake
 )
 from google_auth import get_google_auth_url, exchange_code_for_user
 
@@ -559,6 +560,29 @@ with tab_diary:
             <div class="macro-lbl">Serat</div>
         </div>
         """, unsafe_allow_html=True)
+
+    # Widget Pelacak Air Minum Harian (Water Intake Tracker)
+    water_data = get_water_intake(st.session_state["user"]["user_id"])
+    water_pct = min(1.0, water_data["glasses"] / max(1, water_data["target"]))
+    
+    with st.container(border=True):
+        col_w1, col_w2, col_w3 = st.columns([2.5, 1.2, 1], vertical_alignment="center")
+        with col_w1:
+            st.markdown(f"💧 **Pelacak Air Minum Hari Ini:** `{water_data['glasses']} / {water_data['target']} Gelas` ({water_data['ml']} / {water_data['target_ml']} ml)")
+            st.progress(water_pct)
+        with col_w2:
+            st.caption("Target standar: 8 gelas (2.000 ml) untuk menjaga metabolisme & pembakaran kalori.")
+        with col_w3:
+            col_b1, col_b2 = st.columns(2)
+            with col_b1:
+                if st.button("➕ 1", use_container_width=True, key="btn_add_water"):
+                    log_water_intake(st.session_state["user"]["user_id"], 1)
+                    st.toast("💧 +1 Gelas air dicatat!")
+                    st.rerun()
+            with col_b2:
+                if st.button("➖ 1", use_container_width=True, key="btn_sub_water"):
+                    log_water_intake(st.session_state["user"]["user_id"], -1)
+                    st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
     
