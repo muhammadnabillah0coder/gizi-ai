@@ -487,11 +487,16 @@ with st.sidebar:
             badge_html = f'<span style="background: rgba(59, 130, 246, 0.2); color: #2563eb; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px;">🌱 Free ({scan_status["scans_today"]}/3 Scan)</span>'
 
         st.markdown(f"""
-        <div style="background: rgba(125, 125, 125, 0.08); border: 1px solid rgba(125, 125, 125, 0.16); border-radius: 14px; padding: 0.75rem 0.9rem; margin-bottom: 0.8rem;">
+        <div style="background: rgba(125, 125, 125, 0.08); border: 1px solid rgba(125, 125, 125, 0.16); border-radius: 14px; padding: 0.75rem 0.9rem; margin-bottom: 0.5rem;">
             <div style="font-weight: 700; font-size: 0.92rem;">👤 {current_user['display_name']}</div>
             <div style="margin-top: 0.35rem;">{badge_html}</div>
         </div>
         """, unsafe_allow_html=True)
+        if st.button("🚪 Keluar Akun (Logout)", use_container_width=True, key="sb_btn_logout"):
+            st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
+            st.query_params.clear()
+            st.toast("Anda telah berhasil keluar dari akun.")
+            st.rerun()
 
     # 3. Target Kalori Harian (Cepat & Praktis)
     st.markdown("##### 🎯 **Target Kalori Harian**")
@@ -625,8 +630,25 @@ with col_head2:
         
         c_acc1, c_acc2 = st.columns([1, 1])
         with c_acc1:
-            with st.popover("🔑 Masuk / Daftar Akun", use_container_width=True):
-                sub_login, sub_reg = st.tabs(["🔐 Masuk", "📝 Buat Akun Baru"])
+            if current_user["user_id"] == "Tamu (Demo)":
+                btn_acc_label = "🔑 Masuk / Daftar"
+            else:
+                btn_acc_label = f"⚙️ Akun: {current_user['display_name'].split()[0]}"
+
+            with st.popover(btn_acc_label, use_container_width=True):
+                if current_user["user_id"] != "Tamu (Demo)":
+                    st.markdown(f"##### 👤 Akun: **{current_user['display_name']}**")
+                    st.caption(f"ID: `{current_user['user_id']}` • Status: `{tier_badge}`")
+                    st.markdown("---")
+                    if st.button("🚪 Keluar dari Akun (Logout)", type="primary", use_container_width=True, key="btn_logout_top"):
+                        st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
+                        st.query_params.clear()
+                        st.toast("Anda telah berhasil keluar dari akun.")
+                        st.rerun()
+                    st.markdown("---")
+                    st.caption("Ingin berganti akun lain?")
+
+                sub_login, sub_reg = st.tabs(["🔐 Masuk Akun Lain", "📝 Buat Akun Baru"])
                 
                 with sub_login:
                     st.markdown("##### 🔐 Masuk ke Diary Anda")
@@ -645,14 +667,6 @@ with col_head2:
                             st.error(f"❌ {res}")
                             
                     st.caption("🔒 Data makanan Anda terkunci aman dengan proteksi PIN/Password.")
-
-                    if current_user["user_id"] != "Tamu (Demo)":
-                        st.markdown("---")
-                        if st.button("🚪 Keluar dari Akun (Logout)", use_container_width=True, key="btn_logout"):
-                            st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
-                            st.query_params.clear()
-                            st.toast("Anda telah keluar.")
-                            st.rerun()
                     
                 with sub_reg:
                     st.markdown("##### 📝 Buat Akun & Hitung Target Pribadi")
