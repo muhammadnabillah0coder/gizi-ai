@@ -11,7 +11,7 @@ from PIL import Image
 import os
 import json
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib.parse
 
 import importlib
@@ -861,8 +861,12 @@ if current_user["user_id"] == "Tamu (Demo)":
 
 # Deteksi Gemini API Key (Global)
 api_key = os.environ.get("GEMINI_API_KEY", "")
-if not api_key and hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-    api_key = st.secrets["GEMINI_API_KEY"]
+if not api_key:
+    try:
+        if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+            api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        pass
 
 # Navigasi Menu Atas (Mobile-Friendly, Ringkas, & Muat 1 Layar HP Tanpa Geser)
 tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([
