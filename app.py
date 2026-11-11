@@ -14,6 +14,12 @@ import pandas as pd
 from datetime import datetime
 import urllib.parse
 
+import importlib
+import nutrition_engine
+import db_history
+importlib.reload(nutrition_engine)
+importlib.reload(db_history)
+
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import calculate_dish_nutrition, fetch_open_food_facts, evaluate_nutri_grade
 from db_history import (
