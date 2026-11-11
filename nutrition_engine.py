@@ -69,12 +69,16 @@ def find_best_match(query_name: str):
             "sodium_mg": 3.0
         }
     
-    # 1.5. Cek pencarian via Barcode jika input berupa angka (8-13 digit)
+    # 1.5. Cek pencarian via Barcode jika input berupa angka (8-14 digit)
     clean_digits = "".join(filter(str.isdigit, query_name))
     if len(clean_digits) >= 8:
         for row in rows:
             if "barcode" in row.keys() and row["barcode"] and clean_digits in str(row["barcode"]):
                 return dict(row)
+        # Jika belum ada di database lokal, coba tarik real-time dari Open Food Facts API
+        off_product = fetch_open_food_facts(clean_digits)
+        if off_product:
+            return off_product
 
     # 2. Cek exact match
     for row in rows:
@@ -111,11 +115,164 @@ def find_best_match(query_name: str):
                 
     return None
 
-def auto_learn_food(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float, sodium_100: float = 0.0):
+def fetch_open_food_facts(barcode: str):
     """
-    Cara 1: Auto-Learning AI / Self-Expanding Database.
-    Secara otomatis memasukkan bahan makanan baru hasil identifikasi AI yang belum ada di database lokal
-    ke dalam tkpi_nutrition.db agar ke depannya menjadi 0 token dan dapat langsung dicari lokal.
+    Mengambil data nutrisi produk kemasan secara real-time dari Open Food Facts API v0.
+    Dilengkapi timeout ketat 3 detik, konversi kJ -> kkal otomatis, dan antrean staging
+    agar dapat ditinjau/diedit sebelum dipublikasikan ke katalog utama.
+    """
+    import urllib.request
+    import json
+    
+    clean_bc = "".join(filter(str.isdigit, str(barcode)))
+    if len(clean_bc) < 8:
+        return None
+        
+    url = f"https://world.openfoodfacts.org/api/v0/product/{clean_bc}.json"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "NutrisiCerdas-MN/2.4 (https://nutrisi-cerdas.streamlit.app)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("status") != 1:
+                return None
+            prod = data.get("product", {})
+            nutr = prod.get("nutriments", {})
+            
+            raw_name = (
+                prod.get("product_name_id")
+                or prod.get("product_name")
+                or prod.get("generic_name")
+                or f"Produk Barcode {clean_bc}"
+            ).strip()
+            brand = (prod.get("brands") or "").split(",")[0].strip()
+            if brand and brand.lower() not in raw_name.lower():
+                full_name = f"{brand} - {raw_name}"
+            else:
+                full_name = raw_name
+                
+            # Konversi energi (prioritaskan kcal, fallback kJ / 4.184)
+            kcal_100 = nutr.get("energy-kcal_100g") or nutr.get("energy-kcal")
+            if kcal_100 is None:
+                kj_val = nutr.get("energy-kj_100g") or nutr.get("energy_100g") or 0.0
+                kcal_100 = round(float(kj_val) / 4.184, 1)
+            else:
+                kcal_100 = round(float(kcal_100), 1)
+                
+            p_100 = round(float(nutr.get("proteins_100g") or nutr.get("proteins") or 0.0), 1)
+            f_100 = round(float(nutr.get("fat_100g") or nutr.get("fat") or 0.0), 1)
+            c_100 = round(float(nutr.get("carbohydrates_100g") or nutr.get("carbohydrates") or 0.0), 1)
+            fib_100 = round(float(nutr.get("fiber_100g") or nutr.get("fiber") or 0.0), 1)
+            
+            # Natrium di Open Food Facts umumnya dalam gram per 100g
+            raw_sod = float(nutr.get("sodium_100g") or 0.0)
+            sod_100 = round(raw_sod * 1000.0, 1) if raw_sod < 15.0 else round(raw_sod, 1)
+            
+            serv_size = prod.get("serving_size") or "1 kemasan (100g)"
+            try:
+                serv_weight = float(prod.get("serving_quantity") or 100.0)
+                if serv_weight <= 0:
+                    serv_weight = 100.0
+            except:
+                serv_weight = 100.0
+                
+            # Masukkan ke antrean staging (pending_foods) agar bisa diedit sebelum dipublikasikan
+            try:
+                from db_history import stage_pending_food
+                stage_pending_food(
+                    food_name=full_name,
+                    category="Produk Kemasan (Open Food Facts)",
+                    kcal_100=kcal_100,
+                    p_100=p_100,
+                    f_100=f_100,
+                    c_100=c_100,
+                    fib_100=fib_100,
+                    sod_100=sod_100,
+                    barcode=clean_bc,
+                    serving_unit=serv_size,
+                    serving_weight=serv_weight,
+                    source_origin="Open Food Facts API"
+                )
+            except Exception:
+                pass
+                
+            return {
+                "food_name": full_name,
+                "category": "Produk Kemasan (Open Food Facts)",
+                "serving_unit": serv_size,
+                "default_serving_weight": serv_weight,
+                "bdd_rate": 100.0,
+                "energy_kcal": kcal_100,
+                "protein_g": p_100,
+                "fat_g": f_100,
+                "carb_g": c_100,
+                "fiber_g": fib_100,
+                "sodium_mg": sod_100,
+                "barcode": clean_bc,
+                "source_origin": "Open Food Facts API (Draft - Siap Diedit & Dipublikasi)"
+            }
+    except Exception:
+        return None
+
+
+def evaluate_nutri_grade(kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float = 0.0, sod_100: float = 0.0):
+    """
+    Menghitung Skor Nutri-Grade (A / B / C / D) dan Rambu Peringatan GGL Kemenkes RI
+    berdasarkan kepadatan nutrisi per 100g/porsi.
+    """
+    score = 100
+    badges = []
+    
+    # Penalti Kalori, Lemak, & Natrium
+    if kcal_100 > 350:
+        score -= 25
+        badges.append(("🔴 Padat Kalori", "#ef4444"))
+    elif kcal_100 > 220:
+        score -= 10
+        badges.append(("🟡 Kalori Sedang", "#f59e0b"))
+    else:
+        badges.append(("🟢 Rendah-Sedang Kalori", "#10b981"))
+        
+    if f_100 > 20.0:
+        score -= 25
+        badges.append(("🔴 Tinggi Lemak (>20g)", "#ef4444"))
+    elif f_100 <= 5.0:
+        score += 5
+        badges.append(("🟢 Rendah Lemak", "#10b981"))
+        
+    if sod_100 > 400.0:
+        score -= 20
+        badges.append(("🔴 Tinggi Natrium/Garam", "#ef4444"))
+        
+    # Bonus Protein & Serat
+    if p_100 >= 12.0:
+        score += 15
+        badges.append(("🟢 Tinggi Protein", "#10b981"))
+    elif p_100 >= 6.0:
+        score += 5
+        
+    if fib_100 >= 3.0:
+        score += 10
+        badges.append(("🟢 Kaya Serat Pangan", "#10b981"))
+        
+    if score >= 85:
+        return {"grade": "A", "color": "#10b981", "label": "Sangat Sehat & Padat Gizi", "badges": badges}
+    elif score >= 70:
+        return {"grade": "B", "color": "#0284c7", "label": "Pilihan Baik & Seimbang", "badges": badges}
+    elif score >= 50:
+        return {"grade": "C", "color": "#f59e0b", "label": "Konsumsi Secukupnya", "badges": badges}
+    else:
+        return {"grade": "D", "color": "#ef4444", "label": "Batasi Porsi (Tinggi Kalori/Lemak/Garam)", "badges": badges}
+
+
+def auto_learn_food(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float, sodium_100: float = 0.0, barcode: str = None, serving_unit: str = "porsi/buah", serving_weight: float = 100.0, auto_publish: bool = False):
+    """
+    Cara 1: Auto-Learning AI / Self-Expanding Database dengan Proteksi Moderasi.
+    - Jika auto_publish=False (default): Masuk ke tabel staging (pending_foods) agar dapat
+      ditinjau & diedit terlebih dahulu sebelum dipublikasikan (menghindari update mendadak).
+    - Jika auto_publish=True: Langsung masuk ke tabel utama food_composition beserta nomor barcode.
     """
     clean_name = food_name.strip()
     if not clean_name or len(clean_name) < 2 or kcal_100 <= 0:
@@ -125,6 +282,14 @@ def auto_learn_food(food_name: str, category: str, kcal_100: float, p_100: float
         conn = get_db_connection()
         cur = conn.cursor()
         
+        clean_bc = barcode.strip() if barcode else None
+        if clean_bc:
+            cur.execute("SELECT id, food_name FROM food_composition WHERE barcode = ? LIMIT 1", (clean_bc,))
+            ex_bc = cur.fetchone()
+            if ex_bc:
+                conn.close()
+                return ex_bc["food_name"]
+                
         # Cek apakah nama ini persis sudah tersimpan sebelumnya
         cur.execute("SELECT id, food_name FROM food_composition WHERE LOWER(food_name) = LOWER(?) LIMIT 1", (clean_name,))
         existing = cur.fetchone()
@@ -132,25 +297,47 @@ def auto_learn_food(food_name: str, category: str, kcal_100: float, p_100: float
             conn.close()
             return existing["food_name"]
             
-        # Buat kode unik otomatis
-        import time, hashlib
+        if not auto_publish:
+            conn.close()
+            from db_history import stage_pending_food
+            stage_pending_food(
+                food_name=clean_name.title(),
+                category=category or "Pangan Olahan (Auto-Learn AI)",
+                kcal_100=kcal_100,
+                p_100=p_100,
+                f_100=f_100,
+                c_100=c_100,
+                fib_100=fib_100,
+                sod_100=sodium_100,
+                barcode=clean_bc or "",
+                serving_unit=serving_unit,
+                serving_weight=serving_weight,
+                source_origin="AI Auto-Learn"
+            )
+            return clean_name.title()
+            
+        # Buat kode unik otomatis jika dipublikasikan langsung
+        import hashlib
         code_hash = hashlib.md5(clean_name.encode('utf-8')).hexdigest()[:6].upper()
         food_code = f"AUTO_{code_hash}"
         
         cur.execute("""
             INSERT INTO food_composition 
-            (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg)
-            VALUES (?, ?, ?, 'porsi/buah', 100.0, 100.0, ?, ?, ?, ?, ?, ?)
+            (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode)
+            VALUES (?, ?, ?, ?, ?, 100.0, ?, ?, ?, ?, ?, ?, ?)
         """, (
             food_code,
             clean_name.title(),
             category or "Pangan Olahan (Auto-Learn AI)",
+            serving_unit,
+            float(serving_weight),
             round(kcal_100, 1),
             round(p_100, 1),
             round(f_100, 1),
             round(c_100, 1),
             round(fib_100, 1),
-            round(sodium_100, 1)
+            round(sodium_100, 1),
+            clean_bc
         ))
         conn.commit()
         conn.close()

@@ -132,6 +132,28 @@ def init_user_history_tables():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_custom_food_user ON custom_foods(user_id)")
     
+    # Tabel Antrean Moderasi / Staging Pangan Baru (Edit Sebelum Publikasi)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_foods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            food_name TEXT NOT NULL,
+            category TEXT DEFAULT 'Produk Kemasan / Ritel',
+            serving_unit TEXT DEFAULT '1 porsi (100g)',
+            default_serving_weight REAL DEFAULT 100.0,
+            energy_kcal REAL NOT NULL,
+            protein_g REAL DEFAULT 0.0,
+            fat_g REAL DEFAULT 0.0,
+            carb_g REAL DEFAULT 0.0,
+            fiber_g REAL DEFAULT 0.0,
+            sodium_mg REAL DEFAULT 0.0,
+            barcode TEXT,
+            source_origin TEXT DEFAULT 'Open Food Facts / AI',
+            submitted_by TEXT DEFAULT 'system',
+            status TEXT DEFAULT 'pending', -- 'pending', 'published', 'rejected'
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
     conn.commit()
     conn.close()
 
@@ -513,6 +535,112 @@ def get_user_history_stats(user_id: str):
             "total_meals": monthly_row["total_meals"] or 0
         }
     }
+
+def stage_pending_food(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float = 0.0, sod_100: float = 0.0, barcode: str = "", serving_unit: str = "1 porsi (100g)", serving_weight: float = 100.0, source_origin: str = "Open Food Facts", submitted_by: str = "system"):
+    """
+    Menyimpan data pangan baru ke tabel antrean (pending_foods) agar dapat ditinjau/diedit
+    terlebih dahulu sebelum dipublikasikan ke database utama (menghindari update mendadak).
+    """
+    clean_name = food_name.strip()
+    if not clean_name or kcal_100 < 0:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # Cek apakah sudah ada di food_composition atau pending_foods
+    if barcode:
+        ex_main = cur.execute("SELECT id FROM food_composition WHERE barcode = ?", (barcode.strip(),)).fetchone()
+        ex_pend = cur.execute("SELECT id FROM pending_foods WHERE barcode = ? AND status = 'pending'", (barcode.strip(),)).fetchone()
+        if ex_main or ex_pend:
+            conn.close()
+            return None
+    ex_name = cur.execute("SELECT id FROM pending_foods WHERE LOWER(food_name) = LOWER(?) AND status = 'pending'", (clean_name,)).fetchone()
+    if ex_name:
+        conn.close()
+        return ex_name[0]
+        
+    cur.execute("""
+        INSERT INTO pending_foods 
+        (food_name, category, serving_unit, default_serving_weight, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode, source_origin, submitted_by, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+    """, (
+        clean_name, category, serving_unit, float(serving_weight),
+        round(float(kcal_100), 1), round(float(p_100), 1), round(float(f_100), 1),
+        round(float(c_100), 1), round(float(fib_100), 1), round(float(sod_100), 1),
+        barcode.strip() if barcode else None, source_origin, submitted_by
+    ))
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+def get_pending_foods(status: str = "pending"):
+    """Mengambil daftar pangan yang menunggu kurasi/edit sebelum publikasi."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    rows = cur.execute("SELECT * FROM pending_foods WHERE status = ? ORDER BY id DESC", (status,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def publish_food_to_catalog(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float = 0.0, sod_100: float = 0.0, barcode: str = "", serving_unit: str = "1 porsi", serving_weight: float = 100.0, pending_id: int = None):
+    """
+    Mempublikasikan data pangan yang sudah diverifikasi/diedit ke dalam katalog utama food_composition.
+    Jika barcode atau nama sudah ada, melakukan update; jika belum, melakukan insert.
+    """
+    clean_name = food_name.strip()
+    clean_barcode = barcode.strip() if barcode else None
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    
+    existing = None
+    if clean_barcode:
+        existing = cur.execute("SELECT id FROM food_composition WHERE barcode = ? LIMIT 1", (clean_barcode,)).fetchone()
+    if not existing:
+        existing = cur.execute("SELECT id FROM food_composition WHERE LOWER(food_name) = LOWER(?) LIMIT 1", (clean_name,)).fetchone()
+        
+    if existing:
+        cur.execute("""
+            UPDATE food_composition 
+            SET food_name = ?, category = ?, serving_unit = ?, default_serving_weight = ?,
+                energy_kcal = ?, protein_g = ?, fat_g = ?, carb_g = ?, fiber_g = ?, sodium_mg = ?,
+                barcode = COALESCE(?, barcode)
+            WHERE id = ?
+        """, (
+            clean_name, category, serving_unit, float(serving_weight),
+            round(float(kcal_100), 1), round(float(p_100), 1), round(float(f_100), 1),
+            round(float(c_100), 1), round(float(fib_100), 1), round(float(sod_100), 1),
+            clean_barcode, existing["id"]
+        ))
+    else:
+        code_hash = hashlib.md5(clean_name.encode("utf-8")).hexdigest()[:6].upper()
+        food_code = f"MN_{code_hash}"
+        cur.execute("""
+            INSERT INTO food_composition 
+            (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode)
+            VALUES (?, ?, ?, ?, ?, 100.0, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            food_code, clean_name, category, serving_unit, float(serving_weight),
+            round(float(kcal_100), 1), round(float(p_100), 1), round(float(f_100), 1),
+            round(float(c_100), 1), round(float(fib_100), 1), round(float(sod_100), 1),
+            clean_barcode
+        ))
+        
+    if pending_id is not None:
+        cur.execute("UPDATE pending_foods SET status = 'published' WHERE id = ?", (pending_id,))
+        
+    conn.commit()
+    conn.close()
+    return True
+
+def reject_pending_food(pending_id: int):
+    """Menolak/menghapus item dari antrean draft."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE pending_foods SET status = 'rejected' WHERE id = ?", (pending_id,))
+    conn.commit()
+    conn.close()
+    return True
 
 if __name__ == "__main__":
     init_user_history_tables()

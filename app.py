@@ -15,16 +15,52 @@ from datetime import datetime
 import urllib.parse
 
 from gemini_extractor import analyze_food_image, analyze_food_text
-from nutrition_engine import calculate_dish_nutrition
+from nutrition_engine import calculate_dish_nutrition, fetch_open_food_facts, evaluate_nutri_grade
 from db_history import (
     init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, 
     get_user_history_stats, update_calorie_target, update_user_theme, 
     add_custom_food, get_custom_foods, delete_custom_food,
     get_user_scan_status, record_scan_usage, activate_pro_tier,
     log_water_intake, get_water_intake,
-    is_admin_user, register_user, authenticate_user
+    is_admin_user, register_user, authenticate_user,
+    stage_pending_food, get_pending_foods, publish_food_to_catalog, reject_pending_food
 )
 from google_auth import get_google_auth_url, exchange_code_for_user
+
+APP_VERSION = "v2.4.0"
+APP_CREATOR = "original by MN"
+
+PATCH_NOTES = [
+    {
+        "version": "v2.4.0 (Terbaru)",
+        "date": "11 Nov 2026",
+        "highlights": [
+            "🛡️ Sistem Kurasi & Edit Sebelum Publikasi (Staging Queue) agar data baru tidak mendadak mengubah katalog utama tanpa verifikasi.",
+            "🌐 Integrasi Real-Time Open Food Facts API (3+ Juta produk barcode dunia & ritel Indonesia) + Kamera Label Gizi Kemasan.",
+            "🚦 Skor Kesehatan Nutri-Grade (A–D) & Rambu Peringatan GGL (Gula, Garam/Natrium, Lemak) standar Kemenkes RI.",
+            "🧠 Smart Daily Balancer: Rekomendasi makanan penyeimbang protein & serat otomatis di Dashboard.",
+            "🎨 Overhaul 9 Tema Kontras Tinggi 60-30-10 (Bebas masalah teks/kotak hitam ketemu hitam di semua browser)."
+        ]
+    },
+    {
+        "version": "v2.2.0",
+        "date": "10 Nov 2026",
+        "highlights": [
+            "⚡ Kotak Catat Cepat (Quick Log Bar) & Bilah Rasio Makronutrien langsung di Dashboard.",
+            "🕒 Pengelompokan Buku Harian per Waktu Makan (Sarapan, Makan Siang, Makan Malam, Camilan).",
+            "🎯 Kalkulator BMR/TDEE Mifflin-St Jeor otomatis terintegrasi saat pendaftaran akun."
+        ]
+    },
+    {
+        "version": "v2.0.0",
+        "date": "09 Nov 2026",
+        "highlights": [
+            "🥗 Rebranding resmi Nutrisi Cerdas (Basis TKPI Kemenkes RI + USDA).",
+            "💧 Pelacak Air Minum Harian (8 Gelas / 2.000 ml) & Proyeksi Defisit/Surplus 7 Hari.",
+            "🔐 Sistem Akun Pribadi Terproteksi PIN SHA-256 & Uji Coba Gratis 30 Hari PRO."
+        ]
+    }
+]
 
 init_user_history_tables()
 
@@ -85,10 +121,132 @@ if "nutrition_data" not in st.session_state:
 current_user = st.session_state["user"]
 user_theme = current_user.get("theme_preference") or "System Default"
 
-# Definisi Palet Tema Lengkap & Kontras Tinggi (Font Selalu Terbaca Tajam)
+# Generator CSS Tema 60-30-10 Anti-Tabrakan Warna (Mengunci Background, Card, Input, Dropdown, Popover, & Sidebar)
+def build_theme_css(bg_main: str, bg_sidebar: str, bg_card: str, bg_input: str, text_primary: str, text_muted: str, border_col: str, accent: str, accent_fg: str, tab_bg: str):
+    return f"""
+        :root {{
+            --bg-main: {bg_main};
+            --bg-card: {bg_card};
+            --bg-input: {bg_input};
+            --text-primary: {text_primary};
+            --text-muted: {text_muted};
+            --border-col: {border_col};
+            --accent: {accent};
+        }}
+        .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{
+            background-color: {bg_main} !important;
+            color: {text_primary} !important;
+        }}
+        [data-testid="stSidebar"], [data-testid="stSidebar"] > div:first-child {{
+            background-color: {bg_sidebar} !important;
+            color: {text_primary} !important;
+            border-right: 1px solid {border_col} !important;
+        }}
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+        .stApp p, .stApp label, .stApp .stMarkdown, [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] p, [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3, [data-testid="stSidebar"] h4, [data-testid="stSidebar"] h5 {{
+            color: {text_primary} !important;
+        }}
+        [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p, .theme-muted {{
+            color: {text_muted} !important;
+        }}
+        .apple-ring-card {{
+            background: {bg_card} !important;
+            color: {text_primary} !important;
+            border-radius: 24px;
+            padding: 1.8rem;
+            border: 1px solid {border_col} !important;
+            box-shadow: 0 6px 24px -4px rgba(0, 0, 0, 0.08);
+            margin-bottom: 1.5rem;
+        }}
+        .macro-pill {{
+            background: {bg_card} !important;
+            color: {text_primary} !important;
+            border-radius: 20px;
+            padding: 1.2rem 1rem;
+            border: 1px solid {border_col} !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+            text-align: center;
+        }}
+        [data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"] {{
+            background-color: {bg_card} !important;
+            border-color: {border_col} !important;
+            border-radius: 16px !important;
+            color: {text_primary} !important;
+        }}
+        /* Kunci Kotak Input, Textarea, Number Input, & Selectbox agar tidak hitam ketemu hitam */
+        div[data-baseweb="input"], div[data-baseweb="base-input"], div[data-baseweb="textarea"],
+        div[data-baseweb="select"] > div {{
+            background-color: {bg_input} !important;
+            color: {text_primary} !important;
+            border-color: {border_col} !important;
+            border-radius: 12px !important;
+        }}
+        div[data-baseweb="input"] input, div[data-baseweb="textarea"] textarea,
+        div[data-baseweb="select"] span, div[data-baseweb="select"] div {{
+            color: {text_primary} !important;
+            -webkit-text-fill-color: {text_primary} !important;
+        }}
+        div[data-baseweb="input"] input::placeholder, div[data-baseweb="textarea"] textarea::placeholder {{
+            color: {text_muted} !important;
+            -webkit-text-fill-color: {text_muted} !important;
+            opacity: 0.75 !important;
+        }}
+        /* Popover & Dropdown Menu List */
+        div[data-baseweb="popover"], div[data-baseweb="popover"] > div,
+        [data-testid="stPopoverBody"], ul[role="listbox"], li[role="option"] {{
+            background-color: {bg_card} !important;
+            color: {text_primary} !important;
+            border-color: {border_col} !important;
+        }}
+        /* Tombol Biasa vs Primary */
+        .stButton > button[kind="secondary"], [data-testid="stPopover"] > div > button {{
+            background-color: {bg_card} !important;
+            color: {text_primary} !important;
+            border: 1.5px solid {border_col} !important;
+        }}
+        .stButton > button[kind="primary"] {{
+            background-color: {accent} !important;
+            color: {accent_fg} !important;
+            border: none !important;
+        }}
+        .ring-title, .macro-lbl {{
+            font-size: 0.8rem;
+            font-weight: 700;
+            color: {text_muted} !important;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }}
+        .ring-val {{ font-size: 2.3rem; font-weight: 800; color: {text_primary} !important; margin: 0.3rem 0; }}
+        .macro-num {{ font-size: 1.6rem; font-weight: 800; color: {text_primary} !important; margin: 0.2rem 0; }}
+        div[data-baseweb="tab-list"] {{
+            gap: 10px;
+            background-color: {tab_bg} !important;
+            padding: 6px;
+            border-radius: 18px;
+            margin-bottom: 1.5rem;
+            border: 1px solid {border_col};
+        }}
+        button[data-baseweb="tab"] {{
+            border-radius: 14px !important;
+            font-size: 1.0rem !important;
+            font-weight: 700 !important;
+            padding: 0.65rem 1.35rem !important;
+            color: {text_muted} !important;
+            background-color: transparent !important;
+        }}
+        button[data-baseweb="tab"][aria-selected="true"] {{
+            background-color: {accent} !important;
+            color: {accent_fg} !important;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12) !important;
+        }}
+    """
+
+# 9 Pilihan Tema Proporsi 60-30-10 Kontras Tinggi
 THEME_STYLES = {
     "System Default": """
-        /* Ikuti Tema Sistem / Bawaan Browser */
+        :root { --text-muted: #64748b; }
         .apple-ring-card {
             background: rgba(125, 125, 125, 0.08);
             border: 1px solid rgba(125, 125, 125, 0.2);
@@ -106,7 +264,7 @@ THEME_STYLES = {
         .ring-title, .macro-lbl { color: inherit; opacity: 0.75; font-weight: 700; text-transform: uppercase; font-size: 0.8rem; }
         .ring-val, .macro-num { font-weight: 800; }
         div[data-baseweb="tab-list"] {
-            gap: 12px;
+            gap: 10px;
             background-color: rgba(125, 125, 125, 0.15);
             padding: 6px;
             border-radius: 18px;
@@ -114,132 +272,9 @@ THEME_STYLES = {
         }
         button[data-baseweb="tab"] {
             border-radius: 14px !important;
-            font-size: 1.05rem !important;
+            font-size: 1.0rem !important;
             font-weight: 700 !important;
-            padding: 0.75rem 1.6rem !important;
-            background-color: transparent !important;
-        }
-        button[data-baseweb="tab"][aria-selected="true"] {
-            background-color: rgba(125, 125, 125, 0.3) !important;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1) !important;
-        }
-    """,
-    "Apple Light": """
-        .stApp { background-color: #f8fafc; color: #0f172a; }
-        .apple-ring-card {
-            background: #ffffff;
-            border-radius: 24px;
-            padding: 1.8rem;
-            box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
-            border: 1px solid #e2e8f0;
-            margin-bottom: 1.5rem;
-        }
-        .macro-pill {
-            background: #ffffff;
-            border-radius: 20px;
-            padding: 1.2rem 1rem;
-            border: 1px solid #edf2f7;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.03);
-            text-align: center;
-        }
-        .ring-title, .macro-lbl { font-size: 0.8rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
-        .ring-val { font-size: 2.3rem; font-weight: 800; color: #0f172a; margin: 0.3rem 0; }
-        .macro-num { font-size: 1.6rem; font-weight: 800; color: #0f172a; margin: 0.2rem 0; }
-        div[data-baseweb="tab-list"] {
-            gap: 12px;
-            background-color: #e2e8f0;
-            padding: 6px;
-            border-radius: 18px;
-            margin-bottom: 1.5rem;
-        }
-        button[data-baseweb="tab"] {
-            border-radius: 14px !important;
-            font-size: 1.05rem !important;
-            font-weight: 700 !important;
-            padding: 0.75rem 1.6rem !important;
-            color: #475569 !important;
-            background-color: transparent !important;
-        }
-        button[data-baseweb="tab"][aria-selected="true"] {
-            background-color: #ffffff !important;
-            color: #0f172a !important;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08) !important;
-        }
-    """,
-    "Cal AI Dark": """
-        .stApp { background-color: #090a0f; color: #f8fafc; }
-        .apple-ring-card {
-            background: #131722;
-            border-radius: 24px;
-            padding: 1.8rem;
-            border: 1px solid #232936;
-            margin-bottom: 1.5rem;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-        }
-        .macro-pill {
-            background: #131722;
-            border-radius: 20px;
-            padding: 1.2rem 1rem;
-            border: 1px solid #232936;
-            text-align: center;
-        }
-        .ring-title, .macro-lbl { font-size: 0.8rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
-        .ring-val { font-size: 2.3rem; font-weight: 800; color: #ffffff; margin: 0.3rem 0; }
-        .macro-num { font-size: 1.6rem; font-weight: 800; color: #ffffff; margin: 0.2rem 0; }
-        div[data-baseweb="tab-list"] {
-            gap: 12px;
-            background-color: #1e2538;
-            padding: 6px;
-            border-radius: 18px;
-            margin-bottom: 1.5rem;
-        }
-        button[data-baseweb="tab"] {
-            border-radius: 14px !important;
-            font-size: 1.05rem !important;
-            font-weight: 700 !important;
-            padding: 0.75rem 1.6rem !important;
-            color: #94a3b8 !important;
-            background-color: transparent !important;
-        }
-        button[data-baseweb="tab"][aria-selected="true"] {
-            background-color: #00f5a0 !important;
-            color: #090a0f !important;
-            box-shadow: 0 4px 15px rgba(0, 245, 160, 0.3) !important;
-        }
-    """,
-    "Mint Fresh": """
-        .stApp { background-color: #f0fdf4; color: #064e3b; }
-        .apple-ring-card {
-            background: #ffffff;
-            border-radius: 24px;
-            padding: 1.8rem;
-            border: 1px solid #bbf7d0;
-            box-shadow: 0 8px 24px rgba(16, 185, 129, 0.08);
-            margin-bottom: 1.5rem;
-        }
-        .macro-pill {
-            background: #ffffff;
-            border-radius: 20px;
-            padding: 1.2rem 1rem;
-            border: 1px solid #bbf7d0;
-            text-align: center;
-        }
-        .ring-title, .macro-lbl { font-size: 0.8rem; font-weight: 700; color: #059669; text-transform: uppercase; letter-spacing: 0.05em; }
-        .ring-val { font-size: 2.3rem; font-weight: 800; color: #064e3b; margin: 0.3rem 0; }
-        .macro-num { font-size: 1.6rem; font-weight: 800; color: #064e3b; margin: 0.2rem 0; }
-        div[data-baseweb="tab-list"] {
-            gap: 12px;
-            background-color: #dcfce7;
-            padding: 6px;
-            border-radius: 18px;
-            margin-bottom: 1.5rem;
-        }
-        button[data-baseweb="tab"] {
-            border-radius: 14px !important;
-            font-size: 1.05rem !important;
-            font-weight: 700 !important;
-            padding: 0.75rem 1.6rem !important;
-            color: #065f46 !important;
+            padding: 0.65rem 1.35rem !important;
             background-color: transparent !important;
         }
         button[data-baseweb="tab"][aria-selected="true"] {
@@ -247,7 +282,47 @@ THEME_STYLES = {
             color: #ffffff !important;
             box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25) !important;
         }
-    """
+    """,
+    "Apple Light": build_theme_css(
+        bg_main="#F8FAFC", bg_sidebar="#F1F5F9", bg_card="#FFFFFF", bg_input="#F8FAFC",
+        text_primary="#0F172A", text_muted="#475569", border_col="#CBD5E1",
+        accent="#10B981", accent_fg="#FFFFFF", tab_bg="#E2E8F0"
+    ),
+    "Cal AI Dark": build_theme_css(
+        bg_main="#0B0F17", bg_sidebar="#111827", bg_card="#161F30", bg_input="#1E293B",
+        text_primary="#F8FAFC", text_muted="#94A3B8", border_col="#2D3B55",
+        accent="#00F5A0", accent_fg="#090D16", tab_bg="#131B2E"
+    ),
+    "Mint Fresh": build_theme_css(
+        bg_main="#F0FDF4", bg_sidebar="#DCFCE7", bg_card="#FFFFFF", bg_input="#F0FDF4",
+        text_primary="#064E3B", text_muted="#047857", border_col="#A7F3D0",
+        accent="#059669", accent_fg="#FFFFFF", tab_bg="#D1FAE5"
+    ),
+    "Warm Sunset": build_theme_css(
+        bg_main="#FFFBEB", bg_sidebar="#FEF3C7", bg_card="#FFFFFF", bg_input="#FFFBEB",
+        text_primary="#292524", text_muted="#78716C", border_col="#FDE68A",
+        accent="#D97706", accent_fg="#FFFFFF", tab_bg="#FEF3C7"
+    ),
+    "Ocean Breeze": build_theme_css(
+        bg_main="#F0F9FF", bg_sidebar="#E0F2FE", bg_card="#FFFFFF", bg_input="#F0F9FF",
+        text_primary="#0C4A6E", text_muted="#0369A1", border_col="#BAE6FD",
+        accent="#0284C7", accent_fg="#FFFFFF", tab_bg="#E0F2FE"
+    ),
+    "Royal Purple Dark": build_theme_css(
+        bg_main="#0F0A1C", bg_sidebar="#160F29", bg_card="#1E1436", bg_input="#2A1C4B",
+        text_primary="#F5F3FF", text_muted="#C4B5FD", border_col="#3B2766",
+        accent="#A855F7", accent_fg="#FFFFFF", tab_bg="#18102C"
+    ),
+    "Sakura Rose": build_theme_css(
+        bg_main="#FFF1F2", bg_sidebar="#FFE4E6", bg_card="#FFFFFF", bg_input="#FFF1F2",
+        text_primary="#4C0519", text_muted="#9F1239", border_col="#FECDD3",
+        accent="#E11D48", accent_fg="#FFFFFF", tab_bg="#FFE4E6"
+    ),
+    "Cyberpunk Gold": build_theme_css(
+        bg_main="#09090B", bg_sidebar="#121216", bg_card="#18181B", bg_input="#27272A",
+        text_primary="#FAFAFA", text_muted="#A1A1AA", border_col="#3F3F46",
+        accent="#EAB308", accent_fg="#09090B", tab_bg="#18181B"
+    ),
 }
 
 # Terapkan CSS Dinamis Sesuai Preferensi
@@ -284,13 +359,17 @@ scan_status = get_user_scan_status(current_user["user_id"])
 
 # Sidebar: Akun Pribadi & Target Harian (Efisien, Bersih, & Kompak)
 with st.sidebar:
-    # 1. Branding Header Ramping
-    st.markdown("""
-    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 0.8rem; padding-bottom: 0.5rem; border-bottom: 1px solid rgba(125, 125, 125, 0.15);">
-        <span style="font-size: 1.8rem;">🥗</span>
+    # 1. Branding Header Ramping + Badge original by MN & Versi Web
+    st.markdown(f"""
+    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 0.8rem; padding-bottom: 0.6rem; border-bottom: 1px solid rgba(125, 125, 125, 0.15);">
+        <span style="font-size: 1.9rem;">🥗</span>
         <div>
             <div style="font-weight: 800; font-size: 1.15rem; line-height: 1.15;">Nutrisi Cerdas</div>
-            <div style="font-size: 0.72rem; color: #10b981; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;">TKPI Kemenkes + USDA</div>
+            <div style="font-size: 0.7rem; color: #10b981; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;">TKPI Kemenkes + Open Food Facts</div>
+            <div style="margin-top: 4px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
+                <span style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.65rem; font-weight: 800; padding: 0.1rem 0.45rem; border-radius: 999px; border: 1px solid rgba(16, 185, 129, 0.3);">{APP_CREATOR}</span>
+                <span style="background: rgba(59, 130, 246, 0.15); color: #3b82f6; font-size: 0.65rem; font-weight: 800; padding: 0.1rem 0.45rem; border-radius: 999px;">{APP_VERSION}</span>
+            </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -377,28 +456,26 @@ with st.sidebar:
             st.success(f"🎯 Target kalori berhasil diatur menjadi **{recom_target} kkal/hari**!")
             st.rerun()
 
-    # 4. Ringkasan Tips Efektif
+    # 4. Pengaturan Tema Tampilan (9 Tema Proporsi 60-30-10 Kontras Tinggi)
     st.markdown("---")
-    st.markdown("""
-    <div style="font-size: 0.82rem; opacity: 0.82; line-height: 1.45;">
-        💡 <strong>Tips Nutrisi:</strong><br/>
-        • Foto makanan dari atas dengan cahaya terang.<br/>
-        • Minum 8 gelas (2.000 ml) air putih tiap hari.<br/>
-        • Porsi sayur & protein bantu rasa kenyang lebih lama.
-    </div>
-    """, unsafe_allow_html=True)
-
-    # 5. Pengaturan Tema Tampilan (Dipindahkan ke Footer Sidebar agar Tidak Menghabiskan Ruang)
-    st.markdown("---")
-    with st.expander("🎨 Pilihan Tema Tampilan (UI)", expanded=False):
-        theme_options = ["System Default", "Apple Light", "Cal AI Dark", "Mint Fresh"]
+    with st.expander("🎨 Pilihan Tema Tampilan (9 Tema)", expanded=False):
+        theme_options = list(THEME_STYLES.keys())
         current_idx = theme_options.index(user_theme) if user_theme in theme_options else 0
-        selected_theme = st.selectbox("Gaya Tampilan:", theme_options, index=current_idx, key="sb_theme_picker")
+        selected_theme = st.selectbox("Pilih Tema Warna UI:", theme_options, index=current_idx, key="sb_theme_picker")
         if selected_theme != user_theme:
             update_user_theme(current_user["user_id"], selected_theme)
             st.session_state["user"]["theme_preference"] = selected_theme
             st.toast(f"Tema diubah ke {selected_theme}!")
             st.rerun()
+
+    # 5. Informasi Versi Web Patch Update & Changelog
+    with st.expander(f"📋 Web Patch Update ({APP_VERSION})", expanded=False):
+        st.caption(f"Dikembangkan oleh **Muhammad Nabillah ({APP_CREATOR})**")
+        for p in PATCH_NOTES:
+            st.markdown(f"**🚀 {p['version']}** _{p['date']}_")
+            for hl in p["highlights"]:
+                st.caption(f"• {hl}")
+            st.markdown("---")
 
 # Header Brand Utama dengan Logo Menonjol & Kotak Login Akun Langsung di Halaman Utama
 current_user = st.session_state["user"]
@@ -421,13 +498,16 @@ with col_head1:
     <div style="display: flex; align-items: center; gap: 18px; margin-bottom: 0.5rem; padding: 0.5rem 0;">
         {logo_img_html}
         <div>
-            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-                <h1 style="font-size: 2.6rem; font-weight: 800; margin: 0; letter-spacing: -0.02em;">Nutrisi Cerdas</h1>
-                <span style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.8rem; font-weight: 800; padding: 0.35rem 0.8rem; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid rgba(16, 185, 129, 0.3);">
-                    BASIS TKPI KEMENKES + USDA • PORSI ESTIMASI AI
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <h1 style="font-size: 2.5rem; font-weight: 800; margin: 0; letter-spacing: -0.02em;">Nutrisi Cerdas</h1>
+                <span style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.76rem; font-weight: 800; padding: 0.3rem 0.75rem; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid rgba(16, 185, 129, 0.3);">
+                    TKPI KEMENKES + OPEN FOOD FACTS • AI VISION
+                </span>
+                <span style="background: linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%); color: #ffffff; font-size: 0.72rem; font-weight: 800; padding: 0.28rem 0.7rem; border-radius: 9999px; letter-spacing: 0.04em; box-shadow: 0 2px 10px rgba(139, 92, 246, 0.3);">
+                    ✨ {APP_CREATOR} • {APP_VERSION}
                 </span>
             </div>
-            <p style="margin: 0.2rem 0 0 0; opacity: 0.8; font-size: 1.05rem; font-weight: 500;">
+            <p style="margin: 0.25rem 0 0 0; opacity: 0.82; font-size: 1.02rem; font-weight: 500;">
                 Kalkulator & Diary Nutrisi: Pahami Pola Makanmu Berbasis Rujukan Pangan Terverifikasi
             </p>
         </div>
@@ -436,7 +516,6 @@ with col_head1:
 
 with col_head2:
     with st.container(border=True):
-        from db_history import is_admin_user
         is_admin = is_admin_user(current_user["user_id"])
         
         if is_admin:
@@ -459,7 +538,6 @@ with col_head2:
                     in_pin = st.text_input("PIN / Password (6 Angka/Karakter):", type="password", placeholder="******", key="login_pin")
                     
                     if st.button("🚀 Masuk Sekarang", type="primary", use_container_width=True, key="btn_do_login"):
-                        from db_history import authenticate_user
                         success, res = authenticate_user(in_uid, in_pin)
                         if success:
                             st.session_state["user"] = res
@@ -556,11 +634,14 @@ with col_head2:
                     - 🤖 **Auto-Learning AI Prioritas**
                     - 📊 **Export Laporan Gizi Lengkap**
                     """)
-                    st.info("🎁 **Spesial Peluncuran:** Coba gratis 30 Hari penuh!")
-                    if st.button("✨ Klaim Uji Coba Gratis 1 Bulan PRO", type="primary", use_container_width=True):
-                        activate_pro_tier(current_user["user_id"], days=30)
-                        st.toast("Selamat! Uji Coba Gratis 1 Bulan PRO Anda sudah aktif!")
-                        st.rerun()
+                    st.info("🎁 **Spesial Peluncuran:** Coba gratis 30 Hari penuh dengan membuat akun pribadi!")
+                    if current_user["user_id"] == "Tamu (Demo)":
+                        st.warning("🔒 Anda masih dalam Mode Tamu. Silakan klik tombol **'🔑 Masuk / Daftar Akun'** di sebelah kiri untuk membuat akun dan mengaktifkan 30 Hari PRO Gratis secara otomatis!")
+                    else:
+                        if st.button("✨ Klaim Uji Coba Gratis 1 Bulan PRO", type="primary", use_container_width=True):
+                            activate_pro_tier(current_user["user_id"], days=30)
+                            st.toast("Selamat! Uji Coba Gratis 1 Bulan PRO Anda sudah aktif!")
+                            st.rerun()
                         
                     st.markdown("---")
                     st.markdown("##### 💳 **Perpanjangan Langganan PRO (QRIS)**")
@@ -576,10 +657,13 @@ with col_head2:
                     """, unsafe_allow_html=True)
                     
                     if st.button("✅ Saya Sudah Transfer / Bayar via QRIS", use_container_width=True):
-                        activate_pro_tier(current_user["user_id"], days=30)
-                        st.balloons()
-                        st.success("Pembayaran terverifikasi! Akun Anda aktif sebagai PRO selama 30 hari ke depan.")
-                        st.rerun()
+                        if current_user["user_id"] == "Tamu (Demo)":
+                            st.error("Silakan daftar/masuk akun terlebih dahulu sebelum mengonfirmasi pembayaran agar status PRO tidak hilang.")
+                        else:
+                            activate_pro_tier(current_user["user_id"], days=30)
+                            st.balloons()
+                            st.success("Pembayaran terverifikasi! Akun Anda aktif sebagai PRO selama 30 hari ke depan.")
+                            st.rerun()
 
 # Smart Hero Banner untuk Pengunjung Tamu (Conversion Call to Action)
 if current_user["user_id"] == "Tamu (Demo)":
@@ -741,6 +825,7 @@ with tab_diary:
     p_g = stats['today_totals']['protein_g']
     f_g = stats['today_totals']['fat_g']
     c_g = stats['today_totals']['carb_g']
+    fib_g = stats['today_totals']['fiber_g']
     macro_sum = p_g + f_g + c_g
     if macro_sum > 0:
         p_pct = round((p_g / macro_sum) * 100)
@@ -762,6 +847,32 @@ with tab_diary:
                 <span style="color: #d97706;">● Lemak {f_pct}%</span>
                 <span style="color: #059669;">● Karbo {c_pct}%</span>
             </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # 🧠 Inovasi: Smart Daily Balancer (Asisten Penyeimbang Gizi Harian Real-Time)
+    rem_kcal = max(0.0, target_kcal - today_kcal)
+    target_prot = round((target_kcal * 0.22) / 4.0)  # ~22% kalori dari protein
+    if stats['today_totals']['count'] > 0:
+        if p_g < target_prot * 0.5 and rem_kcal > 250:
+            balancer_msg = f"🥩 <strong>Asupan Protein Masih Rendah ({p_g}g / target ~{target_prot}g):</strong> Tambahkan <strong>2 butir telur rebus (+12g P)</strong>, <strong>1 potong dada ayam bakar (+28g P)</strong>, atau <strong>tempe/tahu</strong> di jam makan berikutnya agar massa otot tetap terjaga!"
+            balancer_col = "#0284c7"
+        elif fib_g < 10.0 and rem_kcal > 150:
+            balancer_msg = f"🥦 <strong>Serat Pangan Belum Optimal ({fib_g}g / target 25g):</strong> Tambahkan seporsi <strong>sayur bening bayam, capcay, atau 1 buah pepaya/apel</strong> agar pencernaan lancar dan kenyang lebih tahan lama."
+            balancer_col = "#10b981"
+        elif rem_kcal <= 150 and today_kcal <= target_kcal * 1.05:
+            balancer_msg = f"🎯 <strong>Target Harian Hampir Sempurna!</strong> Sisa kuota kalori Anda tinggal <strong>{rem_kcal:.0f} kkal</strong>. Cukup minum air putih atau teh tawar hangat untuk menutup hari ini."
+            balancer_col = "#10b981"
+        elif today_kcal > target_kcal * 1.05:
+            balancer_msg = f"⚡ <strong>Kalori Melewati Target (+{today_kcal - target_kcal:.0f} kkal):</strong> Tidak perlu panik! Cukup jalan kaki santai 20–30 menit sore/malam ini dan kurangi porsi karbohidrat besok pagi."
+            balancer_col = "#f59e0b"
+        else:
+            balancer_msg = f"✨ <strong>Komposisi Makanmu Terjaga Baik!</strong> Sisa budget hari ini <strong>{rem_kcal:.0f} kkal</strong>. Pertahankan porsi protein dan air putih."
+            balancer_col = "#10b981"
+            
+        st.markdown(f"""
+        <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.25); border-left: 5px solid {balancer_col}; border-radius: 14px; padding: 0.85rem 1.15rem; margin-bottom: 1rem; font-size: 0.88rem; line-height: 1.45;">
+            🧠 <strong>Smart Daily Balancer:</strong> {balancer_msg}
         </div>
         """, unsafe_allow_html=True)
 
@@ -873,17 +984,26 @@ with tab_diary:
         st.markdown(f"""
         <div class="apple-ring-card">
             <div class="ring-title">Total Kalori 30 Hari</div>
-            <div class="ring-val" style="color: #0284c7;">{m_data['total_kcal']:,.0f} <span style="font-size: 1rem; color: #64748b; font-weight: 500;">kkal</span></div>
-            <hr style="margin: 0.8rem 0; border: none; border-top: 1px solid #f1f5f9;">
-            <p style="margin: 0.3rem 0; color: #475569;">📅 <strong>Hari Aktif Mencatat:</strong> {m_data['active_days']} hari</p>
-            <p style="margin: 0.3rem 0; color: #475569;">🍽️ <strong>Total Menu Masuk:</strong> {m_data['total_meals']} porsi</p>
-            <p style="margin: 0.3rem 0; color: #475569;">⚡ <strong>Rata-rata Harian:</strong> {(m_data['total_kcal'] / max(1, m_data['active_days'])):,.0f} kkal/hari</p>
+            <div class="ring-val" style="color: #0284c7;">{m_data['total_kcal']:,.0f} <span style="font-size: 1rem; opacity: 0.7; font-weight: 500;">kkal</span></div>
+            <hr style="margin: 0.8rem 0; border: none; border-top: 1px solid rgba(125, 125, 125, 0.2);">
+            <p style="margin: 0.3rem 0; opacity: 0.9;">📅 <strong>Hari Aktif Mencatat:</strong> {m_data['active_days']} hari</p>
+            <p style="margin: 0.3rem 0; opacity: 0.9;">🍽️ <strong>Total Menu Masuk:</strong> {m_data['total_meals']} porsi</p>
+            <p style="margin: 0.3rem 0; opacity: 0.9;">⚡ <strong>Rata-rata Harian:</strong> {(m_data['total_kcal'] / max(1, m_data['active_days'])):,.0f} kkal/hari</p>
         </div>
         """, unsafe_allow_html=True)
 
     # Riwayat Makan Hari Ini & Tombol Hapus Baris
     st.markdown("### 📝 **Buku Harian Makan Hari Ini**")
     
+    # Normalisasi nama waktu makan lama yang mungkin memiliki emoji di depannya
+    def normalize_meal_key(raw_mtype: str) -> str:
+        if not raw_mtype:
+            return "Lainnya"
+        for k in ["Sarapan", "Makan Siang", "Makan Malam", "Camilan"]:
+            if k.lower() in raw_mtype.lower():
+                return k
+        return raw_mtype
+
     # Tombol Bagikan ke WhatsApp & Ekspor
     if stats["today_meals"]:
         wa_text = (
@@ -894,7 +1014,7 @@ with tab_diary:
             f"📋 *Menu Hari Ini:*\n"
         )
         for idx, m in enumerate(stats["today_meals"], 1):
-            m_type = m.get("meal_type") or "Makan"
+            m_type = normalize_meal_key(m.get("meal_type"))
             wa_text += f"{idx}. [{m_type}] {m['dish_name']} ({m['energy_kcal']} kkal)\n"
         wa_text += "\nCek & hitung nutrisi makananmu di: https://nutrisi-cerdas.streamlit.app"
         
@@ -931,7 +1051,7 @@ with tab_diary:
         
         grouped_meals = {}
         for m in stats["today_meals"]:
-            mtype = m.get("meal_type") or "Lainnya"
+            mtype = normalize_meal_key(m.get("meal_type"))
             if mtype not in grouped_meals:
                 grouped_meals[mtype] = []
             grouped_meals[mtype].append(m)
@@ -989,20 +1109,15 @@ with tab_diary:
 
 # ================= TAB 2: CATAT MAKANAN BARU =================
 with tab_scanner:
-    # Ambil API key otomatis
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not api_key and hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-        api_key = st.secrets["GEMINI_API_KEY"]
-        
     if not api_key:
         st.warning("⚠️ **Mode Offline Lab Aktif (API Key Belum Disetel di Streamlit Secrets)**")
-        st.info("Pencarian teks database lab (1.300+ pangan) & input manual tetap berfungsi 100%. Untuk mengaktifkan Vision AI scan foto piring, tambahkan `GEMINI_API_KEY` di menu Secrets Streamlit Cloud.")
+        st.info("Pencarian teks database lab (1.300+ pangan), scan barcode Open Food Facts, & input manual tetap berfungsi 100%. Untuk mengaktifkan Vision AI scan foto piring, tambahkan `GEMINI_API_KEY` di menu Secrets Streamlit Cloud.")
 
     subtab_foto, subtab_kamera, subtab_teks, subtab_barcode, subtab_manual = st.tabs([
         "📁 Unggah Foto Galeri", 
         "📸 Jepret Kamera HP", 
         "✍️ Tulis Menu Harian", 
-        "🏷️ Cari Barcode Kemasan",
+        "🏷️ Barcode & Kemasan (Live)",
         "➕ Input Manual Sendiri"
     ])
     
@@ -1024,10 +1139,13 @@ with tab_scanner:
                 if not scan_status["can_scan"]:
                     st.warning("⚠️ **Batas Scan Harian Free Tercapai (3/3).**")
                     st.markdown("Nikmati **Scan Foto Sepuasnya** cuma **Rp 19.000/bulan**!")
-                    if st.button("👑 Buka Scan Unlimited (Uji Coba PRO)", type="primary", use_container_width=True, key="btn_up_pro1"):
-                        activate_pro_tier(current_user["user_id"], days=30)
-                        st.toast("Akun PRO aktif! Silakan scan kembali.")
-                        st.rerun()
+                    if current_user["user_id"] != "Tamu (Demo)":
+                        if st.button("👑 Buka Scan Unlimited (Uji Coba PRO)", type="primary", use_container_width=True, key="btn_up_pro1"):
+                            activate_pro_tier(current_user["user_id"], days=30)
+                            st.toast("Akun PRO aktif! Silakan scan kembali.")
+                            st.rerun()
+                    else:
+                        st.info("Daftar akun gratis di atas untuk langsung mendapatkan 30 Hari PRO!")
                 else:
                     if st.button("🚀 Analisis Nutrisi Foto", type="primary", use_container_width=True, key="btn_foto"):
                         with st.spinner("Menganalisis visual foto makanan..."):
@@ -1059,10 +1177,13 @@ with tab_scanner:
                 if not scan_status["can_scan"]:
                     st.warning("⚠️ **Batas Scan Harian Free Tercapai (3/3).**")
                     st.markdown("Nikmati **Scan Foto Sepuasnya** cuma **Rp 19.000/bulan**!")
-                    if st.button("👑 Buka Scan Unlimited (Uji Coba PRO)", type="primary", use_container_width=True, key="btn_up_pro2"):
-                        activate_pro_tier(current_user["user_id"], days=30)
-                        st.toast("Akun PRO aktif! Silakan scan kembali.")
-                        st.rerun()
+                    if current_user["user_id"] != "Tamu (Demo)":
+                        if st.button("👑 Buka Scan Unlimited (Uji Coba PRO)", type="primary", use_container_width=True, key="btn_up_pro2"):
+                            activate_pro_tier(current_user["user_id"], days=30)
+                            st.toast("Akun PRO aktif! Silakan scan kembali.")
+                            st.rerun()
+                    else:
+                        st.info("Daftar akun gratis di atas untuk langsung mendapatkan 30 Hari PRO!")
                 else:
                     if st.button("🚀 Analisis Jepretan Kamera", type="primary", use_container_width=True, key="btn_cam"):
                         with st.spinner("Menganalisis foto kamera..."):
@@ -1096,24 +1217,46 @@ with tab_scanner:
                         st.error(f"Gagal memproses teks: {e}")
 
     with subtab_barcode:
-        st.markdown("#### 🏷️ **Cari Nutrisi Berdasarkan Nomor Barcode (EAN-13)**")
-        st.caption("Ketikkan nomor barcode 8-13 digit yang tertera di kemasan produk ritel (misal: Ultra Milk, Indomie, Fitbar, Pocari Sweat):")
+        st.markdown("#### 🏷️ **Dual-Mode Scanner: Nomor Barcode (Lokal + Open Food Facts Live) & Foto Kemasan**")
+        st.caption("Cari produk ritel dari katalog lokal maupun 3+ Juta produk di pangkalan data global **Open Food Facts**. Hasil dapat Anda **edit terlebih dahulu** sebelum dipublikasikan ke katalog utama!")
         
-        c_bar1, c_bar2 = st.columns([2, 1])
+        c_bar1, c_bar2 = st.columns([2.2, 1], vertical_alignment="bottom")
         with c_bar1:
-            in_barcode = st.text_input("Nomor Barcode Produk:", placeholder="Contoh: 8998866200231 (Ultra Milk Cokelat) / 089686010921 (Indomie)", key="input_barcode_field")
+            in_barcode = st.text_input(
+                "Nomor Barcode Produk (8–14 Digit):",
+                placeholder="Contoh: 8998866200231 (Ultra Milk) / 089686010921 (Indomie) / 3017620422003 (Nutella)",
+                key="input_barcode_field"
+            )
         with c_bar2:
-            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            btn_barcode = st.button("🔍 Cek Nutrisi Barcode", type="primary", use_container_width=True, key="btn_check_barcode")
-            
-        if btn_barcode and in_barcode.strip():
+            btn_barcode = st.button("🔍 Cek Barcode (Lokal & Live)", type="primary", use_container_width=True, key="btn_check_barcode")
+
+        # Pintasan Contoh Barcode Populer untuk Uji Cepat
+        st.caption("⚡ **Klik Cepat Contoh Barcode:**")
+        sc_b1, sc_b2, sc_b3, sc_b4 = st.columns(4)
+        sample_code = None
+        if sc_b1.button("🥛 Ultra Milk Cokelat", use_container_width=True, key="smp_bc1"):
+            sample_code = "8998866200231"
+        if sc_b2.button("🍜 Indomie Goreng", use_container_width=True, key="smp_bc2"):
+            sample_code = "089686010921"
+        if sc_b3.button("🍫 Nutella (Live OFF)", use_container_width=True, key="smp_bc3"):
+            sample_code = "3017620422003"
+        if sc_b4.button("🍪 Oreo (Live OFF)", use_container_width=True, key="smp_bc4"):
+            sample_code = "7622210449283"
+
+        target_bc = sample_code or (in_barcode.strip() if btn_barcode else "")
+        if target_bc:
             from nutrition_engine import find_best_match
-            matched = find_best_match(in_barcode.strip())
+            with st.spinner(f"🔍 Mencari barcode `{target_bc}` di database lokal & Open Food Facts API..."):
+                matched = find_best_match(target_bc)
             if matched:
+                src_info = matched.get("source_origin") or "Katalog Terverifikasi Lokal"
                 st.session_state["nutrition_data"] = {
                     "dish_name": matched["food_name"],
                     "confidence": "high",
                     "portion_category": "standar kemasan",
+                    "barcode": matched.get("barcode") or target_bc,
+                    "source_origin": src_info,
+                    "serving_unit": matched.get("serving_unit") or "1 kemasan",
                     "components": [{
                         "name": matched["food_name"],
                         "weight_g": matched.get("default_serving_weight") or 100.0,
@@ -1121,14 +1264,32 @@ with tab_scanner:
                         "protein_g_per_100g": matched["protein_g"],
                         "fat_g_per_100g": matched["fat_g"],
                         "carb_g_per_100g": matched["carb_g"],
-                        "fiber_g_per_100g": matched["fiber_g"]
+                        "fiber_g_per_100g": matched.get("fiber_g") or 0.0,
+                        "sodium_mg_per_100g": matched.get("sodium_mg") or 0.0
                     }],
-                    "health_tip": f"Produk ritel resmi terverifikasi label kemasan. Ukuran saji standar: {matched.get('serving_unit', '1 porsi')}."
+                    "health_tip": f"Sumber Data: {src_info}. Ukuran saji: {matched.get('serving_unit', '100g')}. Anda dapat meninjau atau mengedit angka gizinya di bawah sebelum dipublikasikan."
                 }
                 st.toast(f"✅ Produk ditemukan: {matched['food_name']}")
                 st.rerun()
             else:
-                st.error("Nomor barcode belum terdaftar di pangkalan data ritel. Coba ketik nama produknya di tab 'Tulis Menu Harian' atau gunakan kamera.")
+                st.error("Nomor barcode tidak ditemukan di database lokal maupun Open Food Facts. Gunakan fitur **Foto Bungkus / Tabel Nilai Gizi** di bawah ini!")
+
+        st.markdown("---")
+        with st.expander("📸 **Tidak Ada Barcode? Foto Bungkus Kemasan / Tabel Informasi Nilai Gizi**", expanded=False):
+            st.caption("Unggah atau foto bagian belakang kemasan (Tabel Informasi Nilai Gizi). AI akan mengekstrak angkanya agar bisa Anda tinjau & edit sebelum dipublikasikan.")
+            pkg_file = st.file_uploader("Pilih foto bungkus / label gizi kemasan:", type=["jpg", "jpeg", "png", "webp"], key="scan_pkg_img")
+            if pkg_file and api_key:
+                im_pkg = Image.open(pkg_file)
+                st.image(im_pkg, caption="Foto Kemasan / Label Gizi", width=260)
+                if st.button("🔬 Ekstrak Tabel Nilai Gizi Kemasan", type="primary", key="btn_scan_pkg"):
+                    with st.spinner("Membaca tabel nilai gizi pada kemasan..."):
+                        try:
+                            res = analyze_food_image(im_pkg, caption="Kemasan produk ritel / tabel informasi nilai gizi", api_key=api_key)
+                            res["source_origin"] = "Ekstraksi Vision Label Gizi (Draft)"
+                            st.session_state["nutrition_data"] = res
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Gagal membaca foto kemasan: {e}")
 
     with subtab_manual:
         st.markdown("#### ➕ Catat Makanan / Produk Kemasan Sendiri")
@@ -1146,9 +1307,16 @@ with tab_scanner:
                 m_fat = st.number_input("Lemak (gram):", min_value=0.0, value=4.0, step=1.0)
                 m_carb = st.number_input("Karbohidrat (gram):", min_value=0.0, value=24.0, step=1.0)
             
-            m_meal_time = st.selectbox("Waktu Makan:", ["🌅 Sarapan", "☀️ Makan Siang", "🌙 Makan Malam", "🥪 Camilan"], key="sel_manual_time")
+            MEAL_MAP_MANUAL = {
+                "🌅 Sarapan": "Sarapan",
+                "☀️ Makan Siang": "Makan Siang",
+                "🌙 Makan Malam": "Makan Malam",
+                "🍪 Camilan": "Camilan"
+            }
+            m_meal_label = st.selectbox("Waktu Makan:", list(MEAL_MAP_MANUAL.keys()), key="sel_manual_time")
+            m_meal_clean = MEAL_MAP_MANUAL[m_meal_label]
             
-            if st.button("💾 Simpan Langsung ke Diary Hari Ini", type="primary", use_container_width=True):
+            if st.button("💾 Simpan ke Diary & Ajukan ke Antrean Katalog", type="primary", use_container_width=True):
                 if m_food_name.strip():
                     log_meal(
                         user_id=st.session_state["user"]["user_id"],
@@ -1156,11 +1324,21 @@ with tab_scanner:
                         totals={"energy_kcal": m_kcal, "protein_g": m_prot, "fat_g": m_fat, "carb_g": m_carb, "fiber_g": 0.0},
                         multiplier=1.0,
                         caption=f"Manual Input ({m_serving})",
-                        meal_type=m_meal_time
+                        meal_type=m_meal_clean
                     )
-                    # Simpan juga ke katalog pribadi user
                     add_custom_food(st.session_state["user"]["user_id"], m_food_name.strip(), m_serving, m_kcal, m_prot, m_fat, m_carb)
-                    st.success(f"Berhasil dicatat ke sesi {m_meal_time}!")
+                    stage_pending_food(
+                        food_name=m_food_name.strip(),
+                        category="Input Manual Pengguna",
+                        kcal_100=m_kcal,
+                        p_100=m_prot,
+                        f_100=m_fat,
+                        c_100=m_carb,
+                        serving_unit=m_serving or "1 porsi",
+                        source_origin="Input Manual User",
+                        submitted_by=current_user["user_id"]
+                    )
+                    st.success(f"Berhasil dicatat ke sesi {m_meal_clean} & disimpan ke draft kurasi!")
                     st.rerun()
                 else:
                     st.warning("Mohon isi nama makanan terlebih dahulu.")
@@ -1182,7 +1360,7 @@ with tab_scanner:
                                     totals={"energy_kcal": c_item["energy_kcal"], "protein_g": c_item["protein_g"], "fat_g": c_item["fat_g"], "carb_g": c_item["carb_g"], "fiber_g": 0.0},
                                     multiplier=1.0,
                                     caption="Koleksi Pribadi",
-                                    meal_type=m_meal_time
+                                    meal_type=m_meal_clean
                                 )
                                 st.toast(f"Berhasil mencatat {c_item['food_name']}!")
                                 st.rerun()
@@ -1193,7 +1371,7 @@ with tab_scanner:
             else:
                 st.info("Belum ada makanan kustom tersimpan. Makanan yang Anda tambahkan di sebelah kiri akan tersimpan di sini agar bisa dicatat cepat kapan saja tanpa mengetik ulang.")
 
-    # HASIL ANALISIS MAKANAN & TOMBOL SIMPAN
+    # HASIL ANALISIS MAKANAN, NUTRI-GRADE, & FITUR EDIT SEBELUM PUBLIKASI
     if st.session_state["nutrition_data"]:
         data = st.session_state["nutrition_data"]
         st.markdown("---")
@@ -1218,6 +1396,32 @@ with tab_scanner:
         calc_res = calculate_dish_nutrition(data.get("components", []), portion_multiplier=p_mult)
         t_tot = calc_res["totals"]
         
+        # Inovasi: Evaluasi Nutri-Grade (A-D) & Rambu Peringatan GGL Kemenkes
+        ng = evaluate_nutri_grade(
+            t_tot["energy_kcal"], t_tot["protein_g"], t_tot["fat_g"],
+            t_tot["carb_g"], t_tot["fiber_g"], t_tot.get("sodium_mg", 0.0)
+        )
+        badges_html = " ".join([
+            f'<span style="background: rgba(125,125,125,0.12); color: {b_col}; border: 1px solid {b_col}; font-size: 0.75rem; font-weight: 800; padding: 0.2rem 0.6rem; border-radius: 999px;">{b_txt}</span>'
+            for b_txt, b_col in ng["badges"]
+        ])
+        st.markdown(f"""
+        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; background: rgba(125, 125, 125, 0.06); border: 1px solid rgba(125, 125, 125, 0.16); border-radius: 16px; padding: 0.85rem 1.2rem; margin: 0.6rem 0;">
+            <div style="display: flex; align-items: center; gap: 12px;">
+                <div style="background: {ng['color']}; color: #ffffff; font-size: 1.4rem; font-weight: 900; width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center; justify-content: center;">
+                    {ng['grade']}
+                </div>
+                <div>
+                    <div style="font-size: 0.75rem; font-weight: 800; opacity: 0.75; text-transform: uppercase;">Indeks Nutri-Grade & GGL</div>
+                    <div style="font-size: 1.0rem; font-weight: 800;">{ng['label']}</div>
+                </div>
+            </div>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+                {badges_html}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
         if data.get("health_tip"):
             st.markdown(f"""
             <div class="apple-tip">
@@ -1268,7 +1472,58 @@ with tab_scanner:
             })
         st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
-        # Pilihan Kategori Waktu Makan Otomatis Sesuai Jam
+        # 🛡️ FITUR EDIT SEBELUM PUBLIKASI (Menghindari Update Database Mendadak)
+        with st.expander("✏️ **Edit / Koreksi Nilai Gizi Sebelum Dipublikasikan ke Database**", expanded=False):
+            st.caption("Koreksi nama menu atau angka nutrisi di bawah ini. Anda dapat memilih untuk menerapkan ke catatan makan Anda saja, atau mempublikasikannya ke katalog utama.")
+            ed_c1, ed_c2 = st.columns(2)
+            with ed_c1:
+                ed_name = st.text_input("Nama Pangan / Produk:", value=data.get("dish_name", "Menu Makanan"), key="ed_res_name")
+                ed_cat = st.text_input("Kategori Pangan:", value="Produk Terverifikasi MN", key="ed_res_cat")
+                ed_bc = st.text_input("Nomor Barcode (Opsional):", value=str(data.get("barcode") or ""), key="ed_res_bc")
+                ed_serv = st.text_input("Satuan Saji:", value=str(data.get("serving_unit") or "1 porsi"), key="ed_res_serv")
+            with ed_c2:
+                ed_kcal = st.number_input("Kalori (kkal):", min_value=0.0, value=float(t_tot["energy_kcal"]), step=5.0, key="ed_res_kcal")
+                ed_p = st.number_input("Protein (g):", min_value=0.0, value=float(t_tot["protein_g"]), step=0.5, key="ed_res_p")
+                ed_f = st.number_input("Lemak (g):", min_value=0.0, value=float(t_tot["fat_g"]), step=0.5, key="ed_res_f")
+                ed_c = st.number_input("Karbohidrat (g):", min_value=0.0, value=float(t_tot["carb_g"]), step=0.5, key="ed_res_c")
+
+            col_pub1, col_pub2 = st.columns(2)
+            with col_pub1:
+                if st.button("✅ Terapkan Koreksi ke Hasil Ini", use_container_width=True, key="btn_apply_edit_local"):
+                    st.session_state["nutrition_data"]["dish_name"] = ed_name
+                    st.session_state["nutrition_data"]["components"] = [{
+                        "name": ed_name,
+                        "weight_g": 100.0,
+                        "energy_kcal_per_100g": ed_kcal,
+                        "protein_g_per_100g": ed_p,
+                        "fat_g_per_100g": ed_f,
+                        "carb_g_per_100g": ed_c,
+                        "fiber_g_per_100g": float(t_tot.get("fiber_g", 0.0))
+                    }]
+                    st.toast("Nilai gizi pada kartu hasil berhasil diperbarui!")
+                    st.rerun()
+            with col_pub2:
+                if is_admin:
+                    if st.button("🚀 Publikasikan Resmi ke Katalog Utama (Admin)", type="primary", use_container_width=True, key="btn_pub_catalog_now"):
+                        publish_food_to_catalog(
+                            food_name=ed_name, category=ed_cat,
+                            kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
+                            fib_100=float(t_tot.get("fiber_g", 0.0)),
+                            barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0
+                        )
+                        st.success(f"🎉 '{ed_name}' berhasil dipublikasikan secara resmi ke katalog utama!")
+                else:
+                    if st.button("📥 Ajukan ke Antrean Publikasi Admin", type="primary", use_container_width=True, key="btn_stage_catalog_now"):
+                        stage_pending_food(
+                            food_name=ed_name, category=ed_cat,
+                            kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
+                            fib_100=float(t_tot.get("fiber_g", 0.0)),
+                            barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0,
+                            source_origin="Koreksi Pengguna", submitted_by=current_user["user_id"]
+                        )
+                        st.success("✅ Berhasil diajukan ke antrean kurasi Admin sebelum dipublikasikan!")
+
+        # Pilihan Kategori Waktu Makan Otomatis Sesuai Jam (Tanpa Bug Emoji)
         curr_h = datetime.now().hour
         if 4 <= curr_h < 11:
             def_idx = 0
@@ -1279,14 +1534,21 @@ with tab_scanner:
         else:
             def_idx = 3
 
+        MEAL_SCAN_MAP = {
+            "🌅 Sarapan": "Sarapan",
+            "☀️ Makan Siang": "Makan Siang",
+            "🌙 Makan Malam": "Makan Malam",
+            "🍪 Camilan": "Camilan"
+        }
         st.markdown("##### 🕒 Waktu Makan:")
-        sel_meal_type = st.radio(
+        sel_meal_label = st.radio(
             "Kategori:",
-            ["🌅 Sarapan", "☀️ Makan Siang", "🌙 Makan Malam", "🥪 Camilan"],
+            list(MEAL_SCAN_MAP.keys()),
             horizontal=True,
             index=def_idx,
             label_visibility="collapsed"
         )
+        sel_meal_clean = MEAL_SCAN_MAP[sel_meal_label]
         
         # Tombol Simpan ke Akun Pribadi & Tombol Batal
         col_act1, col_act2 = st.columns([3, 1])
@@ -1298,9 +1560,9 @@ with tab_scanner:
                     totals=t_tot,
                     multiplier=p_mult,
                     caption=data.get("user_caption", ""),
-                    meal_type=sel_meal_type
+                    meal_type=sel_meal_clean
                 )
-                st.success(f"Berhasil dicatat ke sesi {sel_meal_type} akun {st.session_state['user']['display_name']}! Silakan cek tab Dashboard.")
+                st.success(f"Berhasil dicatat ke sesi {sel_meal_clean} akun {st.session_state['user']['display_name']}! Silakan cek tab Dashboard.")
                 st.session_state["nutrition_data"] = None
                 st.rerun()
         with col_act2:
@@ -1310,8 +1572,75 @@ with tab_scanner:
 
 # ================= TAB 3: SUMBER DATA & ENSIKLOPEDIA NUTRISI =================
 with tab_sources:
-    st.markdown("## 📚 **Pusat Rujukan & Sumber Data Nutrisi Resmi**")
-    st.caption("Seluruh kalkulasi nilai nutrisi pada sistem Nutrisi Cerdas berpatokan 100% pada data uji laboratorium ilmiah dan resmi pemerintah, bukan estimasi fiksi.")
+    st.markdown("## 📚 **Pusat Rujukan & Kurasi Pangkalan Data Nutrisi**")
+    st.caption("Seluruh kalkulasi nilai nutrisi pada sistem Nutrisi Cerdas berpatokan pada data uji laboratorium ilmiah TKPI Kemenkes RI, USDA, dan Open Food Facts dengan sistem kurasi bertahap.")
+
+    # 🛡️ PANEL KURASI & EDIT SEBELUM PUBLIKASI (Menghindari Update Mendadak)
+    pending_list = get_pending_foods(status="pending")
+    with st.expander(f"🛡️ **Panel Kurasi & Edit Data Gizi Sebelum Publikasi ({len(pending_list)} Draft Menunggu)**", expanded=bool(is_admin and len(pending_list) > 0)):
+        st.caption("Setiap data baru dari **Open Food Facts API**, **AI Auto-Learn**, maupun **Usulan Pengguna** masuk ke ruang tinjauan (Staging) ini terlebih dahulu agar Anda dapat mengedit dan memverifikasi angkanya sebelum resmi dipublikasikan ke database utama.")
+        if pending_list:
+            for p_item in pending_list[:15]:
+                with st.container(border=True):
+                    st.markdown(f"**📝 Draft #{p_item['id']}: {p_item['food_name']}** • `{p_item['source_origin']}`")
+                    pc1, pc2, pc3 = st.columns([2, 2, 1.2])
+                    with pc1:
+                        p_name = st.text_input("Nama Pangan:", value=p_item["food_name"], key=f"pend_n_{p_item['id']}")
+                        p_cat = st.text_input("Kategori:", value=p_item["category"] or "Produk Kemasan", key=f"pend_cat_{p_item['id']}")
+                        p_bc = st.text_input("Barcode:", value=p_item["barcode"] or "", key=f"pend_bc_{p_item['id']}")
+                    with pc2:
+                        p_kcal = st.number_input("Energi (kkal/100g):", value=float(p_item["energy_kcal"]), step=5.0, key=f"pend_k_{p_item['id']}")
+                        p_prot = st.number_input("Protein (g/100g):", value=float(p_item["protein_g"]), step=0.5, key=f"pend_p_{p_item['id']}")
+                        p_fat = st.number_input("Lemak (g/100g):", value=float(p_item["fat_g"]), step=0.5, key=f"pend_f_{p_item['id']}")
+                        p_carb = st.number_input("Karbo (g/100g):", value=float(p_item["carb_g"]), step=0.5, key=f"pend_c_{p_item['id']}")
+                    with pc3:
+                        st.markdown("<div style='height: 18px;'></div>", unsafe_allow_html=True)
+                        if st.button("🚀 Publikasikan", type="primary", use_container_width=True, key=f"btn_pub_{p_item['id']}"):
+                            publish_food_to_catalog(
+                                food_name=p_name, category=p_cat,
+                                kcal_100=p_kcal, p_100=p_prot, f_100=p_fat, c_100=p_carb,
+                                fib_100=float(p_item.get("fiber_g") or 0.0),
+                                sod_100=float(p_item.get("sodium_mg") or 0.0),
+                                barcode=p_bc,
+                                serving_unit=p_item.get("serving_unit") or "100g",
+                                serving_weight=float(p_item.get("default_serving_weight") or 100.0),
+                                pending_id=p_item["id"]
+                            )
+                            st.toast(f"✅ {p_name} resmi dipublikasikan ke katalog utama!")
+                            st.rerun()
+                        if st.button("🗑️ Tolak Draft", use_container_width=True, key=f"btn_rej_{p_item['id']}"):
+                            reject_pending_food(p_item["id"])
+                            st.toast("Draft dihapus dari antrean.")
+                            st.rerun()
+        else:
+            st.success("✨ Tidak ada antrean draft yang menunggu. Anda juga dapat menambahkan atau mengedit data pangan baru melalui formulir di bawah.")
+
+        st.markdown("---")
+        st.markdown("##### ➕ **Tambah / Edit Langsung Pangan ke Katalog Utama**")
+        add_c1, add_c2, add_c3 = st.columns(3)
+        with add_c1:
+            new_f_name = st.text_input("Nama Makanan / Produk:", placeholder="Misal: Susu Steril Bear Brand", key="new_cat_name")
+            new_f_cat = st.text_input("Kategori:", value="Produk Ritel Terverifikasi", key="new_cat_cat")
+            new_f_bc = st.text_input("Kode Barcode (Opsional):", placeholder="8992696404441", key="new_cat_bc")
+        with add_c2:
+            new_f_kcal = st.number_input("Kalori (per 100g/saji):", min_value=0.0, value=120.0, step=5.0, key="new_cat_kcal")
+            new_f_p = st.number_input("Protein (g):", min_value=0.0, value=6.0, step=0.5, key="new_cat_p")
+            new_f_f = st.number_input("Lemak (g):", min_value=0.0, value=4.5, step=0.5, key="new_cat_f")
+        with add_c3:
+            new_f_c = st.number_input("Karbohidrat (g):", min_value=0.0, value=9.5, step=0.5, key="new_cat_c")
+            new_f_fib = st.number_input("Serat (g):", min_value=0.0, value=0.0, step=0.5, key="new_cat_fib")
+            st.markdown("<div style='height: 26px;'></div>", unsafe_allow_html=True)
+            if st.button("💾 Simpan & Publikasikan ke Katalog", type="primary", use_container_width=True, key="btn_direct_pub"):
+                if new_f_name.strip():
+                    publish_food_to_catalog(
+                        food_name=new_f_name.strip(), category=new_f_cat.strip(),
+                        kcal_100=new_f_kcal, p_100=new_f_p, f_100=new_f_f, c_100=new_f_c,
+                        fib_100=new_f_fib, barcode=new_f_bc.strip()
+                    )
+                    st.success(f"✅ '{new_f_name}' berhasil disimpan dan dipublikasikan ke katalog utama!")
+                    st.rerun()
+                else:
+                    st.warning("Isi nama makanan terlebih dahulu.")
 
     # 3 Kartu Lembaga Sumber Resmi
     col_s1, col_s2, col_s3 = st.columns(3)
@@ -1319,7 +1648,7 @@ with tab_sources:
         st.markdown("""
         <div class="apple-ring-card">
             <h4 style="margin: 0; color: #10b981;">🏛️ Kemenkes RI (TKPI)</h4>
-            <p style="font-size: 0.88rem; color: #64748b; margin-top: 0.4rem;">
+            <p style="font-size: 0.88rem; opacity: 0.82; margin-top: 0.4rem;">
                 <strong>Tabel Komposisi Pangan Indonesia</strong> (Panganku.org). Memuat lebih dari 1.100+ bahan mentah & masakan tradisional nusantara per 100g BDD (Bagian Dapat Dimakan).
             </p>
             <a href="https://www.panganku.org" target="_blank" style="font-weight: 700; color: #10b981; font-size: 0.85rem;">Kunjungi Panganku.org ↗</a>
@@ -1328,18 +1657,18 @@ with tab_sources:
     with col_s2:
         st.markdown("""
         <div class="apple-ring-card">
-            <h4 style="margin: 0; color: #0284c7;">🌾 USDA FoodData Central</h4>
-            <p style="font-size: 0.88rem; color: #64748b; margin-top: 0.4rem;">
-                Standar laboratorium internasional Departemen Pertanian Amerika Serikat untuk bahan baku global, aneka jenis kopi, buah impor, dan menu modern terverifikasi.
+            <h4 style="margin: 0; color: #0284c7;">🌐 Open Food Facts & USDA</h4>
+            <p style="font-size: 0.88rem; opacity: 0.82; margin-top: 0.4rem;">
+                Pangkalan data terbuka produk kemasan dunia (3+ juta barcode EAN-13) dan standar laboratorium Departemen Pertanian AS untuk bahan pangan global.
             </p>
-            <a href="https://fdc.nal.usda.gov" target="_blank" style="font-weight: 700; color: #0284c7; font-size: 0.85rem;">Kunjungi USDA FoodData ↗</a>
+            <a href="https://world.openfoodfacts.org" target="_blank" style="font-weight: 700; color: #0284c7; font-size: 0.85rem;">Kunjungi Open Food Facts ↗</a>
         </div>
         """, unsafe_allow_html=True)
     with col_s3:
         st.markdown("""
         <div class="apple-ring-card">
             <h4 style="margin: 0; color: #d97706;">🔬 NilaiGizi.com & AKG</h4>
-            <p style="font-size: 0.88rem; color: #64748b; margin-top: 0.4rem;">
+            <p style="font-size: 0.88rem; opacity: 0.82; margin-top: 0.4rem;">
                 Platform nutrisionis nasional (AhliGizi.ID) dan acuan Angka Kecukupan Gizi (AKG Permenkes No. 28/2019) untuk validasi porsi rumah tangga (URT) Indonesia.
             </p>
             <a href="https://nilaigizi.com" target="_blank" style="font-weight: 700; color: #d97706; font-size: 0.85rem;">Kunjungi NilaiGizi.com ↗</a>
@@ -1347,14 +1676,13 @@ with tab_sources:
         """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("### 🔍 **Pencarian Terbuka Pangkalan Data Laboratorium & Ritel (1.300+ Item)**")
+    st.markdown("### 🔍 **Pencarian Terbuka Pangkalan Data Laboratorium & Ritel**")
     st.caption("Cari bahan makanan atau menu masakan apapun di database lokal untuk melihat profil nutrisi per 100 gram:")
 
     col_q1, col_q2 = st.columns([2, 1])
     with col_q1:
-        search_query = st.text_input("Ketik nama makanan:", placeholder="Contoh: ayam, nasi, telur, ultra milk, indomie, fitbar", key="kb_search")
+        search_query = st.text_input("Ketik nama makanan atau nomor barcode:", placeholder="Contoh: ayam, nasi, telur, ultra milk, indomie, fitbar", key="kb_search")
     with col_q2:
-        # Ambil daftar kategori unik
         import sqlite3
         conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
         conn.row_factory = sqlite3.Row
@@ -1363,13 +1691,14 @@ with tab_sources:
         sel_cat = st.selectbox("Filter Kategori:", ["Semua Kategori"] + cats, key="kb_cat")
         conn.close()
 
-    # Query database
     conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
     cur = conn.cursor()
-    sql = "SELECT food_name, category, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg FROM food_composition WHERE 1=1"
+    total_db_count = cur.execute("SELECT COUNT(*) FROM food_composition").fetchone()[0]
+    sql = "SELECT food_name, category, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode FROM food_composition WHERE 1=1"
     params = []
     if search_query.strip():
-        sql += " AND food_name LIKE ?"
+        sql += " AND (food_name LIKE ? OR barcode LIKE ?)"
+        params.append(f"%{search_query.strip()}%")
         params.append(f"%{search_query.strip()}%")
     if sel_cat != "Semua Kategori":
         sql += " AND category = ?"
@@ -1390,20 +1719,24 @@ with tab_sources:
                 "Lemak (g)": r[4],
                 "Karbohidrat (g)": r[5],
                 "Serat (g)": r[6],
-                "Natrium (mg)": r[7]
+                "Natrium (mg)": r[7],
+                "Barcode": r[8] or "-"
             })
         st.dataframe(table_kb, use_container_width=True, hide_index=True)
-        st.caption(f"Menampilkan {len(results)} hasil teratas dari total 1.301 entri pangan terverifikasi.")
+        st.caption(f"Menampilkan {len(results)} hasil teratas dari total {total_db_count:,} entri pangan terverifikasi.")
     else:
         st.info("Tidak ada bahan makanan yang cocok dengan kata kunci tersebut. Coba kata kunci lain.")
 
-# ================= TAB 4: PANDUAN PENGGUNAAN STEP BY STEP =================
+# ================= TAB 4: PANDUAN PENGGUNAAN & PATCH NOTES =================
 with tab_guide:
-    st.markdown("""
+    st.markdown(f"""
     <div style="padding: 1rem 0 1.5rem 0;">
-        <h2 style="font-size: 1.8rem; font-weight: 800; margin: 0 0 0.5rem 0;">📖 Panduan Lengkap Penggunaan Nutrisi Cerdas</h2>
-        <p style="opacity: 0.8; font-size: 1.05rem;">
-            Pelajari cara memanfaatkan fitur pencatatan kalori, kalkulator defisit/surplus, dan diary gizi harian secara maksimal.
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <h2 style="font-size: 1.8rem; font-weight: 800; margin: 0;">📖 Panduan Penggunaan & Catatan Rilis</h2>
+            <span style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.78rem; font-weight: 800; padding: 0.25rem 0.7rem; border-radius: 999px;">{APP_CREATOR} • {APP_VERSION}</span>
+        </div>
+        <p style="opacity: 0.8; font-size: 1.02rem; margin-top: 0.4rem;">
+            Pelajari cara memanfaatkan fitur pencatatan kalori, scanner barcode Open Food Facts, kurasi database, dan diary gizi harian secara maksimal.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -1414,45 +1747,52 @@ with tab_guide:
         with st.container(border=True):
             st.markdown("### 1️⃣ **Mulai & Amankan Akun Anda**")
             st.markdown("""
-            * **Langkah 1:** Klik tombol **'🔑 Masuk Akun'** di sudut kanan atas.
-            * **Langkah 2:** Klik tombol putih **'Sign in with Google'** untuk menghubungkan akun Gmail Anda, atau ketik nama Anda.
-            * **Keuntungan:** Semua riwayat makan, grafik mingguan, dan target kalori Anda akan tersimpan permanen dan tidak akan hilang saat browser ditutup.
+            * **Langkah 1:** Klik tombol **'🔑 Masuk / Daftar Akun'** di sudut kanan atas atau pada banner Dashboard.
+            * **Langkah 2:** Buat akun cepat dalam 30 detik menggunakan nama panggilan & PIN 4–6 digit.
+            * **Keuntungan:** Semua riwayat makan, grafik mingguan, dan bonus **30 Hari PRO Gratis** langsung aktif dan terkunci permanen di perangkat Anda.
             """)
 
         with st.container(border=True):
-            st.markdown("### 2️⃣ **Atur Target Kalori Harian (BMR/TDEE)**")
+            st.markdown("### 2️⃣ **Atur Target Kalori & 9 Tema UI**")
             st.markdown("""
-            * **Langkah 1:** Buka panel samping (Sidebar) di sebelah kiri layar HP/Laptop.
-            * **Langkah 2:** Buka menu **'🧮 Hitung Target Ideal (BMR/TDEE)'**.
-            * **Langkah 3:** Masukkan berat badan, tinggi badan, usia, dan tujuan program Anda (Turunkan Berat Badan / Jaga Berat Badan / Naikkan Massa Otot).
-            * **Langkah 4:** Klik **'Gunakan Target Ini'**, maka Cincin Kalori di Dashboard akan otomatis menyesuaikan!
+            * **Target BMR Otomatis:** Dihitung langsung saat pendaftaran menggunakan rumus klinis *Mifflin-St Jeor* Kemenkes RI.
+            * **9 Pilihan Tema Proporsi 60-30-10:** Buka Sidebar kiri bawah menu **'🎨 Pilihan Tema Tampilan (9 Tema)'** untuk memilih gaya warna favorit (*Apple Light, Cal AI Dark, Mint Fresh, Warm Sunset, Ocean Breeze, Royal Purple Dark, Sakura Rose, Cyberpunk Gold*) yang dijamin tajam & nyaman di mata.
             """)
 
     with col_g2:
         with st.container(border=True):
-            st.markdown("### 3️⃣ **Mencatat Makanan Harian (3 Cara Mudah)**")
+            st.markdown("### 3️⃣ **Mencatat Makanan & Scan Barcode Kemasan**")
             st.markdown("""
-            Masuk ke tab **'📸 CATAT MAKANAN BARU'**:
-            * **Cara A (Jepret Kamera HP):** Arahkan kamera langsung ke piring makananmu, lalu klik *'Analisis Jepretan Kamera'*.
-            * **Cara B (Unggah Foto Galeri):** Pilih foto makanan dari galeri HP Anda.
-            * **Cara C (Tulis Teks Bebas):** Ketik apa saja yang Anda makan (misal: *'1 piring nasi padang rendang dan daun singkong'*).
-            * **Simpan ke Diary:** Di bawah hasil analisa, pilih waktu makan (Sarapan/Makan Siang/Makan Malam) lalu klik **'💾 Simpan ke Buku Harian'**.
+            * **Cara A (Catat Cepat Dashboard):** Ketik langsung makananmu di kotak *Catat Cepat* halaman depan.
+            * **Cara B (Foto Piring / Kamera HP):** Jepret makananmu, AI akan mengestimasi gramasi URT & mencocokkan ke data lab.
+            * **Cara C (Barcode Live Open Food Facts):** Masukkan kode barcode kemasan atau foto Tabel Informasi Nilai Gizi. Anda dapat **mengedit angkanya terlebih dahulu** sebelum dipublikasikan ke katalog!
             """)
 
         with st.container(border=True):
-            st.markdown("### 4️⃣ **Evaluasi Tren & Pola Makan Anda**")
+            st.markdown("### 4️⃣ **Kurasi Data & Evaluasi Nutri-Grade**")
             st.markdown("""
-            * Buka tab **'📊 DASHBOARD REKAPAN'** untuk melihat:
-              * **Cincin Aktivitas Kalori Hari Ini** (berapa sisa kuota kalori Anda).
-              * **Grafik Tren 7 Hari & 30 Hari** (mendeteksi hari di mana Anda makan berlebih).
-              * **Tombol Bagikan ke WhatsApp** untuk mengirim laporan diet harian ke pelatih, teman, atau keluarga!
+            * **Nutri-Grade (A–D) & Rambu GGL:** Setiap makanan dilengkapi skor kesehatan (A s/d D) dan peringatan otomatis jika tinggi lemak/natrium.
+            * **Edit Sebelum Publikasi:** Di tab **📚 Ensiklopedia**, seluruh produk baru masuk ke ruang tinjauan (*Staging*) agar dapat diverifikasi dan diedit sebelum dipublikasikan ke database utama.
             """)
 
     st.markdown("---")
+    st.markdown(f"### 🚀 **Riwayat Pembaruan Web (Patch Notes — {APP_CREATOR})**")
+    for p in PATCH_NOTES:
+        with st.container(border=True):
+            st.markdown(f"#### 📌 **{p['version']}** <span style='font-size: 0.85rem; opacity: 0.7; font-weight: 500;'>({p['date']})</span>", unsafe_allow_html=True)
+            for hl in p["highlights"]:
+                st.markdown(f"- {hl}")
+
+    st.markdown("---")
     st.markdown("### 💡 **Pertanyaan Umum (FAQ)**")
-    with st.expander("❓ Apakah data makanan saya aman dan privat?"):
-        st.write("Ya, data riwayat makanan Anda hanya terikat pada akun Google atau username Anda sendiri dan tidak dapat diakses oleh publik.")
-    with st.expander("❓ Bagaimana cara kerja kuota scan foto makanan?"):
-        st.write("Pengguna Free mendapatkan 3x scan foto kamera/galeri setiap hari secara gratis. Pencarian database lab dan pencatatan via teks bersifat 100% tanpa batas selamanya. Anda bisa mengklaim 30 Hari Gratis PRO untuk menikmati scan foto tanpa batas.")
+    with st.expander("❓ Mengapa produk baru masuk ke antrean Edit Sebelum Publikasi terlebih dahulu?"):
+        st.write("Untuk menjaga akurasi setara laboratorium dan menghindari perubahan database secara mendadak. Anda atau Admin dapat meninjau dan mengoreksi angka kalori/makronutrien terlebih dahulu sebelum menyimpannya secara permanen ke katalog utama.")
     with st.expander("❓ Dari mana data kalori dan nutrisi ini diambil?"):
-        st.write("Data nutrisi kami 100% berbasis Tabel Komposisi Pangan Indonesia (TKPI) resmi Kementerian Kesehatan RI, USDA FoodData Central, dan NilaiGizi.")
+        st.write("Data nutrisi kami berbasis Tabel Komposisi Pangan Indonesia (TKPI) resmi Kementerian Kesehatan RI, USDA FoodData Central, Open Food Facts Global Database, dan NilaiGizi.")
+
+# Footer Resmi original by MN
+st.markdown(f"""
+<div style="text-align: center; padding: 2rem 0 1rem 0; margin-top: 2rem; border-top: 1px solid rgba(125, 125, 125, 0.15); font-size: 0.85rem; opacity: 0.75;">
+    🥗 <strong>Nutrisi Cerdas</strong> • Kalkulator & Diary Gizi Terverifikasi • Crafted with ❤️ <strong>{APP_CREATOR}</strong> (Muhammad Nabillah) • Build <code>{APP_VERSION}</code>
+</div>
+""", unsafe_allow_html=True)
