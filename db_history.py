@@ -441,6 +441,7 @@ def activate_pro_tier(user_id: str, days: int = 30):
 def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0, caption: str = "", meal_type: str = "Makan Siang"):
     """
     Menyimpan satu catatan makan ke buku harian pengguna dengan kategori waktu makan.
+    Mengembalikan dict data log yang baru disimpan agar antarmuka dapat menampilkan tanda konfirmasi.
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -460,9 +461,17 @@ def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0
         caption,
         meal_type
     ))
+    new_id = cur.lastrowid
     conn.commit()
     conn.close()
-    return True
+    return {
+        "id": new_id,
+        "user_id": user_id,
+        "dish_name": dish_name,
+        "energy_kcal": totals.get("energy_kcal", 0.0),
+        "meal_type": meal_type,
+        "saved_at": datetime.now().strftime("%H:%M")
+    }
 
 def delete_meal_log(log_id: int, user_id: str):
     """

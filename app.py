@@ -865,6 +865,22 @@ pct_today = min(round((today_kcal / target_kcal) * 100, 1), 100.0) if target_kca
 
 # ================= TAB 1: DASHBOARD REKAPAN KALORI =================
 with tab_diary:
+    # Pesan Konfirmasi Penyimpanan Terakhir (Visual Feedback Anti-Bingung)
+    if "last_saved_item" in st.session_state and st.session_state["last_saved_item"]:
+        saved_info = st.session_state["last_saved_item"]
+        st.markdown(f"""
+        <div style="background: rgba(16, 185, 129, 0.12); border: 1.5px solid #10b981; border-radius: 16px; padding: 0.9rem 1.2rem; margin-bottom: 1.2rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <span style="font-size: 1.6rem;">✅</span>
+                <div>
+                    <div style="font-weight: 800; font-size: 0.98rem; color: #10b981;">Tersimpan Permanen ke Buku Harian!</div>
+                    <div style="font-size: 0.84rem; opacity: 0.9;"><strong>{saved_info['dish_name']}</strong> ({saved_info['energy_kcal']} kkal) • Sesi <strong>{saved_info['meal_type']}</strong> • Jam {saved_info['saved_at']}</div>
+                </div>
+            </div>
+            <span style="background: #10b981; color: white; font-size: 0.72rem; font-weight: 800; padding: 0.25rem 0.65rem; border-radius: 999px;">DATA AMAN</span>
+        </div>
+        """, unsafe_allow_html=True)
+
     # Banner Cincin Aktivitas Kalori Hari Ini (Apple Health Style)
     st.markdown(f"""
     <div class="apple-ring-card">
@@ -1002,7 +1018,7 @@ with tab_diary:
                 if st.button(qp_label, use_container_width=True, key=f"dash_qp_{idx_qp}"):
                     current_hour = datetime.now().hour
                     auto_meal = "Sarapan" if 4 <= current_hour < 11 else ("Makan Siang" if 11 <= current_hour < 16 else ("Makan Malam" if 16 <= current_hour < 21 else "Camilan"))
-                    log_meal(
+                    res_log = log_meal(
                         user_id=st.session_state["user"]["user_id"],
                         dish_name=qp_name,
                         totals=qp_tot,
@@ -1010,6 +1026,7 @@ with tab_diary:
                         caption="Piring Cepat 1-Klik",
                         meal_type=auto_meal
                     )
+                    st.session_state["last_saved_item"] = res_log
                     st.toast(f"✅ {qp_name} ({qp_tot['energy_kcal']} kkal) dicatat ke {auto_meal}!")
                     st.rerun()
             
@@ -1037,7 +1054,7 @@ with tab_diary:
                         else:
                             auto_meal = "Camilan"
                             
-                        log_meal(
+                        res_log = log_meal(
                             user_id=st.session_state["user"]["user_id"],
                             dish_name=res.get("dish_name", dash_quick_text.strip()),
                             totals=totals,
@@ -1045,6 +1062,7 @@ with tab_diary:
                             caption=dash_quick_text.strip(),
                             meal_type=auto_meal
                         )
+                        st.session_state["last_saved_item"] = res_log
                         st.balloons()
                         st.toast(f"Berhasil mencatat {res.get('dish_name')} ({totals['energy_kcal']} kkal) ke {auto_meal}!")
                         st.rerun()
@@ -1206,9 +1224,12 @@ with tab_diary:
 
                 for m in meals_in_group:
                     time_str = datetime.strptime(m["logged_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M") if " " in m["logged_at"] else m["logged_at"]
-                    col_row1, col_row2, col_row3 = st.columns([3, 2.2, 0.8], vertical_alignment="center")
+                    is_just_saved = ("last_saved_item" in st.session_state and st.session_state["last_saved_item"] and st.session_state["last_saved_item"].get("id") == m["id"])
+                    saved_badge = '<span style="background: rgba(16,185,129,0.18); color: #10b981; font-size: 0.68rem; font-weight: 800; padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid rgba(16,185,129,0.3); margin-left: 6px;">🟢 BARU DISIMPAN</span>' if is_just_saved else ''
+
+                    col_row1, col_row2, col_row3 = st.columns([3.2, 2.0, 0.8], vertical_alignment="center")
                     with col_row1:
-                        st.markdown(f"**{m['dish_name']}**")
+                        st.markdown(f"**{m['dish_name']}** {saved_badge}", unsafe_allow_html=True)
                         sub_cap = f"_{m['photo_caption']}_" if m['photo_caption'] else ""
                         st.caption(f"🕒 {time_str} {sub_cap}")
                     with col_row2:
@@ -1569,7 +1590,7 @@ with tab_scanner:
         col_act1, col_act2 = st.columns([3, 1])
         with col_act1:
             if st.button(f"💾 Simpan ke Buku Harian ({st.session_state['user']['display_name']})", type="primary", use_container_width=True):
-                log_meal(
+                res_log = log_meal(
                     user_id=st.session_state["user"]["user_id"],
                     dish_name=data.get("dish_name", "Menu Sehat"),
                     totals=t_tot,
@@ -1577,8 +1598,9 @@ with tab_scanner:
                     caption=data.get("user_caption", ""),
                     meal_type=sel_meal_clean
                 )
-                st.success(f"Berhasil dicatat ke sesi {sel_meal_clean}! Silakan cek tab 📊 Hari Ini.")
+                st.session_state["last_saved_item"] = res_log
                 st.session_state["nutrition_data"] = None
+                st.toast(f"✅ {data.get('dish_name')} berhasil disimpan ke {sel_meal_clean}!")
                 st.rerun()
         with col_act2:
             if st.button("❌ Bersihkan", use_container_width=True):
