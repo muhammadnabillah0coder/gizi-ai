@@ -29,7 +29,8 @@ from db_history import (
     get_user_scan_status, record_scan_usage, activate_pro_tier,
     log_water_intake, get_water_intake,
     is_admin_user, register_user, authenticate_user,
-    stage_pending_food, get_pending_foods, publish_food_to_catalog, reject_pending_food
+    stage_pending_food, get_pending_foods, publish_food_to_catalog, reject_pending_food,
+    export_user_data_json, import_user_data_json
 )
 from google_auth import get_google_auth_url, exchange_code_for_user
 
@@ -567,7 +568,34 @@ with st.sidebar:
             st.toast(f"Tema diubah ke {selected_theme}!")
             st.rerun()
 
-    # 5. Informasi Versi Web Patch Update & Changelog (Hanya Tampil untuk Admin)
+    # 5. Cadangan Data Riwayat (Anti-Hilang)
+    if current_user["user_id"] != "Tamu (Demo)":
+        with st.expander("🛡️ **Cadangan Data Akun (Anti-Hilang)**", expanded=False):
+            st.caption("Unduh salinan riwayat makanan Anda ke HP/Laptop agar data Anda selalu aman kapan saja:")
+            backup_json = export_user_data_json(current_user["user_id"])
+            st.download_button(
+                "📥 Unduh Cadangan Riwayat (.json)",
+                data=backup_json,
+                file_name=f"cadangan_gizi_{current_user['user_id']}_{datetime.now().strftime('%Y%m%d')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+            st.markdown("---")
+            st.caption("Pulihkan dari file cadangan sebelumnya:")
+            up_backup = st.file_uploader("Pilih file cadangan (.json):", type=["json"], key="up_backup_restore")
+            if up_backup:
+                try:
+                    str_data = up_backup.read().decode("utf-8")
+                    ok_imp, msg_imp = import_user_data_json(current_user["user_id"], str_data)
+                    if ok_imp:
+                        st.success(msg_imp)
+                        st.rerun()
+                    else:
+                        st.error(msg_imp)
+                except Exception as ex:
+                    st.error(f"Gagal memulihkan: {ex}")
+
+    # 6. Informasi Versi Web Patch Update & Changelog (Hanya Tampil untuk Admin)
     if is_admin:
         with st.expander(f"📋 Web Patch Update ({APP_VERSION} - Admin Only)", expanded=False):
             st.caption(f"Dikembangkan oleh **Muhammad Nabillah ({APP_CREATOR})**")
@@ -871,14 +899,47 @@ tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([
     "❓ Bantuan"
 ])
 
-# Ambil statistik riwayat akun
-stats = get_user_history_stats(st.session_state["user"]["user_id"])
+# Inisialisasi Tanggal Aktif Dashboard (Mendukung Hari Ini, Kemarin, dan Kalender Bebas)
+if "selected_diary_date" not in st.session_state:
+    st.session_state["selected_diary_date"] = datetime.now().date()
+
+active_diary_date = st.session_state["selected_diary_date"]
+active_diary_date_str = active_diary_date.strftime("%Y-%m-%d")
+
+# Ambil statistik riwayat akun berdasarkan tanggal yang dipilih
+stats = get_user_history_stats(st.session_state["user"]["user_id"], target_date=active_diary_date_str)
 target_kcal = float(st.session_state["user"].get("daily_calorie_target") or 2000.0)
 today_kcal = stats["today_totals"]["energy_kcal"]
 pct_today = min(round((today_kcal / target_kcal) * 100, 1), 100.0) if target_kcal > 0 else 0
 
 # ================= TAB 1: DASHBOARD REKAPAN KALORI =================
 with tab_diary:
+    # Bar Navigasi Tanggal Cepat (Hari Ini, Kemarin, Kalender)
+    c_date1, c_date2, c_date3, c_date4 = st.columns([1.2, 1.2, 1.6, 2], vertical_alignment="center")
+    today_dt = datetime.now().date()
+    yesterday_dt = today_dt - timedelta(days=1)
+    
+    with c_date1:
+        if st.button("📍 Hari Ini", use_container_width=True, type="primary" if active_diary_date == today_dt else "secondary"):
+            st.session_state["selected_diary_date"] = today_dt
+            st.rerun()
+    with c_date2:
+        if st.button("⏮️ Kemarin", use_container_width=True, type="primary" if active_diary_date == yesterday_dt else "secondary"):
+            st.session_state["selected_diary_date"] = yesterday_dt
+            st.rerun()
+    with c_date3:
+        pick_d = st.date_input("Pilih Tanggal:", value=active_diary_date, max_value=today_dt + timedelta(days=7), key="dash_datepicker", label_visibility="collapsed")
+        if pick_d != active_diary_date:
+            st.session_state["selected_diary_date"] = pick_d
+            st.rerun()
+    with c_date4:
+        date_display_text = active_diary_date.strftime('%A, %d %B %Y')
+        # Terjemahan nama hari sederhana
+        day_id = {"Monday": "Senin", "Tuesday": "Selasa", "Wednesday": "Rabu", "Thursday": "Kamis", "Friday": "Jumat", "Saturday": "Sabtu", "Sunday": "Minggu"}.get(active_diary_date.strftime('%A'), active_diary_date.strftime('%A'))
+        st.markdown(f"<div style='text-align: right; font-weight: 700; font-size: 0.92rem; opacity: 0.85;'>📅 {day_id}, {active_diary_date.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
+
     # Pesan Konfirmasi Penyimpanan Terakhir (Visual Feedback Anti-Bingung)
     if "last_saved_item" in st.session_state and st.session_state["last_saved_item"]:
         saved_info = st.session_state["last_saved_item"]
@@ -900,7 +961,7 @@ with tab_diary:
     <div class="apple-ring-card">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
             <div>
-                <div class="ring-title">🎯 Cincin Kalori Hari Ini ({datetime.now().strftime('%d %B %Y')})</div>
+                <div class="ring-title">🎯 Cincin Kalori ({active_diary_date.strftime('%d %B %Y')})</div>
                 <div class="ring-val">{today_kcal:,.1f} <span style="font-size: 1.1rem; color: #64748b; font-weight: 500;">/ {target_kcal:,.0f} kkal</span></div>
                 <div class="ring-sub">Tercapai <strong>{pct_today}%</strong> • Sisa budget: <strong>{max(0.0, target_kcal - today_kcal):,.1f} kkal</strong></div>
             </div>
@@ -1298,6 +1359,8 @@ with tab_scanner:
                 st.markdown("#### Siap Menganalisis?")
                 st.caption("AI memindai porsi URT & mencocokkan ke 1.300+ data laboratorium resmi TKPI Kemenkes & produk ritel.")
                 
+                auto_save_opt = st.checkbox("⚡ **Langsung Simpan Otomatis** ke Buku Harian setelah selesai analisis", value=True, key="opt_autosave_photo")
+                
                 if not scan_status["can_scan"]:
                     st.warning("⚠️ **Batas Scan Harian Free Tercapai (3/3).**")
                     st.markdown("Nikmati **Scan Foto Sepuasnya** cuma **Rp 19.000/bulan**!")
@@ -1315,6 +1378,22 @@ with tab_scanner:
                                 res = analyze_food_image(im, caption=p_caption, api_key=api_key)
                                 res["user_caption"] = p_caption
                                 record_scan_usage(current_user["user_id"])
+                                
+                                if auto_save_opt:
+                                    calc_res_temp = calculate_dish_nutrition(res.get("components", []), portion_multiplier=1.0)
+                                    curr_h = datetime.now().hour
+                                    auto_meal = "Sarapan" if 4 <= curr_h < 11 else ("Makan Siang" if 11 <= curr_h < 16 else ("Makan Malam" if 16 <= curr_h < 21 else "Camilan"))
+                                    res_log = log_meal(
+                                        user_id=current_user["user_id"],
+                                        dish_name=res.get("dish_name", "Menu Sehat"),
+                                        totals=calc_res_temp["totals"],
+                                        multiplier=1.0,
+                                        caption=p_caption or "Foto Piring",
+                                        meal_type=auto_meal
+                                    )
+                                    st.session_state["last_saved_item"] = res_log
+                                    st.toast(f"✅ {res.get('dish_name')} berhasil dianalisis & disimpan otomatis ke {auto_meal}!")
+                                
                                 st.session_state["nutrition_data"] = res
                                 st.rerun()
                             except Exception as e:

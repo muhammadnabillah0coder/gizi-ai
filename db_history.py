@@ -438,29 +438,53 @@ def activate_pro_tier(user_id: str, days: int = 30):
     conn.close()
     return expiry
 
-def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0, caption: str = "", meal_type: str = "Makan Siang"):
+def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0, caption: str = "", meal_type: str = "Makan Siang", log_date: str = None):
     """
     Menyimpan satu catatan makan ke buku harian pengguna dengan kategori waktu makan.
+    Mendukung custom log_date (format YYYY-MM-DD) untuk mencatat makanan hari kemarin/lalu.
     Mengembalikan dict data log yang baru disimpan agar antarmuka dapat menampilkan tanda konfirmasi.
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO meal_logs 
-        (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, portion_multiplier, photo_caption, meal_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        dish_name,
-        totals.get("energy_kcal", 0.0),
-        totals.get("protein_g", 0.0),
-        totals.get("fat_g", 0.0),
-        totals.get("carb_g", 0.0),
-        totals.get("fiber_g", 0.0),
-        multiplier,
-        caption,
-        meal_type
-    ))
+    
+    if log_date:
+        # Jika ada tanggal khusus, gabungkan dengan jam saat ini
+        now_time = datetime.now().strftime("%H:%M:%S")
+        custom_timestamp = f"{log_date} {now_time}"
+        cur.execute("""
+            INSERT INTO meal_logs 
+            (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, portion_multiplier, photo_caption, meal_type, logged_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            dish_name,
+            totals.get("energy_kcal", 0.0),
+            totals.get("protein_g", 0.0),
+            totals.get("fat_g", 0.0),
+            totals.get("carb_g", 0.0),
+            totals.get("fiber_g", 0.0),
+            multiplier,
+            caption,
+            meal_type,
+            custom_timestamp
+        ))
+    else:
+        cur.execute("""
+            INSERT INTO meal_logs 
+            (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, portion_multiplier, photo_caption, meal_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            dish_name,
+            totals.get("energy_kcal", 0.0),
+            totals.get("protein_g", 0.0),
+            totals.get("fat_g", 0.0),
+            totals.get("carb_g", 0.0),
+            totals.get("fiber_g", 0.0),
+            multiplier,
+            caption,
+            meal_type
+        ))
     new_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -484,10 +508,10 @@ def delete_meal_log(log_id: int, user_id: str):
     conn.close()
     return True
 
-def get_user_history_stats(user_id: str):
+def get_user_history_stats(user_id: str, target_date: str = None):
     """
     Mengambil rekapan nutrisi:
-    1. Hari ini
+    1. Tanggal terpilih (target_date, default hari ini)
     2. 7 Hari Terakhir (Mingguan)
     3. 30 Hari Terakhir (Bulanan)
     """
@@ -495,21 +519,24 @@ def get_user_history_stats(user_id: str):
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
-    # Hari ini (sejak jam 00:00)
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    today_meals = cur.execute("""
+    # Gunakan tanggal yang diminta, atau default ke hari ini
+    if not target_date:
+        target_date = datetime.now().strftime("%Y-%m-%d")
+        
+    date_meals = cur.execute("""
         SELECT * FROM meal_logs 
-        WHERE user_id = ? AND date(logged_at) = date('now', 'localtime')
+        WHERE user_id = ? AND date(logged_at) = ?
         ORDER BY id DESC
-    """, (user_id,)).fetchall()
+    """, (user_id, target_date)).fetchall()
     
-    today_totals = {
-        "energy_kcal": round(sum(m["energy_kcal"] for m in today_meals), 1),
-        "protein_g": round(sum(m["protein_g"] for m in today_meals), 1),
-        "fat_g": round(sum(m["fat_g"] for m in today_meals), 1),
-        "carb_g": round(sum(m["carb_g"] for m in today_meals), 1),
-        "fiber_g": round(sum(m["fiber_g"] for m in today_meals), 1),
-        "count": len(today_meals)
+    date_totals = {
+        "energy_kcal": round(sum(m["energy_kcal"] for m in date_meals), 1),
+        "protein_g": round(sum(m["protein_g"] for m in date_meals), 1),
+        "fat_g": round(sum(m["fat_g"] for m in date_meals), 1),
+        "carb_g": round(sum(m["carb_g"] for m in date_meals), 1),
+        "fiber_g": round(sum(m["fiber_g"] for m in date_meals), 1),
+        "count": len(date_meals),
+        "target_date": target_date
     }
     
     # 7 Hari Terakhir (Harian untuk Chart)
@@ -535,8 +562,8 @@ def get_user_history_stats(user_id: str):
     conn.close()
     
     return {
-        "today_meals": [dict(m) for m in today_meals],
-        "today_totals": today_totals,
+        "today_meals": [dict(m) for m in date_meals],
+        "today_totals": date_totals,
         "weekly_data": [dict(r) for r in weekly_rows],
         "monthly_summary": {
             "total_kcal": round(monthly_row["total_kcal"] or 0.0, 1),
@@ -544,6 +571,77 @@ def get_user_history_stats(user_id: str):
             "total_meals": monthly_row["total_meals"] or 0
         }
     }
+
+def export_user_data_json(user_id: str) -> str:
+    """
+    Mengekspor data profil, preferensi, dan seluruh riwayat catatan makan pengguna ke format JSON.
+    Berguna sebagai cadangan anti-hilang di sisi perangkat pengguna.
+    """
+    import json
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    
+    user_row = cur.execute("SELECT user_id, display_name, daily_calorie_target, theme_preference, gender, weight_kg, height_cm, age_years, subscription_tier, created_at FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    meal_rows = cur.execute("SELECT dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, portion_multiplier, photo_caption, meal_type, logged_at FROM meal_logs WHERE user_id = ? ORDER BY id ASC", (user_id,)).fetchall()
+    custom_rows = cur.execute("SELECT food_name, serving_size, energy_kcal, protein_g, fat_g, carb_g FROM custom_foods WHERE user_id = ?", (user_id,)).fetchall()
+    conn.close()
+    
+    data = {
+        "backup_version": "1.0",
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user_profile": dict(user_row) if user_row else {"user_id": user_id},
+        "meal_logs": [dict(m) for m in meal_rows],
+        "custom_foods": [dict(c) for c in custom_rows]
+    }
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
+    """
+    Memulihkan kembali riwayat catatan makan pengguna dari file JSON cadangan.
+    """
+    import json
+    try:
+        data = json.loads(json_str)
+        meal_logs = data.get("meal_logs", [])
+        if not meal_logs:
+            return False, "File cadangan tidak memuat catatan makanan."
+            
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        
+        imported_count = 0
+        for m in meal_logs:
+            # Cek apakah log dengan nama, kalori, dan waktu yang sama persis sudah ada
+            cur.execute("""
+                SELECT id FROM meal_logs 
+                WHERE user_id = ? AND dish_name = ? AND logged_at = ?
+            """, (user_id, m["dish_name"], m.get("logged_at", "")))
+            if not cur.fetchone():
+                cur.execute("""
+                    INSERT INTO meal_logs 
+                    (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, portion_multiplier, photo_caption, meal_type, logged_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    user_id,
+                    m["dish_name"],
+                    m.get("energy_kcal", 0.0),
+                    m.get("protein_g", 0.0),
+                    m.get("fat_g", 0.0),
+                    m.get("carb_g", 0.0),
+                    m.get("fiber_g", 0.0),
+                    m.get("portion_multiplier", 1.0),
+                    m.get("photo_caption", ""),
+                    m.get("meal_type", "Makan Siang"),
+                    m.get("logged_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                ))
+                imported_count += 1
+                
+        conn.commit()
+        conn.close()
+        return True, f"Berhasil memulihkan {imported_count} catatan makanan!"
+    except Exception as e:
+        return False, f"Format file cadangan tidak valid: {str(e)}"
 
 def stage_pending_food(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float = 0.0, sod_100: float = 0.0, barcode: str = "", serving_unit: str = "1 porsi (100g)", serving_weight: float = 100.0, source_origin: str = "Open Food Facts", submitted_by: str = "system"):
     """
