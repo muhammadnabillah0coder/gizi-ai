@@ -568,34 +568,7 @@ with st.sidebar:
             st.toast(f"Tema diubah ke {selected_theme}!")
             st.rerun()
 
-    # 5. Cadangan Data Riwayat (Anti-Hilang)
-    if current_user["user_id"] != "Tamu (Demo)":
-        with st.expander("🛡️ **Cadangan Data Akun (Anti-Hilang)**", expanded=False):
-            st.caption("Unduh salinan riwayat makanan Anda ke HP/Laptop agar data Anda selalu aman kapan saja:")
-            backup_json = export_user_data_json(current_user["user_id"])
-            st.download_button(
-                "📥 Unduh Cadangan Riwayat (.json)",
-                data=backup_json,
-                file_name=f"cadangan_gizi_{current_user['user_id']}_{datetime.now().strftime('%Y%m%d')}.json",
-                mime="application/json",
-                use_container_width=True
-            )
-            st.markdown("---")
-            st.caption("Pulihkan dari file cadangan sebelumnya:")
-            up_backup = st.file_uploader("Pilih file cadangan (.json):", type=["json"], key="up_backup_restore")
-            if up_backup:
-                try:
-                    str_data = up_backup.read().decode("utf-8")
-                    ok_imp, msg_imp = import_user_data_json(current_user["user_id"], str_data)
-                    if ok_imp:
-                        st.success(msg_imp)
-                        st.rerun()
-                    else:
-                        st.error(msg_imp)
-                except Exception as ex:
-                    st.error(f"Gagal memulihkan: {ex}")
-
-    # 6. Informasi Versi Web Patch Update & Changelog (Hanya Tampil untuk Admin)
+    # 5. Informasi Versi Web Patch Update & Changelog (Hanya Tampil untuk Admin)
     if is_admin:
         with st.expander(f"📋 Web Patch Update ({APP_VERSION} - Admin Only)", expanded=False):
             st.caption(f"Dikembangkan oleh **Muhammad Nabillah ({APP_CREATOR})**")
