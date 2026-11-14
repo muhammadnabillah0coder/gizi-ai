@@ -476,19 +476,14 @@ FOCUS_GOALS = [
 with st.sidebar:
     # 1. Branding Header Ramping + Badge original by MN (Versi teknis hanya untuk Admin)
     ver_badge_sb = f'<span style="background: rgba(59, 130, 246, 0.15); color: #3b82f6; font-size: 0.65rem; font-weight: 800; padding: 0.1rem 0.45rem; border-radius: 999px;">{APP_VERSION}</span>' if is_admin else ''
-    st.markdown(f"""
-    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 0.8rem; padding-bottom: 0.6rem; border-bottom: 1px solid rgba(125, 125, 125, 0.15);">
-        <span style="font-size: 1.9rem;">🥗</span>
-        <div>
-            <div style="font-weight: 800; font-size: 1.15rem; line-height: 1.15;">Nutrisi Cerdas</div>
-            <div style="font-size: 0.7rem; color: #10b981; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;">TKPI Kemenkes + Open Food Facts</div>
-            <div style="margin-top: 4px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
-                <span style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.65rem; font-weight: 800; padding: 0.1rem 0.45rem; border-radius: 999px; border: 1px solid rgba(16, 185, 129, 0.3);">{APP_CREATOR}</span>
-                {ver_badge_sb}
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f"""<div style="display: flex; align-items: center; gap: 10px; margin-bottom: 0.8rem; padding-bottom: 0.6rem; border-bottom: 1px solid rgba(125, 125, 125, 0.15);">
+<span style="font-size: 1.9rem;">🥗</span>
+<div>
+<div style="font-weight: 800; font-size: 1.15rem; line-height: 1.15;">Nutrisi Cerdas</div>
+<div style="font-size: 0.7rem; color: #10b981; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;">TKPI Kemenkes + Open Food Facts</div>
+<div style="margin-top: 4px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;"><span style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.65rem; font-weight: 800; padding: 0.1rem 0.45rem; border-radius: 999px; border: 1px solid rgba(16, 185, 129, 0.3);">{APP_CREATOR}</span>{ver_badge_sb}</div>
+</div>
+</div>""", unsafe_allow_html=True)
     
     # 2. Status Akun Ringkas
     if current_user["user_id"] == "Tamu (Demo)":
@@ -1726,9 +1721,7 @@ with tab_scanner:
                     <div style="font-size: 1.0rem; font-weight: 800;">{ng['label']}</div>
                 </div>
             </div>
-            <div style="display: flex; gap: 6px; flex-wrap: wrap;">
-                {badges_html}
-            </div>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap;">{badges_html}</div>
         </div>
         """, unsafe_allow_html=True)
 
