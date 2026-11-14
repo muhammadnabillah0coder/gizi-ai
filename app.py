@@ -26,20 +26,32 @@ from db_history import (
     init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, 
     get_user_history_stats, update_calorie_target, update_user_theme, 
     add_custom_food, get_custom_foods, delete_custom_food,
-    get_user_scan_status, record_scan_usage, activate_pro_tier,
+    get_user_scan_status, record_scan_usage,
     log_water_intake, get_water_intake,
     is_admin_user, register_user, authenticate_user,
     stage_pending_food, get_pending_foods, publish_food_to_catalog, reject_pending_food,
-    export_user_data_json, import_user_data_json
+    export_user_data_json, import_user_data_json,
+    get_local_now, create_session_token, verify_session_token,
+    update_user_preferences, log_weight_entry, get_weight_history, get_logging_streak
 )
 from google_auth import get_google_auth_url, exchange_code_for_user
 
-APP_VERSION = "v2.4.0"
+APP_VERSION = "v3.0.0-beta"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v2.4.0 (Terbaru)",
+        "version": "v3.0.0-beta (Terbaru)",
+        "date": "14 Nov 2026",
+        "highlights": [
+            "🎟️ Mode Open Beta Nyaman: Modul QRIS simulasi ditutup; akun terdaftar mendapat 5x scan foto AI/hari (3x makan berat + 2x jajan) & fitur teks/barcode unlimited.",
+            "🔐 Pengamanan Sesi & Akun: Token HMAC URL anti-pembajakan (?u=), hashing PBKDF2 + salt otomatis, dan exact-match Admin.",
+            "⚖️ Pelacak Berat Badan, Streak Harian, Mode Fokus Klinis (Diet/Bumil/DM/Hipertensi), & Zona Waktu Indonesia (WITA default).",
+            "🧠 Cache Ekstraksi AI Hemat Kuota + Disclaimer Medis & Kebijakan Privasi."
+        ]
+    },
+    {
+        "version": "v2.4.0",
         "date": "11 Nov 2026",
         "highlights": [
             "🛡️ Sistem Kurasi & Edit Sebelum Publikasi (Staging Queue) agar data baru tidak mendadak mengubah katalog utama tanpa verifikasi.",
@@ -57,15 +69,6 @@ PATCH_NOTES = [
             "🕒 Pengelompokan Buku Harian per Waktu Makan (Sarapan, Makan Siang, Makan Malam, Camilan).",
             "🎯 Kalkulator BMR/TDEE Mifflin-St Jeor otomatis terintegrasi saat pendaftaran akun."
         ]
-    },
-    {
-        "version": "v2.0.0",
-        "date": "09 Nov 2026",
-        "highlights": [
-            "🥗 Rebranding resmi Nutrisi Cerdas (Basis TKPI Kemenkes RI + USDA).",
-            "💧 Pelacak Air Minum Harian (8 Gelas / 2.000 ml) & Proyeksi Defisit/Surplus 7 Hari.",
-            "🔐 Sistem Akun Pribadi Terproteksi PIN SHA-256 & Uji Coba Gratis 30 Hari PRO."
-        ]
     }
 ]
 
@@ -81,11 +84,9 @@ st.set_page_config(
 # Tangani Redirect Google OAuth Callback (?code=...)
 auth_code = st.query_params.get("code", "")
 if auth_code:
-    # Deteksi URL saat ini untuk redirect URI
     redirect_uri = "https://nutrisi-cerdas.streamlit.app"
     user_info, err_details = exchange_code_for_user(auth_code, redirect_uri)
     if not user_info:
-        # Fallback ke domain alternatif atau localhost
         user_info, err_details = exchange_code_for_user(auth_code, "https://nutrisicerdas.streamlit.app")
         if not user_info:
             user_info, err_details = exchange_code_for_user(auth_code, "http://localhost:8501")
@@ -96,7 +97,8 @@ if auth_code:
         u = get_or_create_user(email, display_name=name, auth_provider="google")
         st.session_state["user"] = u
         st.query_params.clear()
-        st.query_params["u"] = email
+        st.query_params["u"] = u["user_id"]
+        st.query_params["s"] = create_session_token(u["user_id"])
         st.query_params["auth"] = "google"
         st.toast(f"Selamat datang, {name}! Akun Google Anda berhasil terhubung.")
         st.rerun()
@@ -104,21 +106,25 @@ if auth_code:
         st.error(f"⚠️ Gagal memverifikasi login Google: {err_details}")
         st.caption("Tips: Pastikan Redirect URI di Google Cloud Console persis `https://nutrisi-cerdas.streamlit.app` dan Client ID/Secret sudah ada di Secrets.")
 
-# Inisialisasi Sesi Akun Pengguna Terlebih Dahulu (Agar Akun & Tema Tersimpan Permanen di Browser)
+# Inisialisasi Sesi Akun Pengguna dengan Verifikasi Token HMAC (Mencegah Pembajakan ?u=)
 saved_user_param = st.query_params.get("u", "")
+saved_sig_param = st.query_params.get("s", "")
 saved_auth_param = st.query_params.get("auth", "local")
 
 if "user" not in st.session_state:
-    if saved_user_param:
+    if saved_user_param and verify_session_token(saved_user_param, saved_sig_param):
         st.session_state["user"] = get_or_create_user(saved_user_param.strip(), auth_provider=saved_auth_param)
     else:
+        if saved_user_param and saved_user_param.strip().lower() != "tamu (demo)":
+            st.session_state["auth_url_warning"] = saved_user_param.strip()
+            st.query_params.clear()
         st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
 else:
-    # Sinkronkan query param agar URL browser selalu menyimpan identitas user
     active_uid = st.session_state["user"]["user_id"]
     active_auth = st.session_state["user"].get("auth_provider", "local")
     if active_uid != "Tamu (Demo)":
         st.query_params["u"] = active_uid
+        st.query_params["s"] = create_session_token(active_uid)
         st.query_params["auth"] = active_auth
 
 if "nutrition_data" not in st.session_state:
@@ -449,7 +455,22 @@ st.markdown(f"""
 current_user = st.session_state["user"]
 is_google = current_user.get("auth_provider") == "google"
 is_admin = is_admin_user(current_user["user_id"])
-scan_status = get_user_scan_status(current_user["user_id"])
+user_tz = int(current_user.get("timezone_offset") if current_user.get("timezone_offset") is not None else 8)
+user_focus = current_user.get("focus_goal") or "Diet Sehat"
+scan_status = get_user_scan_status(current_user["user_id"], tz_offset=user_tz)
+
+TZ_OPTIONS = {
+    7: "WIB (UTC+7 — Jawa/Sumatra/Kalbar)",
+    8: "WITA (UTC+8 — Tanah Grogot/Kaltim/Bali)",
+    9: "WIT (UTC+9 — Papua/Maluku)"
+}
+FOCUS_GOALS = [
+    "Diet Sehat",
+    "Jaga Berat Badan",
+    "Ibu Hamil & Menyusui",
+    "Kendali Gula (Diabetes)",
+    "Kendali Natrium (Hipertensi)"
+]
 
 # Sidebar: Akun Pribadi & Target Harian (Efisien, Bersih, & Kompak)
 with st.sidebar:
@@ -473,19 +494,17 @@ with st.sidebar:
     if current_user["user_id"] == "Tamu (Demo)":
         st.markdown("""
         <div style="background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 14px; padding: 0.75rem 0.9rem; margin-bottom: 0.8rem;">
-            <div style="font-size: 0.76rem; font-weight: 800; color: #d97706; text-transform: uppercase;">🌱 Status: Tamu (Demo)</div>
+            <div style="font-size: 0.76rem; font-weight: 800; color: #d97706; text-transform: uppercase;">🌱 Status: Mode Demo</div>
             <div style="font-size: 0.83rem; margin-top: 0.25rem; line-height: 1.35;">
-                Riwayat makan belum tersimpan permanen. Buat akun gratis untuk mengunci progres Anda.
+                Buat akun gratis dalam 15 detik agar catatan makan, grafik berat badan, & 5x scan foto AI/hari terkunci atas namamu.
             </div>
         </div>
         """, unsafe_allow_html=True)
     else:
         if is_admin:
             badge_html = '<span style="background: rgba(245, 158, 11, 0.2); color: #d97706; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px;">👑 FOUNDER / ADMIN</span>'
-        elif scan_status["is_pro"]:
-            badge_html = f'<span style="background: rgba(16, 185, 129, 0.2); color: #059669; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px;">👑 PRO ({scan_status["days_left"]} Hari)</span>'
         else:
-            badge_html = f'<span style="background: rgba(59, 130, 246, 0.2); color: #2563eb; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px;">🌱 Free ({scan_status["scans_today"]}/3 Scan)</span>'
+            badge_html = f'<span style="background: rgba(16, 185, 129, 0.2); color: #059669; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px;">🎟️ Open Beta ({scan_status["scans_today"]}/{scan_status["max_scans"]} Scan Foto)</span>'
 
         st.markdown(f"""
         <div style="background: rgba(125, 125, 125, 0.08); border: 1px solid rgba(125, 125, 125, 0.16); border-radius: 14px; padding: 0.75rem 0.9rem; margin-bottom: 0.5rem;">
@@ -513,9 +532,9 @@ with st.sidebar:
     with st.expander("🧮 Hitung Ulang Target Ideal (BMR)", expanded=False):
         st.caption("Hitung target kalori berdasarkan rumus standar Mifflin-St Jeor / Kemenkes RI:")
         gender = st.radio("Jenis Kelamin:", ["Pria", "Wanita"], horizontal=True, key="sb_bmr_gen")
-        bb = st.number_input("Berat Badan (kg):", value=65.0, step=1.0, key="sb_bmr_bb")
-        tb = st.number_input("Tinggi Badan (cm):", value=170.0, step=1.0, key="sb_bmr_tb")
-        usia = st.number_input("Usia (tahun):", value=25, step=1, key="sb_bmr_age")
+        bb = st.number_input("Berat Badan (kg):", value=float(current_user.get("weight_kg") or 65.0), step=1.0, key="sb_bmr_bb")
+        tb = st.number_input("Tinggi Badan (cm):", value=float(current_user.get("height_cm") or 170.0), step=1.0, key="sb_bmr_tb")
+        usia = st.number_input("Usia (tahun):", value=int(current_user.get("age_years") or 25), step=1, key="sb_bmr_age")
         aktivitas = st.selectbox("Aktivitas Harian:", [
             "Sedentari (Jarang olahraga / di depan laptop)",
             "Ringan (Olahraga 1-3 hari/minggu)",
@@ -529,7 +548,6 @@ with st.sidebar:
         ], key="sb_bmr_goal")
         
         if st.button("Terapkan Target Kalori", use_container_width=True, key="sb_btn_apply_bmr"):
-            # Formula Mifflin - St Jeor
             if gender == "Pria":
                 bmr = (10 * bb) + (6.25 * tb) - (5 * usia) + 5
             else:
@@ -556,6 +574,21 @@ with st.sidebar:
             st.success(f"🎯 Target kalori berhasil diatur menjadi **{recom_target} kkal/hari**!")
             st.rerun()
 
+    # 3b. Preferensi Fokus Kesehatan & Zona Waktu (Default WITA UTC+8)
+    with st.expander("🩺 Fokus Kesehatan & Zona Waktu", expanded=False):
+        focus_idx = FOCUS_GOALS.index(user_focus) if user_focus in FOCUS_GOALS else 0
+        sel_focus = st.selectbox("Fokus Pemantauan Gizi:", FOCUS_GOALS, index=focus_idx, key="sb_focus_goal")
+        tz_keys = list(TZ_OPTIONS.keys())
+        tz_idx = tz_keys.index(user_tz) if user_tz in tz_keys else 1
+        sel_tz = st.selectbox("Zona Waktu:", tz_keys, index=tz_idx, format_func=lambda k: TZ_OPTIONS[k], key="sb_tz_select")
+        if sel_focus != user_focus or sel_tz != user_tz:
+            update_user_preferences(current_user["user_id"], timezone_offset=sel_tz, focus_goal=sel_focus)
+            st.session_state["user"]["timezone_offset"] = sel_tz
+            st.session_state["user"]["focus_goal"] = sel_focus
+            st.session_state["selected_diary_date"] = get_local_now(sel_tz).date()
+            st.toast("Preferensi fokus & zona waktu disimpan!")
+            st.rerun()
+
     # 4. Pengaturan Tema Tampilan (9 Tema Proporsi 60-30-10 Kontras Tinggi)
     st.markdown("---")
     with st.expander("🎨 Pilihan Tema Tampilan (9 Tema)", expanded=False):
@@ -567,6 +600,28 @@ with st.sidebar:
             st.session_state["user"]["theme_preference"] = selected_theme
             st.toast(f"Tema diubah ke {selected_theme}!")
             st.rerun()
+
+    # 4b. Jaring Pengaman Cadangan Data Ringkas (Khusus Akun Terdaftar, Tersembunyi Rapi)
+    if current_user["user_id"] != "Tamu (Demo)":
+        with st.expander("📦 Cadangan Data Pribadi (Opsional)", expanded=False):
+            st.caption("Unduh salinan riwayat makan & berat badan Anda kapan saja:")
+            json_bk = export_user_data_json(current_user["user_id"])
+            st.download_button(
+                "⬇️ Unduh Salinan Diary (.json)",
+                data=json_bk,
+                file_name=f"nutrisi_cerdas_{current_user['user_id']}_{get_local_now(user_tz).strftime('%Y%m%d')}.json",
+                mime="application/json",
+                use_container_width=True,
+                key="sb_btn_export_json"
+            )
+            up_bk = st.file_uploader("Pulihkan dari file .json:", type=["json"], key="sb_up_restore_json")
+            if up_bk and st.button("♻️ Pulihkan Sekarang", use_container_width=True, key="sb_btn_do_restore"):
+                ok_imp, msg_imp = import_user_data_json(current_user["user_id"], up_bk.getvalue().decode("utf-8"))
+                if ok_imp:
+                    st.success(msg_imp)
+                    st.rerun()
+                else:
+                    st.error(msg_imp)
 
     # 5. Informasi Versi Web Patch Update & Changelog (Hanya Tampil untuk Admin)
     if is_admin:
@@ -581,7 +636,16 @@ with st.sidebar:
 # Header Brand Utama dengan Logo Menonjol & Kotak Login Akun Langsung di Halaman Utama
 current_user = st.session_state["user"]
 is_google = current_user.get("auth_provider") == "google"
-scan_status = get_user_scan_status(current_user["user_id"])
+user_tz = int(current_user.get("timezone_offset") if current_user.get("timezone_offset") is not None else 8)
+user_focus = current_user.get("focus_goal") or "Diet Sehat"
+scan_status = get_user_scan_status(current_user["user_id"], tz_offset=user_tz)
+
+if st.session_state.get("auth_url_warning"):
+    st.warning(
+        f"🔒 Untuk menjaga privasi buku harian **{st.session_state['auth_url_warning']}**, "
+        "tautan akun lama memerlukan verifikasi PIN terlebih dahulu. Silakan klik **🔑 Masuk / Daftar**."
+    )
+    st.session_state.pop("auth_url_warning", None)
 
 col_head1, col_head2 = st.columns([2, 1.2], vertical_alignment="center")
 
@@ -594,7 +658,7 @@ with col_head1:
             logo_base64 = base64.b64encode(f.read()).decode()
             
     logo_img_html = f'<img src="data:image/png;base64,{logo_base64}" style="width: 82px; height: 82px; border-radius: 24px; box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.4);" />' if logo_base64 else '<div style="font-size: 3.5rem; background: linear-gradient(135deg, #10b981 0%, #059669 100%); width: 82px; height: 82px; display: flex; align-items: center; justify-content: center; border-radius: 24px; box-shadow: 0 10px 25px -4px rgba(16, 185, 129, 0.4);">🥗</div>'
-    creator_badge_text = f"✨ {APP_CREATOR} • {APP_VERSION}" if is_admin else f"✨ {APP_CREATOR}"
+    creator_badge_text = f"✨ {APP_CREATOR} • {APP_VERSION}" if is_admin else "🧪 Open Beta Gratis"
 
     st.markdown(f"""
     <div style="display: flex; align-items: center; gap: 18px; margin-bottom: 0.5rem; padding: 0.5rem 0;">
@@ -618,14 +682,12 @@ with col_head1:
 
 with col_head2:
     with st.container(border=True):
-        is_admin = is_admin_user(current_user["user_id"])
-        
         if is_admin:
-            tier_badge = "👑 FOUNDER / ADMIN (Lifetime Unlimited)"
-        elif scan_status["is_pro"]:
-            tier_badge = "👑 PRO (Unlimited)"
+            tier_badge = "👑 ADMIN (Unlimited)"
+        elif current_user["user_id"] == "Tamu (Demo)":
+            tier_badge = f"🌱 Mode Demo ({scan_status['scans_today']}/{scan_status['max_scans']} Scan Foto)"
         else:
-            tier_badge = f"🌱 Free ({scan_status['scans_today']}/3 Scan Hari Ini)"
+            tier_badge = f"🎟️ Open Beta ({scan_status['scans_today']}/{scan_status['max_scans']} Scan Foto)"
             
         st.markdown(f"👤 **{current_user['display_name']}** • `{tier_badge}`")
         
@@ -639,7 +701,7 @@ with col_head2:
             with st.popover(btn_acc_label, use_container_width=True):
                 if current_user["user_id"] != "Tamu (Demo)":
                     st.markdown(f"##### 👤 Akun: **{current_user['display_name']}**")
-                    st.caption(f"ID: `{current_user['user_id']}` • Status: `{tier_badge}`")
+                    st.caption(f"ID: `{current_user['user_id']}` • Fokus: `{user_focus}`")
                     st.markdown("---")
                     if st.button("🚪 Keluar dari Akun (Logout)", type="primary", use_container_width=True, key="btn_logout_top"):
                         st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
@@ -649,30 +711,31 @@ with col_head2:
                     st.markdown("---")
                     st.caption("Ingin berganti akun lain?")
 
-                sub_login, sub_reg = st.tabs(["🔐 Masuk Akun Lain", "📝 Buat Akun Baru"])
+                sub_login, sub_reg = st.tabs(["🔐 Masuk Akun", "📝 Buat Akun Baru"])
                 
                 with sub_login:
                     st.markdown("##### 🔐 Masuk ke Diary Anda")
                     in_uid = st.text_input("Email / ID Pengguna:", placeholder="contoh@gmail.com atau username", key="login_uid")
-                    in_pin = st.text_input("PIN / Password (6 Angka/Karakter):", type="password", placeholder="******", key="login_pin")
+                    in_pin = st.text_input("PIN / Password (Minimal 4 Karakter):", type="password", placeholder="****", key="login_pin")
                     
                     if st.button("🚀 Masuk Sekarang", type="primary", use_container_width=True, key="btn_do_login"):
                         success, res = authenticate_user(in_uid, in_pin)
                         if success:
                             st.session_state["user"] = res
                             st.query_params["u"] = res["user_id"]
+                            st.query_params["s"] = create_session_token(res["user_id"])
                             st.query_params["auth"] = "local"
                             st.toast(f"Selamat datang kembali, {res['display_name']}!")
                             st.rerun()
                         else:
                             st.error(f"❌ {res}")
                             
-                    st.caption("🔒 Data makanan Anda terkunci aman dengan proteksi PIN/Password.")
+                    st.caption("🔒 Data diary & berat badan Anda dilindungi PIN terenkripsi.")
                     
                 with sub_reg:
-                    st.markdown("##### 📝 Buat Akun & Hitung Target Pribadi")
+                    st.markdown("##### 📝 Buat Akun Open Beta (Gratis)")
                     reg_uid = st.text_input("Email / ID Unik:", placeholder="contoh@gmail.com / nama_kamu", key="reg_uid")
-                    reg_name = st.text_input("Nama Panggilan:", placeholder="misal: Nabillah", key="reg_name")
+                    reg_name = st.text_input("Nama Panggilan:", placeholder="misal: Dwi Mey", key="reg_name")
                     reg_pin = st.text_input("Buat PIN / Password Baru:", type="password", placeholder="Minimal 4 digit", key="reg_pin")
                     
                     c_r1, c_r2 = st.columns(2)
@@ -683,13 +746,13 @@ with col_head2:
                         reg_age = st.number_input("Usia (thn):", value=25, step=1, key="reg_age")
                         reg_tb = st.number_input("Tinggi Badan (cm):", value=170.0, step=1.0, key="reg_tb")
                         
-                    reg_goal = st.selectbox("Tujuan Program:", [
+                    reg_focus = st.selectbox("Fokus Pemantauan:", FOCUS_GOALS, key="reg_focus")
+                    reg_goal = st.selectbox("Target Kalori:", [
                         "🔥 Turunkan Berat Badan (Defisit Sehat -400 kkal)",
                         "⚖️ Jaga Berat Badan Ideal (Maintenance)",
                         "💪 Tambah Berat / Massa Otot (Surplus +400 kkal)"
                     ], key="reg_goal")
                     
-                    # Formula Mifflin - St Jeor Real-time
                     if reg_gender == "Pria":
                         calc_bmr = (10 * reg_bb) + (6.25 * reg_tb) - (5 * reg_age) + 5
                     else:
@@ -711,95 +774,76 @@ with col_head2:
                     
                     reg_target = st.number_input("Target Kalori Disepakati (kkal/hari):", min_value=1000, max_value=4000, value=int(auto_target), step=50, key="reg_kcal")
                     
-                    if st.button("✨ Buat Akun & Aktifkan PRO 30 Hari", type="primary", use_container_width=True, key="btn_do_reg"):
-                        if not reg_pin.strip():
-                            st.error("PIN / Password wajib diisi untuk keamanan diary Anda.")
+                    if st.button("✨ Daftar & Mulai Catat Gratis", type="primary", use_container_width=True, key="btn_do_reg"):
+                        if not reg_pin.strip() or len(reg_pin.strip()) < 4:
+                            st.error("PIN / Password minimal 4 karakter untuk melindungi akun Anda.")
                         else:
-                            success, res = register_user(reg_uid, reg_name, reg_pin, gender=reg_gender, bb=reg_bb, tb=reg_tb, age=int(reg_age), target_kcal=float(reg_target))
+                            success, res = register_user(
+                                reg_uid, reg_name, reg_pin,
+                                gender=reg_gender, bb=reg_bb, tb=reg_tb, age=int(reg_age),
+                                target_kcal=float(reg_target), focus_goal=reg_focus, timezone_offset=8
+                            )
                             if success:
-                                activate_pro_tier(res["user_id"], days=30)
-                                st.session_state["user"] = get_or_create_user(res["user_id"], display_name=res["display_name"], auth_provider="local")
+                                st.session_state["user"] = res
                                 st.query_params["u"] = res["user_id"]
+                                st.query_params["s"] = create_session_token(res["user_id"])
                                 st.query_params["auth"] = "local"
                                 st.balloons()
-                                st.toast("Akun berhasil dibuat! Bonus Uji Coba PRO 30 Hari aktif untuk Anda.")
+                                st.toast("🎉 Akun Open Beta berhasil dibuat! Akses 5x scan foto/hari aktif.")
                                 st.rerun()
                             else:
                                 st.error(f"❌ {res}")
         
         with c_acc2:
-            with st.popover("⚡ Upgrade / Status PRO", use_container_width=True):
-                st.markdown("### 👑 **Nutrisi Cerdas PRO**")
+            with st.popover("🎟️ Akses Open Beta", use_container_width=True):
+                st.markdown("### 🧪 **Program Uji Coba (Open Beta)**")
+                st.caption("Saat ini seluruh fitur dibuka gratis untuk teman & komunitas uji coba tanpa pembayaran apa pun.")
                 
-                if scan_status["is_pro"]:
-                    if is_admin:
-                        st.success("🌟 **Status: FOUNDER / ADMIN (Seumur Hidup)**")
-                        st.caption("Akses semua fitur tanpa batas kuota selamanya.")
-                    else:
-                        st.success(f"🎉 **Status: PRO Aktif** (Sisa ~{scan_status['days_left']} hari)")
-                        st.caption("Scan foto makanan tanpa batas dan riwayat lengkap aktif.")
-                else:
+                if is_admin:
+                    st.success("🌟 **Status: FOUNDER / ADMIN (Unlimited)**")
+                elif current_user["user_id"] == "Tamu (Demo)":
+                    st.info(f"🌱 **Mode Demo Aktif:** `{scan_status['scans_today']}/{scan_status['max_scans']}` scan foto hari ini.")
                     st.markdown("""
-                    **Cuma Rp 19.000 / bulan** *(Jauh lebih hemat dari kompetitor!)*
-                    - 🚀 **Scan Foto Makanan Sepuasnya (Unlimited)**
-                    - 🤖 **Auto-Learning AI Prioritas**
-                    - 📊 **Export Laporan Gizi Lengkap**
+                    Daftar akun gratis (15 detik) untuk menikmati:
+                    - 📸 **5x Scan Foto AI / hari** (3x makan berat + 2x jajan)
+                    - ⚖️ **Pelacak Berat Badan & Streak Harian**
+                    - 🩺 **Mode Fokus Klinis** (Diet / Bumil / DM / Hipertensi)
+                    - ✍️ **Catat Teks AI, Barcode, & 1-Klik Menu** *(Unlimited)*
                     """)
-                    st.info("🎁 **Spesial Peluncuran:** Coba gratis 30 Hari penuh dengan membuat akun pribadi!")
-                    if current_user["user_id"] == "Tamu (Demo)":
-                        st.warning("🔒 Anda masih dalam Mode Tamu. Silakan klik tombol **'🔑 Masuk / Daftar Akun'** di sebelah kiri untuk membuat akun dan mengaktifkan 30 Hari PRO Gratis secara otomatis!")
-                    else:
-                        if st.button("✨ Klaim Uji Coba Gratis 1 Bulan PRO", type="primary", use_container_width=True):
-                            activate_pro_tier(current_user["user_id"], days=30)
-                            st.toast("Selamat! Uji Coba Gratis 1 Bulan PRO Anda sudah aktif!")
-                            st.rerun()
-                        
-                    st.markdown("---")
-                    st.markdown("##### 💳 **Perpanjangan Langganan PRO (QRIS)**")
-                    st.caption("Scan kode QRIS di bawah menggunakan GoPay, OVO, Dana, ShopeePay, atau Mobile Banking apa saja:")
-                    
-                    # Tampilkan simulasi QRIS Dinamis Standar Indonesia
+                else:
+                    sisa_scan = max(0, scan_status["max_scans"] - scan_status["scans_today"])
+                    st.success(f"🎉 **Akun Beta Aktif!** Sisa scan foto hari ini: **{sisa_scan} / {scan_status['max_scans']}x**")
                     st.markdown("""
-                    <div style="background: #ffffff; padding: 12px; border-radius: 16px; border: 2px dashed #10b981; text-align: center; margin: 8px 0;">
-                        <img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=https://nutrisi-cerdas.streamlit.app/qris-pay-19k" width="160" height="160" alt="QRIS Nutrisi Cerdas" style="border-radius: 8px;" />
-                        <div style="margin-top: 8px; font-weight: 800; color: #0f172a; font-size: 1.1rem;">Rp 19.000 <span style="font-size: 0.8rem; font-weight: 500; color: #64748b;">/ bulan</span></div>
-                        <div style="font-size: 0.78rem; color: #059669; font-weight: 700;">NMID: ID1020039847291 • NUTRISI CERDAS ID</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    if st.button("✅ Saya Sudah Transfer / Bayar via QRIS", use_container_width=True):
-                        if current_user["user_id"] == "Tamu (Demo)":
-                            st.error("Silakan daftar/masuk akun terlebih dahulu sebelum mengonfirmasi pembayaran agar status PRO tidak hilang.")
-                        else:
-                            activate_pro_tier(current_user["user_id"], days=30)
-                            st.balloons()
-                            st.success("Pembayaran terverifikasi! Akun Anda aktif sebagai PRO selama 30 hari ke depan.")
-                            st.rerun()
+                    **Fasilitas Akun Beta Anda (Gratis):**
+                    - 📸 **5x Scan Foto Makanan AI / hari** (3x makan berat + 2x camilan)
+                    - ✍️ **Catat Teks, 1-Klik Menu Harian, & Barcode** *(Unlimited)*
+                    - ⚖️ **Grafik Berat Badan, Streak Harian, & Fokus Klinis**
+                    """)
 
-# Smart Hero Banner untuk Pengunjung Tamu (Conversion Call to Action)
+# Smart Hero Banner untuk Pengunjung Tamu (Open Beta Ramah Tanpa Tagihan)
 if current_user["user_id"] == "Tamu (Demo)":
     with st.container(border=True):
         c_hero_txt, c_hero_act = st.columns([2.3, 1.2], vertical_alignment="center")
         with c_hero_txt:
             st.markdown("""
             <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
-                <span style="background: #10b981; color: #ffffff; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.04em;">Mode Tamu (Demo)</span>
-                <span style="color: #059669; font-size: 0.85rem; font-weight: 700;">🎁 Bonus 30 Hari PRO Gratis Tersedia</span>
+                <span style="background: #10b981; color: #ffffff; font-size: 0.72rem; font-weight: 800; padding: 0.18rem 0.55rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.04em;">Open Beta Gratis</span>
+                <span style="color: #059669; font-size: 0.85rem; font-weight: 700;">🥗 1.301+ Data Lab TKPI Kemenkes + Open Food Facts</span>
             </div>
             <h3 style="margin: 0.2rem 0; font-size: 1.25rem; font-weight: 800; letter-spacing: -0.01em;">
-                Kunci Riwayat Makan & Target Dietmu di HP Ini
+                Foto Piringmu, Ketahui Kalori & Gizi Nyata Tanpa Ribet
             </h3>
             <p style="margin: 0; font-size: 0.88rem; opacity: 0.85; line-height: 1.45;">
-                Catatan makan mode tamu akan hilang saat browser ditutup. <strong>Buat akun gratis dalam 30 detik</strong> (cukup nama & 4-6 digit PIN) agar diary gizi dan grafik penurunan berat badanmu tersimpan permanen.
+                Sedang dalam mode demo. <strong>Buat akun gratis (cukup nama & 4 digit PIN)</strong> untuk mengunci riwayat makan, grafik berat badan, streak harian, dan kuota <strong>5x scan foto AI per hari</strong>.
             </p>
             """, unsafe_allow_html=True)
             
         with c_hero_act:
-            with st.popover("🚀 Buat Akun & Kunci Data (30 Detik)", type="primary", use_container_width=True):
-                st.markdown("##### 📝 Pendaftaran Akun Cepat")
-                st.caption("Hitung target kalori otomatis & aktifkan 30 Hari PRO:")
+            with st.popover("🚀 Buat Akun Gratis (15 Detik)", type="primary", use_container_width=True):
+                st.markdown("##### 📝 Pendaftaran Akun Beta")
+                st.caption("Hitung target kalori otomatis & simpan riwayat Anda:")
                 h_uid = st.text_input("Email / ID Unik:", placeholder="contoh@gmail.com / nama_kamu", key="h_reg_uid")
-                h_name = st.text_input("Nama Panggilan:", placeholder="misal: Nabillah", key="h_reg_name")
+                h_name = st.text_input("Nama Panggilan:", placeholder="misal: Dwi Mey", key="h_reg_name")
                 h_pin = st.text_input("Buat PIN / Password Baru:", type="password", placeholder="Minimal 4 digit", key="h_reg_pin")
                 
                 hc_1, hc_2 = st.columns(2)
@@ -810,13 +854,13 @@ if current_user["user_id"] == "Tamu (Demo)":
                     h_age = st.number_input("Usia (thn):", value=25, step=1, key="h_reg_age")
                     h_tb = st.number_input("Tinggi (cm):", value=170.0, step=1.0, key="h_reg_tb")
                     
+                h_focus = st.selectbox("Fokus Kesehatan:", FOCUS_GOALS, key="h_reg_focus")
                 h_goal = st.selectbox("Tujuan Program:", [
                     "🔥 Turunkan Berat Badan (Defisit Sehat -400 kkal)",
                     "⚖️ Jaga Berat Badan Ideal (Maintenance)",
                     "💪 Tambah Berat / Massa Otot (Surplus +400 kkal)"
                 ], key="h_reg_goal")
                 
-                # Formula Mifflin-St Jeor Real-time
                 if h_gender == "Pria":
                     h_bmr = (10 * h_bb) + (6.25 * h_tb) - (5 * h_age) + 5
                 else:
@@ -839,22 +883,23 @@ if current_user["user_id"] == "Tamu (Demo)":
                 
                 h_custom_target = st.number_input("Target Kalori Awal (kkal/hari):", min_value=1000, max_value=4000, value=int(h_target), step=50, key="h_reg_target")
                 
-                if st.button("✨ Buat Akun & Dapatkan 30 Hari PRO", type="primary", use_container_width=True, key="h_btn_submit"):
-                    if not h_uid.strip() or not h_pin.strip():
-                        st.error("ID / Email dan PIN wajib diisi!")
+                if st.button("✨ Buat Akun Gratis Sekarang", type="primary", use_container_width=True, key="h_btn_submit"):
+                    if not h_uid.strip() or len(h_pin.strip()) < 4:
+                        st.error("ID / Email wajib diisi dan PIN minimal 4 karakter!")
                     else:
                         success, res = register_user(
                             h_uid, h_name, h_pin,
                             gender=h_gender, bb=h_bb, tb=h_tb,
-                            age=int(h_age), target_kcal=float(h_custom_target)
+                            age=int(h_age), target_kcal=float(h_custom_target),
+                            focus_goal=h_focus, timezone_offset=8
                         )
                         if success:
-                            activate_pro_tier(res["user_id"], days=30)
-                            st.session_state["user"] = get_or_create_user(res["user_id"], display_name=res["display_name"], auth_provider="local")
+                            st.session_state["user"] = res
                             st.query_params["u"] = res["user_id"]
+                            st.query_params["s"] = create_session_token(res["user_id"])
                             st.query_params["auth"] = "local"
                             st.balloons()
-                            st.toast("🎉 Akun berhasil dibuat! Bonus 30 Hari PRO Gratis telah aktif.")
+                            st.toast("🎉 Akun berhasil dibuat! Akses 5x scan foto/hari aktif untuk Anda.")
                             st.rerun()
                         else:
                             st.error(f"❌ {res}")
@@ -876,15 +921,17 @@ tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([
     "❓ Bantuan"
 ])
 
-# Inisialisasi Tanggal Aktif Dashboard (Mendukung Hari Ini, Kemarin, dan Kalender Bebas)
+# Inisialisasi Tanggal Aktif Dashboard berdasarkan Zona Waktu Lokal Pengguna (WITA default)
+local_now = get_local_now(user_tz)
 if "selected_diary_date" not in st.session_state:
-    st.session_state["selected_diary_date"] = datetime.now().date()
+    st.session_state["selected_diary_date"] = local_now.date()
 
 active_diary_date = st.session_state["selected_diary_date"]
 active_diary_date_str = active_diary_date.strftime("%Y-%m-%d")
 
-# Ambil statistik riwayat akun berdasarkan tanggal yang dipilih
-stats = get_user_history_stats(st.session_state["user"]["user_id"], target_date=active_diary_date_str)
+# Ambil statistik riwayat & streak akun berdasarkan tanggal lokal yang dipilih
+stats = get_user_history_stats(st.session_state["user"]["user_id"], target_date=active_diary_date_str, tz_offset=user_tz)
+streak_days = get_logging_streak(st.session_state["user"]["user_id"], tz_offset=user_tz)
 target_kcal = float(st.session_state["user"].get("daily_calorie_target") or 2000.0)
 today_kcal = stats["today_totals"]["energy_kcal"]
 pct_today = min(round((today_kcal / target_kcal) * 100, 1), 100.0) if target_kcal > 0 else 0
@@ -893,7 +940,7 @@ pct_today = min(round((today_kcal / target_kcal) * 100, 1), 100.0) if target_kca
 with tab_diary:
     # Bar Navigasi Tanggal Cepat (Hari Ini, Kemarin, Kalender)
     c_date1, c_date2, c_date3, c_date4 = st.columns([1.2, 1.2, 1.6, 2], vertical_alignment="center")
-    today_dt = datetime.now().date()
+    today_dt = local_now.date()
     yesterday_dt = today_dt - timedelta(days=1)
     
     with c_date1:
@@ -910,10 +957,9 @@ with tab_diary:
             st.session_state["selected_diary_date"] = pick_d
             st.rerun()
     with c_date4:
-        date_display_text = active_diary_date.strftime('%A, %d %B %Y')
-        # Terjemahan nama hari sederhana
         day_id = {"Monday": "Senin", "Tuesday": "Selasa", "Wednesday": "Rabu", "Thursday": "Kamis", "Friday": "Jumat", "Saturday": "Sabtu", "Sunday": "Minggu"}.get(active_diary_date.strftime('%A'), active_diary_date.strftime('%A'))
-        st.markdown(f"<div style='text-align: right; font-weight: 700; font-size: 0.92rem; opacity: 0.85;'>📅 {day_id}, {active_diary_date.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
+        tz_short = {7: "WIB", 8: "WITA", 9: "WIT"}.get(user_tz, "WITA")
+        st.markdown(f"<div style='text-align: right; font-weight: 700; font-size: 0.92rem; opacity: 0.85;'>📅 {day_id}, {active_diary_date.strftime('%d/%m/%Y')} ({tz_short})</div>", unsafe_allow_html=True)
 
     st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
 
@@ -933,16 +979,22 @@ with tab_diary:
         </div>
         """, unsafe_allow_html=True)
 
-    # Banner Cincin Aktivitas Kalori Hari Ini (Apple Health Style)
+    # Banner Cincin Aktivitas Kalori Hari Ini (Apple Health Style + Streak & Fokus)
+    streak_badge_html = (
+        f"<span style='background: rgba(245, 158, 11, 0.16); color: #d97706; padding: 0.4rem 0.9rem; border-radius: 9999px; font-weight: 800; font-size: 0.85rem;'>🔥 Streak {streak_days} Hari</span>"
+        if streak_days > 0 else
+        "<span style='background: rgba(125, 125, 125, 0.14); padding: 0.4rem 0.9rem; border-radius: 9999px; font-weight: 700; font-size: 0.82rem;'>🌱 Mulai Streak Hari Ini</span>"
+    )
     st.markdown(f"""
     <div class="apple-ring-card">
-        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
             <div>
-                <div class="ring-title">🎯 Cincin Kalori ({active_diary_date.strftime('%d %B %Y')})</div>
+                <div class="ring-title">🎯 Cincin Kalori ({active_diary_date.strftime('%d %B %Y')}) • Fokus: {user_focus}</div>
                 <div class="ring-val">{today_kcal:,.1f} <span style="font-size: 1.1rem; color: #64748b; font-weight: 500;">/ {target_kcal:,.0f} kkal</span></div>
                 <div class="ring-sub">Tercapai <strong>{pct_today}%</strong> • Sisa budget: <strong>{max(0.0, target_kcal - today_kcal):,.1f} kkal</strong></div>
             </div>
-            <div style="text-align: right; margin-top: 0.5rem;">
+            <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 0.3rem;">
+                {streak_badge_html}
                 <span style="background: rgba(16, 185, 129, 0.15); color: #059669; padding: 0.4rem 1rem; border-radius: 9999px; font-weight: 700; font-size: 0.88rem;">
                     {stats['today_totals']['count']} Menu Tercatat
                 </span>
@@ -990,6 +1042,7 @@ with tab_diary:
     f_g = stats['today_totals']['fat_g']
     c_g = stats['today_totals']['carb_g']
     fib_g = stats['today_totals']['fiber_g']
+    sod_mg = stats['today_totals'].get('sodium_mg', 0.0)
     macro_sum = p_g + f_g + c_g
     if macro_sum > 0:
         p_pct = round((p_g / macro_sum) * 100)
@@ -999,7 +1052,7 @@ with tab_diary:
         <div style="background: rgba(125, 125, 125, 0.06); border: 1px solid rgba(125, 125, 125, 0.14); border-radius: 16px; padding: 0.85rem 1.2rem; margin: 1rem 0;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.45rem; font-size: 0.82rem; font-weight: 700;">
                 <span>📊 Rasio Makronutrien Hari Ini</span>
-                <span style="opacity: 0.75;">Total Nutrisi: {macro_sum:.1f}g</span>
+                <span style="opacity: 0.75;">Total Nutrisi: {macro_sum:.1f}g • Natrium: {sod_mg:,.0f} mg</span>
             </div>
             <div style="display: flex; height: 10px; border-radius: 999px; overflow: hidden; margin-bottom: 0.55rem; background: rgba(125, 125, 125, 0.15);">
                 <div style="width: {p_pct}%; background: #0284c7;" title="Protein {p_pct}%"></div>
@@ -1014,11 +1067,21 @@ with tab_diary:
         </div>
         """, unsafe_allow_html=True)
 
-    # 🧠 Inovasi: Smart Daily Balancer (Asisten Penyeimbang Gizi Harian Real-Time)
+    # 🧠 Smart Daily Balancer (Beradaptasi dengan Fokus Kesehatan: Diet / Bumil / DM / Hipertensi)
     rem_kcal = max(0.0, target_kcal - today_kcal)
-    target_prot = round((target_kcal * 0.22) / 4.0)  # ~22% kalori dari protein
+    prot_ratio = 0.25 if "Hamil" in user_focus else 0.22
+    target_prot = round((target_kcal * prot_ratio) / 4.0)
     if stats['today_totals']['count'] > 0:
-        if p_g < target_prot * 0.5 and rem_kcal > 250:
+        if "Hipertensi" in user_focus and sod_mg >= 1800.0:
+            balancer_msg = f"🧂 <strong>Peringatan Natrium (Hipertensi):</strong> Asupan garam/natrium hari ini sudah mencapai <strong>{sod_mg:,.0f} mg</strong> (mendekati/melewati batas aman 2.000 mg Kemenkes/WHO). Hindari makanan asin, kecap berlebih, & kuah kaldu di jam makan berikutnya!"
+            balancer_col = "#ef4444"
+        elif "Diabetes" in user_focus and c_g > (target_kcal * 0.55 / 4.0) and fib_g < 15.0:
+            balancer_msg = f"🩸 <strong>Kendali Gula & Karbo (DM):</strong> Karbohidrat cukup tinggi (<strong>{c_g}g</strong>) dengan serat masih <strong>{fib_g}g</strong>. Perbanyak sayuran berserat & protein di porsi berikutnya agar lonjakan gula darah tetap landai!"
+            balancer_col = "#f59e0b"
+        elif "Hamil" in user_focus and p_g < target_prot * 0.6:
+            balancer_msg = f"🤰 <strong>Nutrisi Ibu & Janin:</strong> Asupan protein masih <strong>{p_g}g / ~{target_prot}g</strong>. Tambahkan sumber protein hewani (ikan kembung/patin, telur, ayam, atau susu) untuk mendukung pertumbuhan janin!"
+            balancer_col = "#0284c7"
+        elif p_g < target_prot * 0.5 and rem_kcal > 250:
             balancer_msg = f"🥩 <strong>Asupan Protein Masih Rendah ({p_g}g / target ~{target_prot}g):</strong> Tambahkan <strong>2 butir telur rebus (+12g P)</strong>, <strong>1 potong dada ayam bakar (+28g P)</strong>, atau <strong>tempe/tahu</strong> di jam makan berikutnya agar massa otot tetap terjaga!"
             balancer_col = "#0284c7"
         elif fib_g < 10.0 and rem_kcal > 150:
@@ -1036,7 +1099,7 @@ with tab_diary:
             
         st.markdown(f"""
         <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.25); border-left: 5px solid {balancer_col}; border-radius: 14px; padding: 0.85rem 1.15rem; margin-bottom: 1rem; font-size: 0.88rem; line-height: 1.45;">
-            🧠 <strong>Smart Daily Balancer:</strong> {balancer_msg}
+            🧠 <strong>Smart Daily Balancer ({user_focus}):</strong> {balancer_msg}
         </div>
         """, unsafe_allow_html=True)
 
@@ -1057,18 +1120,18 @@ with tab_diary:
         # Inovasi: Piring Cepat 1-Klik (Tanpa Perlu Mengetik)
         st.caption("🔥 **1-Klik Menu Harian Populer (Langsung Catat Tanpa Ketik):**")
         QUICK_PLATES = [
-            ("🍛 Nasi + Telur Dadar", "Nasi Putih + Telur Dadar", {"energy_kcal": 315.0, "protein_g": 11.5, "fat_g": 12.0, "carb_g": 40.0, "fiber_g": 1.0}),
-            ("🍗 Nasi + Ayam Bakar", "Nasi Putih + Ayam Bakar Dada", {"energy_kcal": 385.0, "protein_g": 32.0, "fat_g": 8.5, "carb_g": 43.0, "fiber_g": 1.2}),
-            ("🍜 Bakso Kuah Komplit", "Semangkuk Bakso Sapi Kuah", {"energy_kcal": 340.0, "protein_g": 18.5, "fat_g": 11.0, "carb_g": 41.0, "fiber_g": 2.0}),
-            ("🥗 Gado-Gado Telur", "Gado-Gado Lontong + Telur Rebus", {"energy_kcal": 410.0, "protein_g": 16.0, "fat_g": 18.0, "carb_g": 46.0, "fiber_g": 5.5}),
-            ("☕ Kopi Susu Aren", "Es Kopi Susu Gula Aren", {"energy_kcal": 175.0, "protein_g": 4.2, "fat_g": 5.5, "carb_g": 27.0, "fiber_g": 0.0}),
-            ("🥚 2 Telur Rebus", "2 Butir Telur Ayam Rebus", {"energy_kcal": 154.0, "protein_g": 12.6, "fat_g": 10.6, "carb_g": 1.1, "fiber_g": 0.0}),
+            ("🍛 Nasi + Telur Dadar", "Nasi Putih + Telur Dadar", {"energy_kcal": 315.0, "protein_g": 11.5, "fat_g": 12.0, "carb_g": 40.0, "fiber_g": 1.0, "sodium_mg": 240.0}),
+            ("🍗 Nasi + Ayam Bakar", "Nasi Putih + Ayam Bakar Dada", {"energy_kcal": 385.0, "protein_g": 32.0, "fat_g": 8.5, "carb_g": 43.0, "fiber_g": 1.2, "sodium_mg": 380.0}),
+            ("🍜 Bakso Kuah Komplit", "Semangkuk Bakso Sapi Kuah", {"energy_kcal": 340.0, "protein_g": 18.5, "fat_g": 11.0, "carb_g": 41.0, "fiber_g": 2.0, "sodium_mg": 680.0}),
+            ("🥗 Gado-Gado Telur", "Gado-Gado Lontong + Telur Rebus", {"energy_kcal": 410.0, "protein_g": 16.0, "fat_g": 18.0, "carb_g": 46.0, "fiber_g": 5.5, "sodium_mg": 420.0}),
+            ("☕ Kopi Susu Aren", "Es Kopi Susu Gula Aren", {"energy_kcal": 175.0, "protein_g": 4.2, "fat_g": 5.5, "carb_g": 27.0, "fiber_g": 0.0, "sodium_mg": 65.0}),
+            ("🥚 2 Telur Rebus", "2 Butir Telur Ayam Rebus", {"energy_kcal": 154.0, "protein_g": 12.6, "fat_g": 10.6, "carb_g": 1.1, "fiber_g": 0.0, "sodium_mg": 140.0}),
         ]
         qp_cols = st.columns(3)
         for idx_qp, (qp_label, qp_name, qp_tot) in enumerate(QUICK_PLATES):
             with qp_cols[idx_qp % 3]:
                 if st.button(qp_label, use_container_width=True, key=f"dash_qp_{idx_qp}"):
-                    current_hour = datetime.now().hour
+                    current_hour = get_local_now(user_tz).hour
                     auto_meal = "Sarapan" if 4 <= current_hour < 11 else ("Makan Siang" if 11 <= current_hour < 16 else ("Makan Malam" if 16 <= current_hour < 21 else "Camilan"))
                     res_log = log_meal(
                         user_id=st.session_state["user"]["user_id"],
@@ -1076,7 +1139,9 @@ with tab_diary:
                         totals=qp_tot,
                         multiplier=1.0,
                         caption="Piring Cepat 1-Klik",
-                        meal_type=auto_meal
+                        meal_type=auto_meal,
+                        log_date=active_diary_date_str,
+                        tz_offset=user_tz
                     )
                     st.session_state["last_saved_item"] = res_log
                     st.toast(f"✅ {qp_name} ({qp_tot['energy_kcal']} kkal) dicatat ke {auto_meal}!")
@@ -1095,8 +1160,7 @@ with tab_diary:
                         calc_res = calculate_dish_nutrition(res.get("components", []), portion_multiplier=1.0)
                         totals = calc_res["totals"]
                         
-                        # Waktu makan otomatis berdasarkan jam lokal
-                        current_hour = datetime.now().hour
+                        current_hour = get_local_now(user_tz).hour
                         if 4 <= current_hour < 11:
                             auto_meal = "Sarapan"
                         elif 11 <= current_hour < 16:
@@ -1112,7 +1176,9 @@ with tab_diary:
                             totals=totals,
                             multiplier=1.0,
                             caption=dash_quick_text.strip(),
-                            meal_type=auto_meal
+                            meal_type=auto_meal,
+                            log_date=active_diary_date_str,
+                            tz_offset=user_tz
                         )
                         st.session_state["last_saved_item"] = res_log
                         st.balloons()
@@ -1121,28 +1187,55 @@ with tab_diary:
                     except Exception as e:
                         st.error(f"Gagal mencatat makanan: {e}")
 
-    # Widget Pelacak Air Minum Harian (Water Intake Tracker)
-    water_data = get_water_intake(st.session_state["user"]["user_id"])
+    # Widget Pelacak Air Minum Harian & Pelacak Berat Badan
+    water_data = get_water_intake(st.session_state["user"]["user_id"], tz_offset=user_tz)
     water_pct = min(1.0, water_data["glasses"] / max(1, water_data["target"]))
     
-    with st.container(border=True):
-        col_w1, col_w2, col_w3 = st.columns([2.5, 1.2, 1], vertical_alignment="center")
-        with col_w1:
-            st.markdown(f"💧 **Pelacak Air Minum Hari Ini:** `{water_data['glasses']} / {water_data['target']} Gelas` ({water_data['ml']} / {water_data['target_ml']} ml)")
-            st.progress(water_pct)
-        with col_w2:
-            st.caption("Target standar: 8 gelas (2.000 ml) untuk menjaga metabolisme & pembakaran kalori.")
-        with col_w3:
-            col_b1, col_b2 = st.columns(2)
-            with col_b1:
-                if st.button("➕ 1", use_container_width=True, key="btn_add_water"):
-                    log_water_intake(st.session_state["user"]["user_id"], 1)
-                    st.toast("💧 +1 Gelas air dicatat!")
+    c_track1, c_track2 = st.columns([1.15, 1], gap="medium")
+    with c_track1:
+        with st.container(border=True):
+            col_w1, col_w3 = st.columns([2.1, 1], vertical_alignment="center")
+            with col_w1:
+                st.markdown(f"💧 **Air Minum:** `{water_data['glasses']}/{water_data['target']} Gelas` ({water_data['ml']} ml)")
+                st.progress(water_pct)
+                st.caption("Target 8 gelas (2.000 ml) untuk metabolisme optimal.")
+            with col_w3:
+                col_b1, col_b2 = st.columns(2)
+                with col_b1:
+                    if st.button("➕", use_container_width=True, key="btn_add_water", help="Tambah 1 gelas air"):
+                        log_water_intake(st.session_state["user"]["user_id"], 1, tz_offset=user_tz)
+                        st.toast("💧 +1 Gelas air dicatat!")
+                        st.rerun()
+                with col_b2:
+                    if st.button("➖", use_container_width=True, key="btn_sub_water", help="Kurangi 1 gelas air"):
+                        log_water_intake(st.session_state["user"]["user_id"], -1, tz_offset=user_tz)
+                        st.rerun()
+
+    with c_track2:
+        with st.container(border=True):
+            w_hist = get_weight_history(st.session_state["user"]["user_id"], limit=30)
+            latest_w = w_hist[-1]["weight_kg"] if w_hist else float(current_user.get("weight_kg") or 65.0)
+            cw_1, cw_2 = st.columns([1.8, 1.1], vertical_alignment="bottom")
+            with cw_1:
+                in_w = st.number_input("⚖️ Timbang Berat Hari Ini (kg):", min_value=20.0, max_value=250.0, value=float(latest_w), step=0.1, key="dash_weight_in")
+            with cw_2:
+                if st.button("💾 Catat BB", use_container_width=True, key="btn_save_weight"):
+                    log_weight_entry(st.session_state["user"]["user_id"], in_w, tz_offset=user_tz, recorded_date=active_diary_date_str)
+                    st.session_state["user"]["weight_kg"] = in_w
+                    st.toast(f"⚖️ Berat badan {in_w:.1f} kg disimpan!")
                     st.rerun()
-            with col_b2:
-                if st.button("➖ 1", use_container_width=True, key="btn_sub_water"):
-                    log_water_intake(st.session_state["user"]["user_id"], -1)
-                    st.rerun()
+            if len(w_hist) >= 2:
+                delta_w = round(w_hist[-1]["weight_kg"] - w_hist[0]["weight_kg"], 1)
+                sign_w = "+" if delta_w > 0 else ""
+                st.caption(f"📈 Tercatat {len(w_hist)} kali • Perubahan total: **{sign_w}{delta_w} kg** ({w_hist[0]['weight_kg']} → {w_hist[-1]['weight_kg']} kg)")
+            else:
+                st.caption("Catat berat badan secara rutin 1–2x seminggu untuk memantau grafik tren Anda.")
+
+    if w_hist and len(w_hist) >= 2:
+        with st.expander("📈 **Lihat Grafik Progres Berat Badan**", expanded=False):
+            df_w = pd.DataFrame(w_hist)
+            df_w["recorded_date"] = pd.to_datetime(df_w["recorded_date"]).dt.strftime("%d/%m")
+            st.line_chart(df_w.set_index("recorded_date")["weight_kg"], color="#0284c7")
 
     st.markdown("<br>", unsafe_allow_html=True)
     
@@ -1200,7 +1293,7 @@ with tab_diary:
     # Tombol Bagikan ke WhatsApp & Ekspor
     if stats["today_meals"]:
         wa_text = (
-            f"🥗 *Laporan Nutrisi Harian Saya ({datetime.now().strftime('%d %B %Y')})*\n"
+            f"🥗 *Laporan Nutrisi Harian Saya ({active_diary_date.strftime('%d %B %Y')})*\n"
             f"👤 Akun: {current_user['display_name']}\n"
             f"🔥 *Total Kalori:* {today_kcal} / {target_kcal:.0f} kkal ({pct_today}%)\n"
             f"🥩 Protein: {stats['today_totals']['protein_g']}g | 🥑 Lemak: {stats['today_totals']['fat_g']}g | 🍚 Karbo: {stats['today_totals']['carb_g']}g\n\n"
@@ -1228,9 +1321,9 @@ with tab_diary:
             # Unduh CSV
             df_export = pd.DataFrame(stats["today_meals"])
             if not df_export.empty:
-                cols_to_export = [c for c in ["logged_at", "meal_type", "dish_name", "energy_kcal", "protein_g", "fat_g", "carb_g", "fiber_g", "photo_caption"] if c in df_export.columns]
+                cols_to_export = [c for c in ["logged_at", "meal_type", "dish_name", "energy_kcal", "protein_g", "fat_g", "carb_g", "fiber_g", "sodium_mg", "photo_caption"] if c in df_export.columns]
                 csv_data = df_export[cols_to_export].to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Unduh Rekap (CSV/Excel)", data=csv_data, file_name=f"nutrisi_harian_{datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
+                st.download_button("📥 Unduh Rekap (CSV/Excel)", data=csv_data, file_name=f"nutrisi_harian_{active_diary_date.strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1275,7 +1368,10 @@ with tab_diary:
                 st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
 
                 for m in meals_in_group:
-                    time_str = datetime.strptime(m["logged_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M") if " " in m["logged_at"] else m["logged_at"]
+                    try:
+                        time_str = datetime.strptime(m["logged_at"][:19], "%Y-%m-%d %H:%M:%S").strftime("%H:%M") if " " in str(m["logged_at"]) else str(m["logged_at"])
+                    except Exception:
+                        time_str = str(m["logged_at"])[11:16] or str(m["logged_at"])
                     is_just_saved = ("last_saved_item" in st.session_state and st.session_state["last_saved_item"] and st.session_state["last_saved_item"].get("id") == m["id"])
                     saved_badge = '<span style="background: rgba(16,185,129,0.18); color: #10b981; font-size: 0.68rem; font-weight: 800; padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid rgba(16,185,129,0.3); margin-left: 6px;">🟢 BARU DISIMPAN</span>' if is_just_saved else ''
 
@@ -1339,26 +1435,24 @@ with tab_scanner:
                 auto_save_opt = st.checkbox("⚡ **Langsung Simpan Otomatis** ke Buku Harian setelah selesai analisis", value=True, key="opt_autosave_photo")
                 
                 if not scan_status["can_scan"]:
-                    st.warning("⚠️ **Batas Scan Harian Free Tercapai (3/3).**")
-                    st.markdown("Nikmati **Scan Foto Sepuasnya** cuma **Rp 19.000/bulan**!")
-                    if current_user["user_id"] != "Tamu (Demo)":
-                        if st.button("👑 Buka Scan Unlimited (Uji Coba PRO)", type="primary", use_container_width=True, key="btn_up_pro1"):
-                            activate_pro_tier(current_user["user_id"], days=30)
-                            st.toast("Akun PRO aktif! Silakan scan kembali.")
-                            st.rerun()
+                    max_sc = scan_status["max_scans"]
+                    if current_user["user_id"] == "Tamu (Demo)":
+                        st.warning(f"⚠️ **Batas Scan Foto Mode Demo Tercapai ({max_sc}/{max_sc} Hari Ini).**")
+                        st.info("Buat akun gratis dalam 15 detik di bagian atas untuk membuka **5x Scan Foto AI/hari** (3x makan berat + 2x jajan) atau gunakan tab **✍️ Ketik & Menu Cepat** sepuasnya!")
                     else:
-                        st.info("Daftar akun gratis di atas untuk langsung mendapatkan 30 Hari PRO!")
+                        st.warning(f"⚠️ **Kuota Scan Foto Hari Ini Tercapai ({max_sc}/{max_sc} — 3x Makan Berat & 2x Jajan).**")
+                        st.info("Jangan khawatir! Anda tetap bisa mencatat **sepuasnya tanpa batas** melalui tab **✍️ Ketik & Menu Cepat**, **1-Klik Menu Harian**, atau **🏷️ Barcode & Manual**.")
                 else:
                     if st.button("🚀 Analisis Nutrisi Foto Sekarang", type="primary", use_container_width=True, key="btn_foto"):
                         with st.spinner("Menganalisis visual foto makanan..."):
                             try:
                                 res = analyze_food_image(im, caption=p_caption, api_key=api_key)
                                 res["user_caption"] = p_caption
-                                record_scan_usage(current_user["user_id"])
+                                record_scan_usage(current_user["user_id"], tz_offset=user_tz)
                                 
                                 if auto_save_opt:
                                     calc_res_temp = calculate_dish_nutrition(res.get("components", []), portion_multiplier=1.0)
-                                    curr_h = datetime.now().hour
+                                    curr_h = get_local_now(user_tz).hour
                                     auto_meal = "Sarapan" if 4 <= curr_h < 11 else ("Makan Siang" if 11 <= curr_h < 16 else ("Makan Malam" if 16 <= curr_h < 21 else "Camilan"))
                                     res_log = log_meal(
                                         user_id=current_user["user_id"],
@@ -1366,7 +1460,9 @@ with tab_scanner:
                                         totals=calc_res_temp["totals"],
                                         multiplier=1.0,
                                         caption=p_caption or "Foto Piring",
-                                        meal_type=auto_meal
+                                        meal_type=auto_meal,
+                                        log_date=active_diary_date_str,
+                                        tz_offset=user_tz
                                     )
                                     st.session_state["last_saved_item"] = res_log
                                     st.toast(f"✅ {res.get('dish_name')} berhasil dianalisis & disimpan otomatis ke {auto_meal}!")
@@ -1526,14 +1622,17 @@ with tab_scanner:
                 
                 if st.button("💾 Simpan ke Buku Harian", type="primary", use_container_width=True):
                     if m_food_name.strip():
-                        log_meal(
+                        res_log = log_meal(
                             user_id=st.session_state["user"]["user_id"],
                             dish_name=m_food_name.strip(),
-                            totals={"energy_kcal": m_kcal, "protein_g": m_prot, "fat_g": m_fat, "carb_g": m_carb, "fiber_g": 0.0},
+                            totals={"energy_kcal": m_kcal, "protein_g": m_prot, "fat_g": m_fat, "carb_g": m_carb, "fiber_g": 0.0, "sodium_mg": 0.0},
                             multiplier=1.0,
                             caption=f"Manual Input ({m_serving})",
-                            meal_type=m_meal_clean
+                            meal_type=m_meal_clean,
+                            log_date=active_diary_date_str,
+                            tz_offset=user_tz
                         )
+                        st.session_state["last_saved_item"] = res_log
                         add_custom_food(st.session_state["user"]["user_id"], m_food_name.strip(), m_serving, m_kcal, m_prot, m_fat, m_carb)
                         stage_pending_food(
                             food_name=m_food_name.strip(),
@@ -1562,14 +1661,17 @@ with tab_scanner:
                             col_cbtn1, col_cbtn2 = st.columns([2, 1])
                             with col_cbtn1:
                                 if st.button("➕ Catat Lagi", key=f"quick_log_{c_item['id']}", use_container_width=True):
-                                    log_meal(
+                                    res_log = log_meal(
                                         user_id=st.session_state["user"]["user_id"],
                                         dish_name=c_item["food_name"],
-                                        totals={"energy_kcal": c_item["energy_kcal"], "protein_g": c_item["protein_g"], "fat_g": c_item["fat_g"], "carb_g": c_item["carb_g"], "fiber_g": 0.0},
+                                        totals={"energy_kcal": c_item["energy_kcal"], "protein_g": c_item["protein_g"], "fat_g": c_item["fat_g"], "carb_g": c_item["carb_g"], "fiber_g": 0.0, "sodium_mg": 0.0},
                                         multiplier=1.0,
                                         caption="Koleksi Pribadi",
-                                        meal_type=m_meal_clean
+                                        meal_type=m_meal_clean,
+                                        log_date=active_diary_date_str,
+                                        tz_offset=user_tz
                                     )
+                                    st.session_state["last_saved_item"] = res_log
                                     st.toast(f"Berhasil mencatat {c_item['food_name']}!")
                                     st.rerun()
                             with col_cbtn2:
@@ -1638,7 +1740,7 @@ with tab_scanner:
         c4.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#059669;'>{t_tot['carb_g']}g</div><div class='macro-lbl'>Karbohidrat</div></div>", unsafe_allow_html=True)
 
         # Pilihan Kategori Waktu Makan & Tombol Simpan Langsung di Atas (Tanpa Perlu Scroll Jauh)
-        curr_h = datetime.now().hour
+        curr_h = get_local_now(user_tz).hour
         def_idx = 0 if 4 <= curr_h < 11 else (1 if 11 <= curr_h < 16 else (2 if 16 <= curr_h < 21 else 3))
 
         MEAL_SCAN_MAP = {
@@ -1666,7 +1768,9 @@ with tab_scanner:
                     totals=t_tot,
                     multiplier=p_mult,
                     caption=data.get("user_caption", ""),
-                    meal_type=sel_meal_clean
+                    meal_type=sel_meal_clean,
+                    log_date=active_diary_date_str,
+                    tz_offset=user_tz
                 )
                 st.session_state["last_saved_item"] = res_log
                 st.session_state["nutrition_data"] = None
@@ -1924,34 +2028,35 @@ with tab_guide:
 
     with col_g1:
         with st.container(border=True):
-            st.markdown("### 1️⃣ **Mulai & Amankan Akun Anda**")
+            st.markdown("### 1️⃣ **Mulai & Amankan Akun Open Beta**")
             st.markdown("""
-            * **Langkah 1:** Klik tombol **'🔑 Masuk / Daftar Akun'** di sudut kanan atas atau pada banner halaman depan.
-            * **Langkah 2:** Buat akun cepat dalam 30 detik menggunakan nama panggilan & PIN 4–6 digit.
-            * **Keuntungan:** Semua riwayat makan, grafik mingguan, dan bonus **30 Hari PRO Gratis** langsung aktif dan terkunci permanen di HP Anda.
+            * **Langkah 1:** Klik tombol **'🔑 Masuk / Daftar'** di sudut kanan atas atau pada banner halaman depan.
+            * **Langkah 2:** Buat akun gratis dalam 15 detik menggunakan nama panggilan & PIN minimal 4 karakter.
+            * **Keuntungan Open Beta:** Nikmati **5x Scan Foto AI/hari** (3x makan berat + 2x camilan), pelacak berat badan, streak harian, dan catatan tersimpan rapi.
             """)
 
         with st.container(border=True):
-            st.markdown("### 2️⃣ **Atur Target Kalori & 9 Tema UI**")
+            st.markdown("### 2️⃣ **Fokus Kesehatan, Zona Waktu & Tema**")
             st.markdown("""
-            * **Target BMR Otomatis:** Dihitung langsung saat pendaftaran menggunakan rumus klinis *Mifflin-St Jeor* Kemenkes RI.
-            * **9 Pilihan Tema Proporsi 60-30-10:** Buka Sidebar kiri bawah menu **'🎨 Pilihan Tema Tampilan (9 Tema)'** untuk memilih gaya warna favorit (*Apple Light, Cal AI Dark, Mint Fresh, Warm Sunset, Ocean Breeze, Royal Purple Dark, Sakura Rose, Cyberpunk Gold*) yang nyaman di mata.
+            * **Target BMR & Fokus Klinis:** Pilih fokus (*Diet Sehat, Ibu Hamil, Kendali Gula DM, atau Kendali Natrium Hipertensi*) agar *Smart Daily Balancer* menyesuaikan saran gizinya.
+            * **Zona Waktu Akurat:** Default menggunakan waktu **WITA (UTC+8)** dan dapat disesuaikan ke WIB/WIT di sidebar.
+            * **9 Pilihan Tema Kontras Tinggi:** Buka Sidebar menu **'🎨 Pilihan Tema Tampilan'** untuk mengatur tampilan favorit.
             """)
 
     with col_g2:
         with st.container(border=True):
             st.markdown("### 3️⃣ **3 Cara Mudah Mencatat Makanan**")
             st.markdown("""
-            * **Cara A (1-Klik Tanpa Ketik):** Sentuh langsung tombol menu harian populer (*Nasi + Telur, Ayam Bakar, Bakso, Kopi Susu*) di halaman depan!
-            * **Cara B (Foto Piring HP):** Buka tab **📸 Catat**, klik *Browse files* untuk memotret atau memilih foto dari galeri.
-            * **Cara C (Barcode Kemasan):** Masukkan kode barcode produk ritel untuk menarik data gizi secara *real-time*.
+            * **Cara A (1-Klik Tanpa Ketik):** Sentuh langsung tombol menu harian populer di halaman depan!
+            * **Cara B (Foto Piring HP):** Buka tab **📸 Catat**, klik *Browse files* untuk memotret atau memilih foto dari galeri *(5x/hari pada Open Beta)*.
+            * **Cara C (Teks AI & Barcode):** Ketik nama masakan atau cek barcode produk ritel secara *unlimited*.
             """)
 
         with st.container(border=True):
-            st.markdown("### 4️⃣ **Skor Nutri-Grade & Smart Balancer**")
+            st.markdown("### 4️⃣ **Skor Nutri-Grade, Berat Badan & Streak**")
             st.markdown("""
-            * **Nutri-Grade (A–D) & Rambu GGL:** Setiap makanan dilengkapi skor kesehatan (A s/d D) dan indikator kepadatan kalori, protein, lemak, & natrium.
-            * **Smart Daily Balancer:** Asisten pintar di tab **📊 Hari Ini** otomatis memberi tahu jika tubuh Anda masih kekurangan protein atau serat hari ini.
+            * **Nutri-Grade (A–D) & Rambu GGL:** Setiap makanan dilengkapi skor kesehatan (A s/d D) dan rambu kepadatan kalori, protein, lemak, & natrium.
+            * **Pelacak Berat Badan & Streak:** Catat berat badan berkala dan bangun **Streak Harian** agar kebiasaan makan sehat makin konsisten.
             """)
 
     if is_admin:
@@ -1964,14 +2069,26 @@ with tab_guide:
                     st.markdown(f"- {hl}")
 
     st.markdown("---")
-    st.markdown("### 💡 **Pertanyaan Umum (FAQ)**")
+    st.markdown("### 💡 **Pertanyaan Umum (FAQ) & Ketentuan Layanan**")
     with st.expander("❓ Dari mana data kalori dan nutrisi ini diambil?"):
         st.write("Data nutrisi kami berbasis Tabel Komposisi Pangan Indonesia (TKPI) resmi Kementerian Kesehatan RI, USDA FoodData Central, Open Food Facts Global Database, dan NilaiGizi.")
     with st.expander("❓ Bagaimana jika hasil estimasi porsi ingin saya sesuaikan?"):
         st.write("Anda dapat menggeser slider ukuran porsi (Sedikit 0.7x, Normal 1.0x, Banyak 1.3x, Jumbo 1.5x) atau membuka menu 'Lihat Rincian Komposisi Lab & Koreksi Angka Gizi' sebelum menekan tombol Simpan.")
+    with st.expander("⚖️ Disclaimer Medis & Edukasi Gizi"):
+        st.write(
+            "Nutrisi Cerdas adalah alat bantu edukasi dan pemantauan gizi harian berbasis TKPI Kemenkes RI. "
+            "Estimasi porsi foto AI dapat memiliki selisih bergantung pada pencahayaan dan bahan tersembunyi. "
+            "Hasil hitungan maupun saran pada aplikasi ini TIDAK menggantikan diagnosis, terapi medis, atau konsultasi langsung dengan dokter maupun ahli gizi klinis."
+        )
+    with st.expander("🔒 Kebijakan Privasi & Keamanan Data (Open Beta)"):
+        st.write(
+            "Data akun dilindungi hashing PBKDF2-SHA256 bersalt dan token sesi bertanda tangan HMAC agar diary tidak dapat dibuka sembarang orang lewat tautan URL. "
+            "Foto makanan hanya dikirim sesaat untuk analisis visual komponen pangan dan tidak disimpan permanen di server AI. "
+            "Anda dapat mengunduh salinan data pribadi (.json) kapan saja melalui menu '📦 Cadangan Data Pribadi' di Sidebar."
+        )
 
 # Footer Resmi original by MN
-footer_ver_html = f" • Build <code>{APP_VERSION}</code>" if is_admin else ""
+footer_ver_html = f" • Build <code>{APP_VERSION}</code>" if is_admin else " • Open Beta"
 st.markdown(f"""
 <div style="text-align: center; padding: 2rem 0 1rem 0; margin-top: 2rem; border-top: 1px solid rgba(125, 125, 125, 0.15); font-size: 0.85rem; opacity: 0.75;">
     🥗 <strong>Nutrisi Cerdas</strong> • Kalkulator & Diary Gizi Terverifikasi • Crafted with ❤️ <strong>{APP_CREATOR}</strong> (Muhammad Nabillah){footer_ver_html}

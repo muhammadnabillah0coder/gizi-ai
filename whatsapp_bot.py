@@ -17,11 +17,18 @@ from datetime import datetime
 
 from gemini_extractor import analyze_food_text, analyze_food_image
 from nutrition_engine import calculate_dish_nutrition
-from db_history import get_or_create_user, log_meal, get_user_history_stats, get_user_scan_status, record_scan_usage
+from db_history import (
+    get_or_create_user, log_meal, get_user_history_stats,
+    get_user_scan_status, record_scan_usage, get_local_now, create_session_token
+)
 
 app = FastAPI(title="Nutrisi Cerdas WhatsApp Bot API")
 
 DASHBOARD_BASE_URL = "https://nutrisi-cerdas.streamlit.app"
+
+def _dashboard_url(user_id: str) -> str:
+    token = create_session_token(user_id)
+    return f"{DASHBOARD_BASE_URL}/?u={user_id}&s={token}" if token else DASHBOARD_BASE_URL
 
 def format_wa_reply(sender_phone: str, dish_name: str, totals: dict, advice: str = "") -> str:
     """Format balasan WhatsApp yang rapi, ramah, dan memotivasi."""
@@ -44,7 +51,7 @@ def format_wa_reply(sender_phone: str, dish_name: str, totals: dict, advice: str
     reply += (
         f"\n📊 *Total Kalori Hari Ini:* {today_kcal:,.1f} kkal\n\n"
         f"Lihat grafik cincin aktivitas & tren mingguanmu di:\n"
-        f"👉 {DASHBOARD_BASE_URL}/?u={sender_phone}\n\n"
+        f"👉 {_dashboard_url(sender_phone)}\n\n"
         f"_Ketik nama makanan atau kirim foto piringmu lagi kapan saja!_"
     )
     return reply
@@ -82,12 +89,13 @@ async def whatsapp_webhook(request: Request):
     # 1. Kasus Kirim Foto Makanan
     if image_url:
         if not scan_status["can_scan"]:
+            max_sc = scan_status.get("max_scans", 5)
             return {
                 "reply": (
-                    f"⚠️ *Batas Scan Foto Gratis Tercapai (3/3 Hari Ini)*\n\n"
-                    f"Kamu masih bisa catat makanan lewat ketik teks gratis sepuasnya!\n\n"
-                    f"Atau buka scan foto tak terbatas cuma *Rp 19.000/bln* di:\n"
-                    f"👉 {DASHBOARD_BASE_URL}/?u={sender_clean}"
+                    f"⚠️ *Batas Scan Foto Beta Tercapai ({max_sc}/{max_sc} Hari Ini)*\n\n"
+                    f"Kamu masih bisa catat makanan lewat ketik teks atau 1-Klik Menu Harian sepuasnya secara gratis!\n\n"
+                    f"Lihat riwayat lengkapmu di:\n"
+                    f"👉 {_dashboard_url(sender_clean)}"
                 )
             }
             
@@ -104,8 +112,8 @@ async def whatsapp_webhook(request: Request):
             nutrition_calc = calculate_dish_nutrition(components)
             totals = nutrition_calc["totals"]
             
-            # Tentukan meal_type otomatis berdasarkan jam
-            hour = datetime.now().hour
+            # Tentukan meal_type otomatis berdasarkan jam lokal WITA
+            hour = get_local_now().hour
             if hour < 11:
                 meal_type = "Sarapan"
             elif hour < 16:
@@ -116,7 +124,7 @@ async def whatsapp_webhook(request: Request):
                 meal_type = "Camilan"
                 
             log_meal(sender_clean, dish_name, totals, multiplier=1.0, caption="Catatan via WhatsApp", meal_type=meal_type)
-            reply_msg = format_wa_reply(sender_clean, dish_name, totals, advice=ai_data.get("practical_advice", ""))
+            reply_msg = format_wa_reply(sender_clean, dish_name, totals, advice=ai_data.get("health_tip", ""))
             return {"reply": reply_msg}
         except Exception as e:
             return {"reply": f"Maaf, gagal memproses foto: {str(e)}. Coba kirim ulang dengan foto lebih jelas ya!"}
@@ -129,7 +137,7 @@ async def whatsapp_webhook(request: Request):
                 "reply": (
                     f"Halo! 🥗 Saya asisten AI *Nutrisi Cerdas*.\n\n"
                     f"Kirimkan *foto makananmu* atau *ketik apa yang kamu makan* (contoh: _1 mangkok bakso campur tahu_), dan saya akan langsung menghitung kalori serta nutrisinya berdasarkan data resmi lab pangan Kemenkes RI!\n\n"
-                    f"Buka dashboard pribadimu:\n👉 {DASHBOARD_BASE_URL}/?u={sender_clean}"
+                    f"Buka dashboard pribadimu:\n👉 {_dashboard_url(sender_clean)}"
                 )
             }
             
@@ -140,11 +148,11 @@ async def whatsapp_webhook(request: Request):
             nutrition_calc = calculate_dish_nutrition(components)
             totals = nutrition_calc["totals"]
             
-            hour = datetime.now().hour
+            hour = get_local_now().hour
             meal_type = "Sarapan" if hour < 11 else ("Makan Siang" if hour < 16 else ("Makan Malam" if hour < 20 else "Camilan"))
             log_meal(sender_clean, dish_name, totals, multiplier=1.0, caption="Catatan teks WA", meal_type=meal_type)
             
-            reply_msg = format_wa_reply(sender_clean, dish_name, totals, advice=ai_data.get("practical_advice", ""))
+            reply_msg = format_wa_reply(sender_clean, dish_name, totals, advice=ai_data.get("health_tip", ""))
             return {"reply": reply_msg}
         except Exception as e:
             return {"reply": f"Maaf, tidak dapat menganalisis teks tersebut: {str(e)}"}
