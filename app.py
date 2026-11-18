@@ -16,6 +16,8 @@ import urllib.parse
 
 import importlib
 import sqlite3
+import food_guardrails
+import gemini_extractor
 import nutrition_engine
 import db_history
 
@@ -40,9 +42,20 @@ def _sync_module_from_disk(mod):
     return mod
 
 
+food_guardrails = _sync_module_from_disk(food_guardrails)
+gemini_extractor = _sync_module_from_disk(gemini_extractor)
 nutrition_engine = _sync_module_from_disk(nutrition_engine)
 db_history = _sync_module_from_disk(db_history)
 
+from food_guardrails import (
+    FoodGuardrailRejected,
+    MAX_FREE_UNCLEAR_IMAGE_RETRIES_PER_DAY,
+    is_excluded_from_public_catalog,
+    sanitize_html_text,
+    validate_extracted_dish_totals,
+    validate_food_candidate,
+    validate_food_text_query,
+)
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import (
     calculate_dish_nutrition, fetch_open_food_facts, evaluate_nutri_grade,
@@ -144,10 +157,11 @@ def _fetch_custom_foods_cached(uid: str, mut_ver: int):
 def _fetch_tkpi_categories_and_count():
     conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
     cur = conn.cursor()
-    cats = [r[0] for r in cur.execute("SELECT DISTINCT category FROM food_composition WHERE category IS NOT NULL ORDER BY category").fetchall()]
-    total_cnt = cur.execute("SELECT COUNT(*) FROM food_composition").fetchone()[0]
+    rows = cur.execute("SELECT food_name, category FROM food_composition").fetchall()
     conn.close()
-    return cats, total_cnt
+    visible_rows = [r for r in rows if not is_excluded_from_public_catalog(r[0] or "")]
+    cats = sorted({r[1] for r in visible_rows if r[1]})
+    return cats, len(visible_rows)
 
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -163,10 +177,75 @@ def _search_tkpi_catalog_cached(query_str: str, sel_cat_str: str):
     if sel_cat_str != "Semua Kategori":
         sql += " AND category = ?"
         params.append(sel_cat_str)
-    sql += " ORDER BY food_name ASC LIMIT 50"
+    sql += " ORDER BY food_name ASC LIMIT 120"
     rows = cur.execute(sql, params).fetchall()
     conn.close()
-    return [tuple(r) for r in rows]
+    filtered = [tuple(r) for r in rows if not is_excluded_from_public_catalog(r[0] or "")]
+    return filtered[:50]
+
+
+def _render_guardrail_rejection_card(g_err: FoodGuardrailRejected):
+    """Menampilkan peringatan penolakan sopan & berwibawa untuk input non-pangan, ekstrem, atau takaran mustahil."""
+    safe_msg = sanitize_html_text(g_err.message)
+    if g_err.rejection_type == "unclear_image":
+        st.warning(
+            f"📷 **Foto Belum Cukup Jelas Untuk Dianalisis**\n\n"
+            f"{g_err.message}\n\n"
+            f"Tips: nyalakan lampu yang terang dan potret piring tegak lurus dari atas."
+        )
+        return
+    st.markdown(
+        f"""
+        <div style="background: rgba(239, 68, 68, 0.10); border: 1.5px solid #ef4444; border-left: 6px solid #dc2626; border-radius: 14px; padding: 0.95rem 1.15rem; margin: 0.65rem 0;">
+            <div style="font-weight: 800; color: #ef4444; font-size: 0.96rem;">🛡️ Input Ditolak Oleh Penjaga Kualitas Pangan</div>
+            <div style="font-size: 0.88rem; margin-top: 0.35rem; line-height: 1.45;">{safe_msg}</div>
+            <div style="font-size: 0.78rem; opacity: 0.78; margin-top: 0.35rem;">Data tidak dihitung sebagai nutrisi dan tidak dimasukkan ke Buku Harian maupun antrean pangkalan data.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _consume_scan_or_free_unclear(uid: str, tz_offset: int, g_err: FoodGuardrailRejected):
+    """Memotong kuota pada foto iseng/non-pangan dan membatasi toleransi gratis foto buram maks. 2x/hari."""
+    if g_err.consumes_scan_quota:
+        record_scan_usage(uid, tz_offset=tz_offset)
+        _mark_db_mutated()
+        return
+    today_key = get_local_now(tz_offset).strftime("%Y-%m-%d")
+    bucket = st.session_state.get("unclear_free_tracker") or {}
+    if bucket.get("date") != today_key or bucket.get("uid") != uid:
+        bucket = {"date": today_key, "uid": uid, "count": 0}
+    bucket["count"] = int(bucket.get("count") or 0) + 1
+    st.session_state["unclear_free_tracker"] = bucket
+    if bucket["count"] > MAX_FREE_UNCLEAR_IMAGE_RETRIES_PER_DAY:
+        record_scan_usage(uid, tz_offset=tz_offset)
+        _mark_db_mutated()
+
+
+def _analyze_and_open_text_preview(raw_text: str, api_key_val: str, origin_tab: str) -> FoodGuardrailRejected | None:
+    """Validasi lokal 0-token lalu analisis teks AI + validasi total porsi sebelum membuka Preview."""
+    try:
+        clean_q = validate_food_text_query(raw_text)
+    except FoodGuardrailRejected as g_err:
+        return g_err
+    if not api_key_val:
+        st.error("⚠️ API Key belum disetel di Secrets.")
+        return None
+    with st.spinner("Menghitung estimasi nutrisi..."):
+        try:
+            res = analyze_food_text(clean_q, api_key=api_key_val)
+            calc_chk = calculate_dish_nutrition(res.get("components", []), auto_learn=False)
+            validate_extracted_dish_totals(res.get("dish_name", ""), calc_chk["totals"])
+            res["user_caption"] = clean_q
+            _open_food_preview(res, origin_tab=origin_tab)
+            st.toast("✅ Preview siap! Pilih porsi & waktu makan di bawah sebelum disimpan.")
+            st.rerun()
+        except FoodGuardrailRejected as g_err:
+            return g_err
+        except Exception as exc:
+            st.error(f"Gagal menganalisis menu: {exc}")
+    return None
 
 
 def _mark_db_mutated():
@@ -179,6 +258,7 @@ def _reset_ephemeral_user_state():
     st.session_state["last_saved_item"] = None
     st.session_state.pop("prepared_backup_json", None)
     st.session_state.pop("selected_diary_date", None)
+    st.session_state.pop("scanner_guardrail_notice", None)
 
 
 _ensure_schema_ready(getattr(db_history, "_MODULE_MTIME", 0.0))
@@ -703,7 +783,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
 
     with st.container(border=True):
         if saved_id:
-            st.markdown(f"""<div style="background: rgba(16, 185, 129, 0.14); border: 1.5px solid #10b981; border-radius: 14px; padding: 0.7rem 1rem; margin-bottom: 0.7rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;"><span style="font-weight: 800; color: #10b981;">🟢 SUDAH TERSIMPAN di Sesi {saved_mt}</span><span style="font-size: 0.82rem; opacity: 0.88;">Mengubah porsi/sesi di bawah akan memperbarui catatan ini (tidak mendobel).</span></div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div style="background: rgba(16, 185, 129, 0.14); border: 1.5px solid #10b981; border-radius: 14px; padding: 0.7rem 1rem; margin-bottom: 0.7rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;"><span style="font-weight: 800; color: #10b981;">🟢 SUDAH TERSIMPAN di Sesi {sanitize_html_text(saved_mt)}</span><span style="font-size: 0.82rem; opacity: 0.88;">Mengubah porsi/sesi di bawah akan memperbarui catatan ini (tidak mendobel).</span></div>""", unsafe_allow_html=True)
         else:
             st.markdown("""<div style="background: rgba(245, 158, 11, 0.14); border: 1.5px solid #f59e0b; border-radius: 14px; padding: 0.7rem 1rem; margin-bottom: 0.7rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;"><span style="font-weight: 800; color: #d97706;">🟡 PREVIEW — BELUM DISIMPAN</span><span style="font-size: 0.82rem; opacity: 0.88;">Atur ukuran porsi & pilih waktu makan, lalu klik <strong>Simpan ke Buku Harian</strong>.</span></div>""", unsafe_allow_html=True)
 
@@ -789,23 +869,27 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
             col_act1, col_act2 = st.columns([3, 1])
             with col_act1:
                 if st.button(f"💾 Simpan ke Buku Harian ({active_user['display_name']})", type="primary", use_container_width=True, key=f"prev_btn_save_{context_key}_{nonce}"):
-                    res_log = log_meal(
-                        user_id=active_user["user_id"],
-                        dish_name=data.get("dish_name", "Menu Sehat"),
-                        totals=t_tot,
-                        multiplier=p_mult,
-                        caption=data.get("user_caption", ""),
-                        meal_type=sel_meal_clean,
-                        log_date=active_date_str,
-                        tz_offset=tz_offset
-                    )
-                    st.session_state["last_saved_item"] = res_log
-                    st.session_state["nutrition_data"]["saved_log_id"] = res_log["id"]
-                    st.session_state["nutrition_data"]["saved_meal_type"] = sel_meal_clean
-                    st.session_state["nutrition_data"]["saved_multiplier"] = p_mult
-                    _mark_db_mutated()
-                    st.toast(f"✅ {data.get('dish_name')} tersimpan ke {sel_meal_clean}!")
-                    st.rerun()
+                    try:
+                        validate_extracted_dish_totals(data.get("dish_name", ""), t_tot)
+                        res_log = log_meal(
+                            user_id=active_user["user_id"],
+                            dish_name=data.get("dish_name", "Menu Sehat"),
+                            totals=t_tot,
+                            multiplier=p_mult,
+                            caption=data.get("user_caption", ""),
+                            meal_type=sel_meal_clean,
+                            log_date=active_date_str,
+                            tz_offset=tz_offset
+                        )
+                        st.session_state["last_saved_item"] = res_log
+                        st.session_state["nutrition_data"]["saved_log_id"] = res_log["id"]
+                        st.session_state["nutrition_data"]["saved_meal_type"] = sel_meal_clean
+                        st.session_state["nutrition_data"]["saved_multiplier"] = p_mult
+                        _mark_db_mutated()
+                        st.toast(f"✅ {data.get('dish_name')} tersimpan ke {sel_meal_clean}!")
+                        st.rerun()
+                    except FoodGuardrailRejected as g_err:
+                        _render_guardrail_rejection_card(g_err)
             with col_act2:
                 if st.button("❌ Tutup", use_container_width=True, key=f"prev_btn_clear_{context_key}_{nonce}"):
                     st.session_state["nutrition_data"] = None
@@ -845,7 +929,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                     st.rerun()
 
         if data.get("health_tip"):
-            st.markdown(f"""<div class="apple-tip">💡 <strong>Saran Nutrisi:</strong> {data['health_tip']}</div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div class="apple-tip">💡 <strong>Saran Nutrisi:</strong> {sanitize_html_text(data['health_tip'])}</div>""", unsafe_allow_html=True)
 
         with st.expander("🔍 **Lihat Rincian Komposisi Lab & Koreksi Angka Gizi**", expanded=False):
             table_rows = [{
@@ -862,24 +946,32 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
             st.markdown("##### ✏️ **Koreksi / Edit Nilai Gizi**")
             ed_c1, ed_c2 = st.columns(2)
             with ed_c1:
-                ed_name = st.text_input("Nama Pangan / Produk:", value=data.get("dish_name", "Menu Makanan"), key=f"ed_res_name_{context_key}_{nonce}")
-                ed_cat = st.text_input("Kategori Pangan:", value="Produk Terverifikasi MN", key=f"ed_res_cat_{context_key}_{nonce}")
-                ed_bc = st.text_input("Nomor Barcode (Opsional):", value=str(data.get("barcode") or ""), key=f"ed_res_bc_{context_key}_{nonce}")
-                ed_serv = st.text_input("Satuan Saji:", value=str(data.get("serving_unit") or "1 porsi"), key=f"ed_res_serv_{context_key}_{nonce}")
+                ed_name = st.text_input("Nama Pangan / Produk:", value=data.get("dish_name", "Menu Makanan"), max_chars=80, key=f"ed_res_name_{context_key}_{nonce}")
+                ed_cat = st.text_input("Kategori Pangan:", value="Produk Terverifikasi MN", max_chars=60, key=f"ed_res_cat_{context_key}_{nonce}")
+                ed_bc = st.text_input("Nomor Barcode (Opsional):", value=str(data.get("barcode") or ""), max_chars=20, key=f"ed_res_bc_{context_key}_{nonce}")
+                ed_serv = st.text_input("Satuan Saji:", value=str(data.get("serving_unit") or "1 porsi"), max_chars=40, key=f"ed_res_serv_{context_key}_{nonce}")
             with ed_c2:
-                ed_kcal = st.number_input("Kalori (kkal):", min_value=0.0, value=float(t_tot["energy_kcal"]), step=5.0, key=f"ed_res_kcal_{context_key}_{nonce}")
-                ed_p = st.number_input("Protein (g):", min_value=0.0, value=float(t_tot["protein_g"]), step=0.5, key=f"ed_res_p_{context_key}_{nonce}")
-                ed_f = st.number_input("Lemak (g):", min_value=0.0, value=float(t_tot["fat_g"]), step=0.5, key=f"ed_res_f_{context_key}_{nonce}")
-                ed_c = st.number_input("Karbohidrat (g):", min_value=0.0, value=float(t_tot["carb_g"]), step=0.5, key=f"ed_res_c_{context_key}_{nonce}")
+                ed_kcal = st.number_input("Kalori (kkal):", min_value=0.0, max_value=3500.0, value=min(3500.0, float(t_tot["energy_kcal"])), step=5.0, key=f"ed_res_kcal_{context_key}_{nonce}")
+                ed_p = st.number_input("Protein (g):", min_value=0.0, max_value=200.0, value=min(200.0, float(t_tot["protein_g"])), step=0.5, key=f"ed_res_p_{context_key}_{nonce}")
+                ed_f = st.number_input("Lemak (g):", min_value=0.0, max_value=200.0, value=min(200.0, float(t_tot["fat_g"])), step=0.5, key=f"ed_res_f_{context_key}_{nonce}")
+                ed_c = st.number_input("Karbohidrat (g):", min_value=0.0, max_value=400.0, value=min(400.0, float(t_tot["carb_g"])), step=0.5, key=f"ed_res_c_{context_key}_{nonce}")
 
             col_pub1, col_pub2 = st.columns(2)
             with col_pub1:
                 if st.button("✅ Terapkan Koreksi ke Hasil Ini", use_container_width=True, key=f"btn_apply_edit_local_{context_key}_{nonce}"):
+                    try:
+                        clean_ed_name = validate_food_candidate(
+                            ed_name, ed_kcal, ed_p, ed_f, ed_c,
+                            float(t_tot.get("fiber_g", 0.0)), is_catalog_entry=False,
+                        )
+                    except FoodGuardrailRejected as g_err:
+                        _render_guardrail_rejection_card(g_err)
+                        return
                     # Bagi proporsional agar saat p_mult = 1.0x nilai akhir sama persis dengan ed_kcal
                     inv_mult = 1.0 / max(p_mult, 0.1)
-                    st.session_state["nutrition_data"]["dish_name"] = ed_name
+                    st.session_state["nutrition_data"]["dish_name"] = clean_ed_name
                     st.session_state["nutrition_data"]["components"] = [{
-                        "name": ed_name,
+                        "name": clean_ed_name,
                         "weight_g": round(100.0 * inv_mult, 2),
                         "energy_kcal_per_100g": ed_kcal,
                         "protein_g_per_100g": ed_p,
@@ -888,7 +980,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                         "fiber_g_per_100g": float(t_tot.get("fiber_g", 0.0)),
                         "sodium_mg_per_100g": float(t_tot.get("sodium_mg", 0.0)),
                         "custom_override": True,
-                        "source_label": f"Koreksi Pengguna ({ed_name})"
+                        "source_label": f"Koreksi Pengguna ({clean_ed_name})"
                     }]
                     if saved_id:
                         new_tot = {
@@ -896,7 +988,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                             "carb_g": ed_c, "fiber_g": float(t_tot.get("fiber_g", 0.0)),
                             "sodium_mg": float(t_tot.get("sodium_mg", 0.0)),
                         }
-                        res_upd = update_meal_log(saved_id, active_user["user_id"], dish_name=ed_name, totals=new_tot, multiplier=p_mult, meal_type=sel_meal_clean)
+                        res_upd = update_meal_log(saved_id, active_user["user_id"], dish_name=clean_ed_name, totals=new_tot, multiplier=p_mult, meal_type=sel_meal_clean)
                         if res_upd:
                             st.session_state["last_saved_item"] = res_upd
                         _mark_db_mutated()
@@ -905,27 +997,43 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
             with col_pub2:
                 if is_adm:
                     if st.button("🚀 Publikasikan Resmi ke Katalog Utama (Admin)", type="primary", use_container_width=True, key=f"btn_pub_catalog_now_{context_key}_{nonce}"):
-                        publish_food_to_catalog(
-                            food_name=ed_name, category=ed_cat,
-                            kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
-                            fib_100=float(t_tot.get("fiber_g", 0.0)),
-                            barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0
-                        )
-                        _fetch_tkpi_categories_and_count.clear()
-                        _search_tkpi_catalog_cached.clear()
-                        _mark_db_mutated()
-                        st.success(f"🎉 '{ed_name}' berhasil dipublikasikan secara resmi ke katalog utama!")
+                        try:
+                            publish_food_to_catalog(
+                                food_name=ed_name, category=ed_cat,
+                                kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
+                                fib_100=float(t_tot.get("fiber_g", 0.0)),
+                                barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0
+                            )
+                            _fetch_tkpi_categories_and_count.clear()
+                            _search_tkpi_catalog_cached.clear()
+                            _mark_db_mutated()
+                            st.success(f"🎉 '{ed_name}' berhasil dipublikasikan secara resmi ke katalog utama!")
+                        except FoodGuardrailRejected as g_err:
+                            _render_guardrail_rejection_card(g_err)
                 else:
                     if st.button("📥 Ajukan ke Antrean Kurasi Admin", type="primary", use_container_width=True, key=f"btn_stage_catalog_now_{context_key}_{nonce}"):
-                        stage_pending_food(
-                            food_name=ed_name, category=ed_cat,
-                            kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
-                            fib_100=float(t_tot.get("fiber_g", 0.0)),
-                            barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0,
-                            source_origin="Koreksi Pengguna", submitted_by=active_user["user_id"]
-                        )
-                        _mark_db_mutated()
-                        st.success("✅ Berhasil diajukan ke antrean kurasi Admin sebelum dipublikasikan!")
+                        if active_user["user_id"] == "Tamu (Demo)":
+                            st.info("Silakan masuk ke akun terdaftar untuk mengajukan usulan ke katalog Admin.")
+                        else:
+                            try:
+                                clean_sub = validate_food_candidate(
+                                    ed_name, ed_kcal, ed_p, ed_f, ed_c,
+                                    float(t_tot.get("fiber_g", 0.0)), is_catalog_entry=True,
+                                )
+                                pid = stage_pending_food(
+                                    food_name=clean_sub, category=ed_cat,
+                                    kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
+                                    fib_100=float(t_tot.get("fiber_g", 0.0)),
+                                    barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0,
+                                    source_origin="Koreksi Pengguna", submitted_by=active_user["user_id"]
+                                )
+                                if pid:
+                                    _mark_db_mutated()
+                                    st.success("✅ Berhasil diajukan ke antrean kurasi Admin sebelum dipublikasikan!")
+                                else:
+                                    st.warning("Item tersebut sudah ada atau menunggu tinjauan Admin.")
+                            except FoodGuardrailRejected as g_err:
+                                _render_guardrail_rejection_card(g_err)
 
 # Sidebar: Akun Pribadi & Target Harian (Efisien, Bersih, & Kompak)
 with st.sidebar:
@@ -958,7 +1066,7 @@ with st.sidebar:
 
         st.markdown(f"""
         <div style="background: rgba(125, 125, 125, 0.08); border: 1px solid rgba(125, 125, 125, 0.16); border-radius: 14px; padding: 0.75rem 0.9rem; margin-bottom: 0.5rem;">
-            <div style="font-weight: 700; font-size: 0.92rem;">👤 {current_user['display_name']}</div>
+            <div style="font-weight: 700; font-size: 0.92rem;">👤 {sanitize_html_text(current_user['display_name'])}</div>
             <div style="margin-top: 0.35rem;">{badge_html}</div>
         </div>
         """, unsafe_allow_html=True)
@@ -985,9 +1093,9 @@ with st.sidebar:
     with st.expander("🧮 Hitung Ulang Target Ideal (BMR)", expanded=False):
         st.caption("Hitung target kalori berdasarkan rumus standar Mifflin-St Jeor / Kemenkes RI:")
         gender = st.radio("Jenis Kelamin:", ["Pria", "Wanita"], horizontal=True, key="sb_bmr_gen")
-        bb = st.number_input("Berat Badan (kg):", value=float(current_user.get("weight_kg") or 65.0), step=1.0, key="sb_bmr_bb")
-        tb = st.number_input("Tinggi Badan (cm):", value=float(current_user.get("height_cm") or 170.0), step=1.0, key="sb_bmr_tb")
-        usia = st.number_input("Usia (tahun):", value=int(current_user.get("age_years") or 25), step=1, key="sb_bmr_age")
+        bb = st.number_input("Berat Badan (kg):", min_value=20.0, max_value=250.0, value=min(250.0, max(20.0, float(current_user.get("weight_kg") or 65.0))), step=1.0, key="sb_bmr_bb")
+        tb = st.number_input("Tinggi Badan (cm):", min_value=80.0, max_value=230.0, value=min(230.0, max(80.0, float(current_user.get("height_cm") or 170.0))), step=1.0, key="sb_bmr_tb")
+        usia = st.number_input("Usia (tahun):", min_value=5, max_value=110, value=min(110, max(5, int(current_user.get("age_years") or 25))), step=1, key="sb_bmr_age")
         aktivitas = st.selectbox("Aktivitas Harian:", [
             "Sedentari (Jarang olahraga / di depan laptop)",
             "Ringan (Olahraga 1-3 hari/minggu)",
@@ -1214,10 +1322,10 @@ with col_head2:
                     c_r1, c_r2 = st.columns(2)
                     with c_r1:
                         reg_gender = st.selectbox("Gender:", ["Pria", "Wanita"], key="reg_gen")
-                        reg_bb = st.number_input("Berat Badan (kg):", value=65.0, step=1.0, key="reg_bb")
+                        reg_bb = st.number_input("Berat Badan (kg):", min_value=20.0, max_value=250.0, value=65.0, step=1.0, key="reg_bb")
                     with c_r2:
-                        reg_age = st.number_input("Usia (thn):", value=25, step=1, key="reg_age")
-                        reg_tb = st.number_input("Tinggi Badan (cm):", value=170.0, step=1.0, key="reg_tb")
+                        reg_age = st.number_input("Usia (thn):", min_value=5, max_value=110, value=25, step=1, key="reg_age")
+                        reg_tb = st.number_input("Tinggi Badan (cm):", min_value=80.0, max_value=230.0, value=170.0, step=1.0, key="reg_tb")
                         
                     reg_focus = st.selectbox("Fokus Pemantauan:", FOCUS_GOALS, key="reg_focus")
                     reg_goal = st.selectbox("Target Kalori:", [
@@ -1324,10 +1432,10 @@ if current_user["user_id"] == "Tamu (Demo)":
                 hc_1, hc_2 = st.columns(2)
                 with hc_1:
                     h_gender = st.selectbox("Gender:", ["Pria", "Wanita"], key="h_reg_gen")
-                    h_bb = st.number_input("Berat (kg):", value=65.0, step=1.0, key="h_reg_bb")
+                    h_bb = st.number_input("Berat (kg):", min_value=20.0, max_value=250.0, value=65.0, step=1.0, key="h_reg_bb")
                 with hc_2:
-                    h_age = st.number_input("Usia (thn):", value=25, step=1, key="h_reg_age")
-                    h_tb = st.number_input("Tinggi (cm):", value=170.0, step=1.0, key="h_reg_tb")
+                    h_age = st.number_input("Usia (thn):", min_value=5, max_value=110, value=25, step=1, key="h_reg_age")
+                    h_tb = st.number_input("Tinggi (cm):", min_value=80.0, max_value=230.0, value=170.0, step=1.0, key="h_reg_tb")
                     
                 h_focus = st.selectbox("Fokus Kesehatan:", FOCUS_GOALS, key="h_reg_focus")
                 h_goal = st.selectbox("Tujuan Program:", [
@@ -1451,7 +1559,7 @@ with tab_diary:
                 <span style="font-size: 1.6rem;">✅</span>
                 <div>
                     <div style="font-weight: 800; font-size: 0.98rem; color: #10b981;">Tersimpan Permanen ke Buku Harian!</div>
-                    <div style="font-size: 0.84rem; opacity: 0.9;"><strong>{saved_info['dish_name']}</strong> ({saved_info['energy_kcal']} kkal) • Sesi <strong>{saved_info['meal_type']}</strong> • Jam {saved_info['saved_at']}</div>
+                    <div style="font-size: 0.84rem; opacity: 0.9;"><strong>{sanitize_html_text(saved_info['dish_name'])}</strong> ({saved_info['energy_kcal']} kkal) • Sesi <strong>{sanitize_html_text(saved_info['meal_type'])}</strong> • Jam {sanitize_html_text(saved_info['saved_at'])}</div>
                 </div>
             </div>
             <span style="background: #10b981; color: white; font-size: 0.72rem; font-weight: 800; padding: 0.25rem 0.65rem; border-radius: 999px;">DATA AMAN</span>
@@ -1671,18 +1779,10 @@ with tab_diary:
         if dash_btn_calc:
             if not dash_quick_text.strip():
                 st.warning("Ketikkan nama menu makanan terlebih dahulu.")
-            elif not api_key:
-                st.error("⚠️ API Key belum disetel di Secrets.")
             else:
-                with st.spinner("Menghitung estimasi nutrisi..."):
-                    try:
-                        res = analyze_food_text(dash_quick_text.strip(), api_key=api_key)
-                        res["user_caption"] = dash_quick_text.strip()
-                        _open_food_preview(res, origin_tab="diary")
-                        st.toast("✅ Preview siap! Pilih porsi & waktu makan di bawah sebelum disimpan.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Gagal menganalisis makanan: {e}")
+                g_err = _analyze_and_open_text_preview(dash_quick_text, api_key, origin_tab="diary")
+                if g_err is not None:
+                    _render_guardrail_rejection_card(g_err)
 
     if st.session_state.get("nutrition_data"):
         if st.session_state.get("preview_origin_tab") == "diary":
@@ -1888,7 +1988,7 @@ with tab_diary:
                     col_row1, col_row2, col_row3, col_row4 = st.columns([3.0, 1.9, 0.55, 0.55], vertical_alignment="center")
                     with col_row1:
                         mult_lbl = f" • {m.get('portion_multiplier', 1.0)}x" if float(m.get("portion_multiplier") or 1.0) != 1.0 else ""
-                        st.markdown(f"**{m['dish_name']}**{mult_lbl} {saved_badge}", unsafe_allow_html=True)
+                        st.markdown(f"**{sanitize_html_text(m['dish_name'])}**{mult_lbl} {saved_badge}", unsafe_allow_html=True)
                         sub_cap = f"_{m['photo_caption']}_" if m['photo_caption'] else ""
                         st.caption(f"🕒 {time_str} {sub_cap}")
                     with col_row2:
@@ -1955,6 +2055,10 @@ with tab_scanner:
     with subtab_foto:
         st.markdown("##### 📸 **Foto Makanan dari Galeri atau Kamera HP**")
         st.caption("Di HP Android/iPhone, klik tombol **Browse files** di bawah untuk langsung memilih **Kamera** atau **Galeri Foto**.")
+        if st.session_state.get("scanner_guardrail_notice") and st.session_state["scanner_guardrail_notice"][0] == "foto":
+            _, r_type, r_msg = st.session_state.pop("scanner_guardrail_notice")
+            _render_guardrail_rejection_card(FoodGuardrailRejected(r_type, r_msg))
+
         c_up1, c_up2 = st.columns([1.2, 1], gap="large")
         with c_up1:
             up_file = st.file_uploader("Pilih atau jepret foto piring makanan:", type=["jpg", "jpeg", "png", "webp"], key="scan_foto")
@@ -1965,7 +2069,7 @@ with tab_scanner:
             if active_img_file:
                 im = Image.open(active_img_file)
                 st.image(im, caption="Foto Makanan Siap Dianalisis", use_container_width=True)
-                p_caption = st.text_input("💬 Catatan / Keterangan (Opsional):", placeholder="Contoh: Bumbu kacang dipisah / ayam tanpa kulit", key="f_cap")
+                p_caption = st.text_input("💬 Catatan / Keterangan (Opsional):", placeholder="Contoh: Bumbu kacang dipisah / ayam tanpa kulit", max_chars=160, key="f_cap")
             else:
                 p_caption = ""
         with c_up2:
@@ -1986,11 +2090,17 @@ with tab_scanner:
                         with st.spinner("Menganalisis visual foto makanan..."):
                             try:
                                 res = analyze_food_image(im, caption=p_caption, api_key=api_key)
+                                calc_chk = calculate_dish_nutrition(res.get("components", []), auto_learn=False)
+                                validate_extracted_dish_totals(res.get("dish_name", ""), calc_chk["totals"])
                                 res["user_caption"] = p_caption or "Foto Piring"
                                 record_scan_usage(current_user["user_id"], tz_offset=user_tz)
                                 _mark_db_mutated()
                                 _open_food_preview(res, origin_tab="scanner")
                                 st.toast("🔍 Foto berhasil dianalisis! Cek porsi & pilih waktu makan di bawah sebelum Simpan.")
+                                st.rerun()
+                            except FoodGuardrailRejected as g_err:
+                                _consume_scan_or_free_unclear(current_user["user_id"], user_tz, g_err)
+                                st.session_state["scanner_guardrail_notice"] = ("foto", g_err.rejection_type, g_err.message)
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Gagal memproses gambar: {e}")
@@ -1999,22 +2109,14 @@ with tab_scanner:
 
     with subtab_teks:
         st.markdown("##### ✍️ **Ketik Menu Makanan atau Pilih Menu Cepat 1-Klik**")
-        t_input = st.text_area("Tuliskan apa yang kamu makan:", placeholder="Contoh: 1 piring gado-gado lontong pakai telur rebus dan bumbu kacang", height=90)
+        t_input = st.text_area("Tuliskan apa yang kamu makan:", placeholder="Contoh: 1 piring gado-gado lontong pakai telur rebus dan bumbu kacang", height=90, max_chars=200)
         if st.button("🔍 Hitung Nutrisi Menu", type="primary", use_container_width=True, key="btn_teks"):
-            if not api_key:
-                st.error("⚠️ API Key belum terkonfigurasi. Silakan periksa pengaturan di sidebar atau secrets.")
-            elif not t_input.strip():
+            if not t_input.strip():
                 st.warning("Silakan tulis menu makanan terlebih dahulu.")
             else:
-                with st.spinner("Menghitung nilai nutrisi dari database lab..."):
-                    try:
-                        res = analyze_food_text(t_input, api_key=api_key)
-                        res["user_caption"] = t_input
-                        _open_food_preview(res, origin_tab="scanner")
-                        st.toast("✅ Analisis berhasil! Lihat Preview di bawah sebelum Simpan.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Gagal memproses teks: {e}")
+                g_err = _analyze_and_open_text_preview(t_input, api_key, origin_tab="scanner")
+                if g_err is not None:
+                    _render_guardrail_rejection_card(g_err)
 
         st.markdown("---")
         st.caption("⚡ **Malas Mengetik? Sentuh Menu Populer Indonesia di Bawah Ini:**")
@@ -2111,6 +2213,10 @@ with tab_scanner:
             else:
                 st.error("Nomor barcode tidak ditemukan. Gunakan fitur **Foto Label Gizi** atau **Input Manual** di bawah ini!")
 
+        if st.session_state.get("scanner_guardrail_notice") and st.session_state["scanner_guardrail_notice"][0] == "pkg":
+            _, r_type, r_msg = st.session_state.pop("scanner_guardrail_notice")
+            _render_guardrail_rejection_card(FoodGuardrailRejected(r_type, r_msg))
+
         with st.expander("📸 **Scan Foto Tabel Informasi Nilai Gizi Kemasan**", expanded=False):
             pkg_file = st.file_uploader("Pilih foto bungkus / label gizi kemasan:", type=["jpg", "jpeg", "png", "webp"], key="scan_pkg_img")
             if pkg_file and api_key:
@@ -2120,8 +2226,14 @@ with tab_scanner:
                     with st.spinner("Membaca tabel nilai gizi pada kemasan..."):
                         try:
                             res = analyze_food_image(im_pkg, caption="Kemasan produk ritel / tabel informasi nilai gizi", api_key=api_key)
+                            calc_chk = calculate_dish_nutrition(res.get("components", []), auto_learn=False)
+                            validate_extracted_dish_totals(res.get("dish_name", ""), calc_chk["totals"])
                             res["source_origin"] = "Ekstraksi Vision Label Gizi"
                             _open_food_preview(res, origin_tab="scanner")
+                            st.rerun()
+                        except FoodGuardrailRejected as g_err:
+                            _consume_scan_or_free_unclear(current_user["user_id"], user_tz, g_err)
+                            st.session_state["scanner_guardrail_notice"] = ("pkg", g_err.rejection_type, g_err.message)
                             st.rerun()
                         except Exception as e:
                             st.error(f"Gagal membaca foto kemasan: {e}")
@@ -2129,15 +2241,15 @@ with tab_scanner:
         with st.expander("➕ **Input Manual Makanan / Resep Sendiri**", expanded=False):
             col_m1, col_m2 = st.columns([1.4, 1], gap="large")
             with col_m1:
-                m_food_name = st.text_input("Nama Makanan / Produk:", placeholder="Contoh: Susu Ultra Milk Cokelat 250ml")
-                m_serving = st.text_input("Ukuran Porsi:", placeholder="1 kotak (250ml)")
+                m_food_name = st.text_input("Nama Makanan / Produk:", placeholder="Contoh: Susu Ultra Milk Cokelat 250ml", max_chars=80)
+                m_serving = st.text_input("Ukuran Porsi:", placeholder="1 kotak (250ml)", max_chars=50)
                 col_nut1, col_nut2 = st.columns(2)
                 with col_nut1:
-                    m_kcal = st.number_input("Total Kalori (kkal):", min_value=0.0, value=160.0, step=10.0)
-                    m_prot = st.number_input("Protein (gram):", min_value=0.0, value=8.0, step=1.0)
+                    m_kcal = st.number_input("Total Kalori (kkal):", min_value=0.0, max_value=3500.0, value=160.0, step=10.0)
+                    m_prot = st.number_input("Protein (gram):", min_value=0.0, max_value=200.0, value=8.0, step=1.0)
                 with col_nut2:
-                    m_fat = st.number_input("Lemak (gram):", min_value=0.0, value=4.0, step=1.0)
-                    m_carb = st.number_input("Karbohidrat (gram):", min_value=0.0, value=24.0, step=1.0)
+                    m_fat = st.number_input("Lemak (gram):", min_value=0.0, max_value=200.0, value=4.0, step=1.0)
+                    m_carb = st.number_input("Karbohidrat (gram):", min_value=0.0, max_value=400.0, value=24.0, step=1.0)
                 
                 MEAL_MAP_MANUAL = {
                     "🌅 Sarapan": "Sarapan",
@@ -2150,32 +2262,27 @@ with tab_scanner:
                 
                 if st.button("💾 Simpan ke Buku Harian", type="primary", use_container_width=True):
                     if m_food_name.strip():
-                        res_log = log_meal(
-                            user_id=st.session_state["user"]["user_id"],
-                            dish_name=m_food_name.strip(),
-                            totals={"energy_kcal": m_kcal, "protein_g": m_prot, "fat_g": m_fat, "carb_g": m_carb, "fiber_g": 0.0, "sodium_mg": 0.0},
-                            multiplier=1.0,
-                            caption=f"Manual Input ({m_serving})",
-                            meal_type=m_meal_clean,
-                            log_date=active_diary_date_str,
-                            tz_offset=user_tz
-                        )
-                        st.session_state["last_saved_item"] = res_log
-                        add_custom_food(st.session_state["user"]["user_id"], m_food_name.strip(), m_serving, m_kcal, m_prot, m_fat, m_carb)
-                        stage_pending_food(
-                            food_name=m_food_name.strip(),
-                            category="Input Manual Pengguna",
-                            kcal_100=m_kcal,
-                            p_100=m_prot,
-                            f_100=m_fat,
-                            c_100=m_carb,
-                            serving_unit=m_serving or "1 porsi",
-                            source_origin="Input Manual User",
-                            submitted_by=current_user["user_id"]
-                        )
-                        st.success(f"Berhasil dicatat ke sesi {m_meal_clean}!")
-                        _mark_db_mutated()
-                        st.rerun()
+                        try:
+                            clean_manual_name = validate_food_candidate(
+                                m_food_name.strip(), m_kcal, m_prot, m_fat, m_carb, is_catalog_entry=False
+                            )
+                            res_log = log_meal(
+                                user_id=st.session_state["user"]["user_id"],
+                                dish_name=clean_manual_name,
+                                totals={"energy_kcal": m_kcal, "protein_g": m_prot, "fat_g": m_fat, "carb_g": m_carb, "fiber_g": 0.0, "sodium_mg": 0.0},
+                                multiplier=1.0,
+                                caption=f"Manual Input ({m_serving})",
+                                meal_type=m_meal_clean,
+                                log_date=active_diary_date_str,
+                                tz_offset=user_tz
+                            )
+                            st.session_state["last_saved_item"] = res_log
+                            add_custom_food(st.session_state["user"]["user_id"], clean_manual_name, m_serving, m_kcal, m_prot, m_fat, m_carb)
+                            st.success(f"Berhasil dicatat ke sesi {m_meal_clean}!")
+                            _mark_db_mutated()
+                            st.rerun()
+                        except FoodGuardrailRejected as g_err:
+                            _render_guardrail_rejection_card(g_err)
                     else:
                         st.warning("Mohon isi nama makanan terlebih dahulu.")
                         
@@ -2265,21 +2372,24 @@ with tab_sources:
                         with pc3:
                             st.markdown("<div style='height: 18px;'></div>", unsafe_allow_html=True)
                             if st.button("🚀 Publikasikan", type="primary", use_container_width=True, key=f"btn_pub_{p_item['id']}"):
-                                publish_food_to_catalog(
-                                    food_name=p_name, category=p_cat,
-                                    kcal_100=p_kcal, p_100=p_prot, f_100=p_fat, c_100=p_carb,
-                                    fib_100=float(p_item.get("fiber_g") or 0.0),
-                                    sod_100=float(p_item.get("sodium_mg") or 0.0),
-                                    barcode=p_bc,
-                                    serving_unit=p_item.get("serving_unit") or "100g",
-                                    serving_weight=float(p_item.get("default_serving_weight") or 100.0),
-                                    pending_id=p_item["id"]
-                                )
-                                _fetch_tkpi_categories_and_count.clear()
-                                _search_tkpi_catalog_cached.clear()
-                                _mark_db_mutated()
-                                st.toast(f"✅ {p_name} resmi dipublikasikan ke katalog utama!")
-                                st.rerun()
+                                try:
+                                    publish_food_to_catalog(
+                                        food_name=p_name, category=p_cat,
+                                        kcal_100=p_kcal, p_100=p_prot, f_100=p_fat, c_100=p_carb,
+                                        fib_100=float(p_item.get("fiber_g") or 0.0),
+                                        sod_100=float(p_item.get("sodium_mg") or 0.0),
+                                        barcode=p_bc,
+                                        serving_unit=p_item.get("serving_unit") or "100g",
+                                        serving_weight=float(p_item.get("default_serving_weight") or 100.0),
+                                        pending_id=p_item["id"]
+                                    )
+                                    _fetch_tkpi_categories_and_count.clear()
+                                    _search_tkpi_catalog_cached.clear()
+                                    _mark_db_mutated()
+                                    st.toast(f"✅ {p_name} resmi dipublikasikan ke katalog utama!")
+                                    st.rerun()
+                                except FoodGuardrailRejected as g_err:
+                                    _render_guardrail_rejection_card(g_err)
                             if st.button("🗑️ Tolak Draft", use_container_width=True, key=f"btn_rej_{p_item['id']}"):
                                 reject_pending_food(p_item["id"])
                                 _mark_db_mutated()
@@ -2305,16 +2415,19 @@ with tab_sources:
                 st.markdown("<div style='height: 26px;'></div>", unsafe_allow_html=True)
                 if st.button("💾 Simpan & Publikasikan ke Katalog", type="primary", use_container_width=True, key="btn_direct_pub"):
                     if new_f_name.strip():
-                        publish_food_to_catalog(
-                            food_name=new_f_name.strip(), category=new_f_cat.strip(),
-                            kcal_100=new_f_kcal, p_100=new_f_p, f_100=new_f_f, c_100=new_f_c,
-                            fib_100=new_f_fib, barcode=new_f_bc.strip()
-                        )
-                        _fetch_tkpi_categories_and_count.clear()
-                        _search_tkpi_catalog_cached.clear()
-                        _mark_db_mutated()
-                        st.success(f"✅ '{new_f_name}' berhasil disimpan dan dipublikasikan ke katalog utama!")
-                        st.rerun()
+                        try:
+                            publish_food_to_catalog(
+                                food_name=new_f_name.strip(), category=new_f_cat.strip(),
+                                kcal_100=new_f_kcal, p_100=new_f_p, f_100=new_f_f, c_100=new_f_c,
+                                fib_100=new_f_fib, barcode=new_f_bc.strip()
+                            )
+                            _fetch_tkpi_categories_and_count.clear()
+                            _search_tkpi_catalog_cached.clear()
+                            _mark_db_mutated()
+                            st.success(f"✅ '{new_f_name}' berhasil disimpan dan dipublikasikan ke katalog utama!")
+                            st.rerun()
+                        except FoodGuardrailRejected as g_err:
+                            _render_guardrail_rejection_card(g_err)
                     else:
                         st.warning("Isi nama makanan terlebih dahulu.")
 
@@ -2393,7 +2506,7 @@ with tab_sources:
                     key="db_pick_idx"
                 )
             with db_c2:
-                pick_grams = st.number_input("Berat (gram):", min_value=5.0, max_value=2000.0, value=100.0, step=10.0, key="db_pick_grams")
+                pick_grams = st.number_input("Berat (gram):", min_value=5.0, max_value=1000.0, value=100.0, step=10.0, key="db_pick_grams")
             with db_c3:
                 if st.button("➕ Preview & Catat", type="primary", use_container_width=True, key="btn_db_to_preview"):
                     chosen = results[pick_idx]

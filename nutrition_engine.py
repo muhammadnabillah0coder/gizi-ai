@@ -9,6 +9,7 @@ import os
 import re
 import difflib
 import threading
+from food_guardrails import is_excluded_from_public_catalog
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db")
 _MODULE_MTIME = round(os.path.getmtime(__file__), 6) if os.path.exists(__file__) else 0.0
@@ -143,6 +144,8 @@ def _get_cached_food_catalog():
         indexed = []
         for raw in raw_rows:
             d = dict(raw)
+            if is_excluded_from_public_catalog(d.get("food_name") or ""):
+                continue
             fname_low = (d.get("food_name") or "").lower()
             core_name = _strip_tkpi_parens(fname_low)
             core_tokens = tuple(t for t in re.split(r"[\s,]+", core_name) if t)
@@ -468,21 +471,24 @@ def auto_learn_food(food_name: str, category: str, kcal_100: float, p_100: float
             
         if not auto_publish:
             conn.close()
-            from db_history import stage_pending_food
-            stage_pending_food(
-                food_name=clean_name.title(),
-                category=category or "Pangan Olahan (Auto-Learn AI)",
-                kcal_100=kcal_100,
-                p_100=p_100,
-                f_100=f_100,
-                c_100=c_100,
-                fib_100=fib_100,
-                sod_100=sodium_100,
-                barcode=clean_bc or "",
-                serving_unit=serving_unit,
-                serving_weight=serving_weight,
-                source_origin="AI Auto-Learn"
-            )
+            try:
+                from db_history import stage_pending_food
+                stage_pending_food(
+                    food_name=clean_name.title(),
+                    category=category or "Pangan Olahan (Auto-Learn AI)",
+                    kcal_100=kcal_100,
+                    p_100=p_100,
+                    f_100=f_100,
+                    c_100=c_100,
+                    fib_100=fib_100,
+                    sod_100=sodium_100,
+                    barcode=clean_bc or "",
+                    serving_unit=serving_unit,
+                    serving_weight=serving_weight,
+                    source_origin="AI Auto-Learn"
+                )
+            except Exception:
+                return None
             return clean_name.title()
             
         # Buat kode unik otomatis jika dipublikasikan langsung

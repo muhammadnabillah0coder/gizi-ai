@@ -18,6 +18,14 @@ from collections import deque
 from decimal import Decimal
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from food_guardrails import (
+    FoodGuardrailRejected,
+    MAX_DAILY_KCAL_PER_USER,
+    MAX_DAILY_MEALS_PER_USER,
+    MAX_SINGLE_DISH_KCAL,
+    validate_display_name,
+    validate_food_candidate,
+)
 
 try:
     import pg8000.dbapi as pg_dbapi
@@ -876,6 +884,9 @@ def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str
         return False, "ID Pengguna / Email tidak valid atau kosong."
     if not pin_or_pass or len(pin_or_pass.strip()) < 4:
         return False, "PIN / Password minimal 4 karakter agar akun Anda aman."
+    ok_dname, dname_or_err = validate_display_name(display_name or "")
+    if not ok_dname:
+        return False, dname_or_err
 
     with _db_session() as (conn, cur):
         existing = cur.execute("SELECT id FROM users WHERE LOWER(user_id) = ?", (clean_id,)).fetchone()
@@ -1247,11 +1258,40 @@ def activate_pro_tier(user_id: str, days: int = 30):
 
 
 def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0, caption: str = "", meal_type: str = "Makan Siang", log_date: str = None, tz_offset: int = DEFAULT_TIMEZONE_OFFSET):
-    """Menyimpan satu catatan makan ke buku harian pengguna dengan waktu lokal Indonesia yang akurat."""
+    """Menyimpan satu catatan makan ke buku harian pengguna dengan penjagaan batas biologis harian."""
     local_now = get_local_now(tz_offset)
     target_d = log_date or local_now.strftime("%Y-%m-%d")
     custom_timestamp = f"{target_d} {local_now.strftime('%H:%M:%S')}"
+    meal_kcal = _safe_float((totals or {}).get("energy_kcal"), 0.0)
+    if meal_kcal < 0 or meal_kcal > (MAX_SINGLE_DISH_KCAL * 1.5):
+        raise FoodGuardrailRejected(
+            "implausible_portion",
+            f"Kalori satu catatan ({meal_kcal:,.1f} kkal) melebihi batas wajar per sajian.",
+        )
+
     with _db_session() as (conn, cur):
+        day_row = cur.execute(
+            """
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(energy_kcal), 0.0) AS tot_k
+            FROM meal_logs
+            WHERE user_id = ? AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) = ?
+            """,
+            (user_id, target_d),
+        ).fetchone()
+        if day_row:
+            cur_cnt = int(day_row[0] or 0)
+            cur_kcal = float(day_row[1] or 0.0)
+            if cur_cnt >= MAX_DAILY_MEALS_PER_USER:
+                raise FoodGuardrailRejected(
+                    "daily_cap_exceeded",
+                    f"Batas maksimal {MAX_DAILY_MEALS_PER_USER} catatan makan per hari tercapai untuk menjaga konsistensi diary.",
+                )
+            if (cur_kcal + meal_kcal) > MAX_DAILY_KCAL_PER_USER:
+                raise FoodGuardrailRejected(
+                    "daily_cap_exceeded",
+                    f"Akumulasi kalori harian akan melebihi batas biologis {MAX_DAILY_KCAL_PER_USER:,.0f} kkal/hari.",
+                )
+
         cur.execute(
             """
             INSERT INTO meal_logs
@@ -1808,8 +1848,21 @@ def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
 
 
 def stage_pending_food(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float = 0.0, sod_100: float = 0.0, barcode: str = "", serving_unit: str = "1 porsi (100g)", serving_weight: float = 100.0, source_origin: str = "Open Food Facts", submitted_by: str = "system"):
-    """Menyimpan data pangan baru ke tabel antrean (pending_foods) agar dapat ditinjau sebelum publikasi."""
-    clean_name = food_name.strip()
+    """Menyimpan data pangan baru yang lolos guardrail ke tabel antrean (pending_foods) agar dapat ditinjau sebelum publikasi."""
+    if not submitted_by or str(submitted_by).strip().lower() == "tamu (demo)":
+        return None
+    try:
+        clean_name = validate_food_candidate(
+            food_name=food_name,
+            energy_kcal=kcal_100,
+            protein_g=p_100,
+            fat_g=f_100,
+            carb_g=c_100,
+            fiber_g=fib_100,
+            is_catalog_entry=True,
+        )
+    except FoodGuardrailRejected:
+        return None
     if not clean_name or kcal_100 < 0:
         return None
 
@@ -1861,7 +1914,15 @@ def publish_food_to_catalog(food_name: str, category: str, kcal_100: float, p_10
     Mempublikasikan data pangan yang sudah diverifikasi ke katalog lokal (food_composition)
     sekaligus menyimpannya permanen ke cloud (food_catalog_additions) bila Supabase aktif.
     """
-    clean_name = food_name.strip()
+    clean_name = validate_food_candidate(
+        food_name=food_name,
+        energy_kcal=kcal_100,
+        protein_g=p_100,
+        fat_g=f_100,
+        carb_g=c_100,
+        fiber_g=fib_100,
+        is_catalog_entry=True,
+    )
     clean_barcode = barcode.strip() if barcode else None
     code_hash = hashlib.md5(clean_name.lower().encode("utf-8")).hexdigest()[:8].upper()
     food_code = f"MN_{code_hash}"

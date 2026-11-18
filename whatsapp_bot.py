@@ -21,6 +21,7 @@ from datetime import datetime
 
 from gemini_extractor import analyze_food_text, analyze_food_image
 from nutrition_engine import calculate_dish_nutrition
+from food_guardrails import FoodGuardrailRejected, validate_extracted_dish_totals
 from db_history import (
     get_or_create_user, log_meal, get_user_history_stats,
     get_user_scan_status, record_scan_usage, get_local_now,
@@ -194,8 +195,9 @@ async def whatsapp_webhook(request: Request):
             
             dish_name = ai_data.get("dish_name", "Menu Pilihan")
             components = ai_data.get("components", [])
-            nutrition_calc = calculate_dish_nutrition(components)
+            nutrition_calc = calculate_dish_nutrition(components, auto_learn=False)
             totals = nutrition_calc["totals"]
+            validate_extracted_dish_totals(dish_name, totals)
             
             # Tentukan meal_type otomatis berdasarkan jam lokal WITA
             hour = get_local_now().hour
@@ -211,6 +213,10 @@ async def whatsapp_webhook(request: Request):
             log_meal(sender_clean, dish_name, totals, multiplier=1.0, caption="Catatan via WhatsApp", meal_type=meal_type)
             reply_msg = format_wa_reply(sender_clean, dish_name, totals, advice=ai_data.get("health_tip", ""))
             return {"reply": reply_msg}
+        except FoodGuardrailRejected as g_err:
+            if g_err.consumes_scan_quota:
+                record_scan_usage(sender_clean)
+            return {"reply": f"🛡️ *Tidak Dapat Diproses*\n\n{g_err.message}"}
         except Exception as e:
             return {"reply": f"Maaf, gagal memproses foto: {str(e)}. Coba kirim ulang dengan foto lebih jelas ya!"}
 
@@ -230,8 +236,9 @@ async def whatsapp_webhook(request: Request):
             ai_data = analyze_food_text(message_text, api_key=api_key)
             dish_name = ai_data.get("dish_name", message_text.capitalize())
             components = ai_data.get("components", [])
-            nutrition_calc = calculate_dish_nutrition(components)
+            nutrition_calc = calculate_dish_nutrition(components, auto_learn=False)
             totals = nutrition_calc["totals"]
+            validate_extracted_dish_totals(dish_name, totals)
             
             hour = get_local_now().hour
             meal_type = "Sarapan" if hour < 11 else ("Makan Siang" if hour < 16 else ("Makan Malam" if hour < 20 else "Camilan"))
@@ -239,6 +246,8 @@ async def whatsapp_webhook(request: Request):
             
             reply_msg = format_wa_reply(sender_clean, dish_name, totals, advice=ai_data.get("health_tip", ""))
             return {"reply": reply_msg}
+        except FoodGuardrailRejected as g_err:
+            return {"reply": f"🛡️ *Tidak Dapat Diproses*\n\n{g_err.message}"}
         except Exception as e:
             return {"reply": f"Maaf, tidak dapat menganalisis teks tersebut: {str(e)}"}
             
