@@ -75,11 +75,18 @@ def exchange_code_for_user(code: str, redirect_uri: str):
         user_res = requests.get(userinfo_url, headers=headers, timeout=10)
         user_info = user_res.json()
         
+        email = (user_info.get("email") or "").strip().lower()
+        verified = bool(user_info.get("verified_email", False))
+        if not email:
+            return None, "Google tidak mengembalikan alamat email akun."
+        if not verified:
+            return None, "Email Google Anda belum terverifikasi."
+
         return {
-            "email": user_info.get("email"),
+            "email": email,
             "name": user_info.get("name"),
             "picture": user_info.get("picture"),
-            "verified_email": user_info.get("verified_email", False)
+            "verified_email": True
         }, None
     except Exception as e:
         return None, f"Exception: {str(e)}"

@@ -104,7 +104,27 @@ class TestAppUISmoke(unittest.TestCase):
         kb_in.input("Ayam").run()
         self.assertEqual(len(at.exception), 0, f"DB search exception: {at.exception}")
 
+        # 7. Logout via Sidebar harus membersihkan last_saved_item & nutrition_data (BUG-08)
+        at.session_state["last_saved_item"] = {"id": 999, "dish_name": "Bocoran"}
+        btn_logout = next(b for b in at.button if b.key == "sb_btn_logout")
+        btn_logout.click().run()
+        self.assertEqual(len(at.exception), 0, f"Logout exception: {at.exception}")
+        self.assertIsNone(at.session_state["last_saved_item"])
+        self.assertIsNone(at.session_state["nutrition_data"])
+
         print(f"[AppTest Latency] boot={boot_ms:.1f}ms preview={prev_ms:.1f}ms slider={slider_ms:.1f}ms")
+
+    def test_admin_session_pending_foods_and_panel_no_typeerror(self):
+        from unittest.mock import patch
+        from streamlit.testing.v1 import AppTest
+
+        app_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app.py"))
+        with patch.object(db_history, "ADMIN_IDENTIFIERS", db_history.ADMIN_IDENTIFIERS | {self.test_uid}):
+            at = AppTest.from_file(app_path, default_timeout=30)
+            at.query_params["u"] = self.test_uid
+            at.query_params["s"] = self.session_tok
+            at.run()
+            self.assertEqual(len(at.exception), 0, f"Admin UI crash: {at.exception}")
 
 
 if __name__ == "__main__":

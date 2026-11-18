@@ -90,6 +90,21 @@ def _friendly_ai_error(exc: Exception) -> GeminiExtractionError:
         )
     return GeminiExtractionError(f"AI belum dapat mengenali menu saat ini ({msg[:120]}). Coba foto lebih terang atau ketik nama menunya.")
 
+def _get_gemini_model_name() -> str:
+    env_model = (os.environ.get("GEMINI_MODEL") or "").strip()
+    if env_model:
+        return env_model
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and "GEMINI_MODEL" in st.secrets:
+            sec_model = str(st.secrets["GEMINI_MODEL"]).strip()
+            if sec_model:
+                return sec_model
+    except Exception:
+        pass
+    return DEFAULT_GEMINI_MODEL
+
+
 def _parse_json_payload(raw_text: str) -> dict:
     clean = (raw_text or "").strip()
     if clean.startswith("```"):
@@ -97,10 +112,14 @@ def _parse_json_payload(raw_text: str) -> dict:
         if clean.startswith("json"):
             clean = clean[4:].strip()
     parsed = json.loads(clean)
-    if isinstance(parsed, dict):
-        parsed.setdefault("is_shared_platter", False)
-        parsed.setdefault("serving_reference", "")
+    if isinstance(parsed, list):
+        parsed = next((item for item in parsed if isinstance(item, dict)), {})
+    if not isinstance(parsed, dict):
+        raise ValueError("Respons AI tidak berbentuk objek JSON yang valid.")
+    parsed.setdefault("is_shared_platter", False)
+    parsed.setdefault("serving_reference", "")
     return parsed
+
 
 def get_gemini_client(api_key: str = None):
     key = api_key or os.environ.get("GEMINI_API_KEY")
@@ -110,7 +129,7 @@ def get_gemini_client(api_key: str = None):
         return ("new", google_genai_sdk.Client(api_key=key))
     if genai_legacy is not None:
         genai_legacy.configure(api_key=key)
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        model_name = _get_gemini_model_name()
         return ("legacy", genai_legacy.GenerativeModel(
             model_name=model_name,
             system_instruction=SYSTEM_INSTRUCTION,
@@ -153,7 +172,7 @@ def analyze_food_image(image_input, caption: str = "", api_key: str = None):
     try:
         if sdk_kind == "new":
             resp = client_obj.models.generate_content(
-                model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+                model=_get_gemini_model_name(),
                 contents=[prompt, img],
                 config=google_genai_types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
@@ -186,7 +205,7 @@ def analyze_food_text(text_input: str, api_key: str = None, use_cache: bool = Tr
     try:
         if sdk_kind == "new":
             resp = client_obj.models.generate_content(
-                model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+                model=_get_gemini_model_name(),
                 contents=prompt,
                 config=google_genai_types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,

@@ -79,6 +79,16 @@ COOKING_MODIFIERS = {
 }
 
 
+def _safe_float(val, default: float = 0.0) -> float:
+    """Konversi angka aman terhadap None atau string kosong agar kalkulasi tidak crash."""
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def _strip_tkpi_parens(name: str) -> str:
     return re.sub(r"\s*\([^)]*\)", "", name or "").strip()
 
@@ -207,15 +217,15 @@ def find_best_match(query_name: str):
             "sodium_mg": 3.0
         }
 
-    # 1.5. Cek pencarian via Barcode jika input berupa angka (8-14 digit)
-    clean_digits = "".join(filter(str.isdigit, query_name))
-    if len(clean_digits) >= 8:
+    # 1.5. Cek pencarian via Barcode hanya jika input murni kode numerik produk (8-18 digit)
+    barcode_candidate = (query_name or "").strip().replace("-", "").replace(" ", "")
+    if barcode_candidate.isdigit() and 8 <= len(barcode_candidate) <= 18:
         for entry in catalog:
             row = entry["row"]
-            if row.get("barcode") and clean_digits in str(row["barcode"]):
+            if row.get("barcode") and barcode_candidate in str(row["barcode"]):
                 return dict(row)
         # Jika belum ada di database lokal, coba tarik real-time dari Open Food Facts API
-        off_product = fetch_open_food_facts(clean_digits)
+        off_product = fetch_open_food_facts(barcode_candidate)
         if off_product:
             return off_product
 
@@ -524,19 +534,20 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
     
     for comp in ai_components:
         raw_name = comp.get("name", "")
-        weight = float(comp.get("weight_g", 0)) * portion_multiplier
+        weight = _safe_float(comp.get("weight_g"), 0.0) * _safe_float(portion_multiplier, 1.0)
         
         is_override = bool(comp.get("custom_override"))
         match = None if is_override else find_best_match(raw_name)
         if match:
-            factor = (weight * (match["bdd_rate"] / 100.0)) / 100.0
+            bdd_rate = _safe_float(match.get("bdd_rate"), 100.0)
+            factor = (weight * (bdd_rate / 100.0)) / 100.0
             
-            kcal = round(match["energy_kcal"] * factor, 1)
-            protein = round(match["protein_g"] * factor, 1)
-            fat = round(match["fat_g"] * factor, 1)
-            carb = round(match["carb_g"] * factor, 1)
-            fiber = round(match["fiber_g"] * factor, 1)
-            sodium = round(match["sodium_mg"] * factor, 1)
+            kcal = round(_safe_float(match.get("energy_kcal"), 0.0) * factor, 1)
+            protein = round(_safe_float(match.get("protein_g"), 0.0) * factor, 1)
+            fat = round(_safe_float(match.get("fat_g"), 0.0) * factor, 1)
+            carb = round(_safe_float(match.get("carb_g"), 0.0) * factor, 1)
+            fiber = round(_safe_float(match.get("fiber_g"), 0.0) * factor, 1)
+            sodium = round(_safe_float(match.get("sodium_mg"), 0.0) * factor, 1)
             
             item_res = {
                 "input_name": raw_name,
@@ -552,12 +563,12 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
             }
         else:
             # Gunakan data nutrisi per 100g yang diekstrak langsung oleh AI atau koreksi manual user
-            kcal_100 = float(comp.get("energy_kcal_per_100g", 0.0))
-            p_100 = float(comp.get("protein_g_per_100g", 0.0))
-            f_100 = float(comp.get("fat_g_per_100g", 0.0))
-            c_100 = float(comp.get("carb_g_per_100g", 0.0))
-            fib_100 = float(comp.get("fiber_g_per_100g", 0.0))
-            sod_100 = float(comp.get("sodium_mg_per_100g", 0.0))
+            kcal_100 = _safe_float(comp.get("energy_kcal_per_100g"), 0.0)
+            p_100 = _safe_float(comp.get("protein_g_per_100g"), 0.0)
+            f_100 = _safe_float(comp.get("fat_g_per_100g"), 0.0)
+            c_100 = _safe_float(comp.get("carb_g_per_100g"), 0.0)
+            fib_100 = _safe_float(comp.get("fiber_g_per_100g"), 0.0)
+            sod_100 = _safe_float(comp.get("sodium_mg_per_100g"), 0.0)
             
             # Auto-Learning: Simpan otomatis ke antrean staging jika hasil dari ekstraksi AI
             if kcal_100 > 0 and not is_override and auto_learn:

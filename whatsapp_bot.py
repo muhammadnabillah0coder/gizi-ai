@@ -9,9 +9,13 @@ Mendukung:
 
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
+import hmac
+import ipaddress
 import requests
 import os
 import io
+import socket
+import urllib.parse
 from PIL import Image
 from datetime import datetime
 
@@ -19,16 +23,93 @@ from gemini_extractor import analyze_food_text, analyze_food_image
 from nutrition_engine import calculate_dish_nutrition
 from db_history import (
     get_or_create_user, log_meal, get_user_history_stats,
-    get_user_scan_status, record_scan_usage, get_local_now, create_session_token
+    get_user_scan_status, record_scan_usage, get_local_now,
+    create_session_token, is_admin_user
 )
 
 app = FastAPI(title="Nutrisi Cerdas WhatsApp Bot API")
 
 DASHBOARD_BASE_URL = "https://nutrisi-cerdas.streamlit.app"
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
 
 def _dashboard_url(user_id: str) -> str:
-    token = create_session_token(user_id)
-    return f"{DASHBOARD_BASE_URL}/?u={user_id}&s={token}" if token else DASHBOARD_BASE_URL
+    clean_uid = (user_id or "").strip().lower()
+    if not clean_uid or is_admin_user(clean_uid):
+        return DASHBOARD_BASE_URL
+    token = create_session_token(clean_uid)
+    if not token:
+        return DASHBOARD_BASE_URL
+    return f"{DASHBOARD_BASE_URL}/?u={urllib.parse.quote(clean_uid)}&s={token}"
+
+
+def _verify_webhook_secret(request: Request, data: dict) -> tuple[bool, int, str]:
+    expected = (os.environ.get("WHATSAPP_WEBHOOK_SECRET") or "").strip()
+    if not expected:
+        return False, 503, "WHATSAPP_WEBHOOK_SECRET belum dikonfigurasi di server."
+
+    auth_hdr = (request.headers.get("authorization") or "").strip()
+    bearer_tok = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
+    supplied = (
+        request.headers.get("x-webhook-secret")
+        or bearer_tok
+        or str(data.get("secret") or "")
+    ).strip()
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        return False, 401, "Unauthorized webhook request."
+    return True, 200, ""
+
+
+def _is_safe_public_https_url(raw_url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse((raw_url or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return False
+    host = parsed.hostname.strip().lower()
+    if host in {"localhost", "ip6-localhost"} or host.endswith(".local"):
+        return False
+    try:
+        port = parsed.port or 443
+        addr_infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    if not addr_infos:
+        return False
+    for info in addr_infos:
+        ip_str = info[4][0].split("%")[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+        ):
+            return False
+    return True
+
+
+def _download_image_bytes(image_url: str) -> bytes:
+    if not _is_safe_public_https_url(image_url):
+        raise ValueError("URL gambar harus berupa HTTPS publik yang valid.")
+    with requests.get(image_url, timeout=15, allow_redirects=False, stream=True) as resp:
+        resp.raise_for_status()
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > _MAX_IMAGE_BYTES:
+                raise ValueError("Ukuran gambar melebihi batas maksimum 10 MB.")
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 def format_wa_reply(sender_phone: str, dish_name: str, totals: dict, advice: str = "") -> str:
     """Format balasan WhatsApp yang rapi, ramah, dan memotivasi."""
@@ -70,6 +151,10 @@ async def whatsapp_webhook(request: Request):
     except:
         form = await request.form()
         data = dict(form)
+
+    ok_sec, sec_code, sec_err = _verify_webhook_secret(request, data)
+    if not ok_sec:
+        return JSONResponse({"status": "error", "reason": sec_err}, status_code=sec_code)
         
     sender = data.get("sender") or data.get("from") or data.get("phone", "")
     message_text = data.get("message") or data.get("text", "")
@@ -100,9 +185,9 @@ async def whatsapp_webhook(request: Request):
             }
             
         try:
-            # Download gambar dari link WhatsApp gateway
-            img_res = requests.get(image_url, timeout=15)
-            pil_img = Image.open(io.BytesIO(img_res.content))
+            # Download gambar dari link WhatsApp gateway dengan validasi SSRF & batas ukuran
+            img_bytes = _download_image_bytes(image_url)
+            pil_img = Image.open(io.BytesIO(img_bytes))
             
             ai_data = analyze_food_image(pil_img, caption=message_text, api_key=api_key)
             record_scan_usage(sender_clean)

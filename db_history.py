@@ -844,8 +844,10 @@ def _verify_password(input_password: str, saved_hash: str) -> tuple[bool, bool]:
     Mengembalikan (is_valid, needs_upgrade).
     """
     if not saved_hash:
-        return True, False
+        return False, False
     clean_pw = (input_password or "").strip()
+    if not clean_pw:
+        return False, False
     if saved_hash.startswith("pbkdf2$"):
         parts = saved_hash.split("$")
         if len(parts) != 3:
@@ -931,53 +933,66 @@ def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str
 def authenticate_user(user_id: str, pin_or_pass: str):
     """Memverifikasi login pengguna dengan ID dan PIN/Password (otomatis upgrade hash lama ke PBKDF2)."""
     clean_id = (user_id or "").strip().lower()
-    if not clean_id:
+    if not clean_id or clean_id == "tamu (demo)":
         return False, "Ketikkan ID Pengguna / Email Anda."
+    if not (pin_or_pass or "").strip():
+        return False, "PIN / Password wajib diisi."
 
     with _db_session() as (conn, cur):
-        user = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ?", (clean_id,)).fetchone()
+        user = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (clean_id,)).fetchone()
         if not user:
             return False, "Akun tidak ditemukan. Silakan klik 'Daftar Akun Baru'."
 
         u_dict = dict(user)
         saved_hash = u_dict.get("password_hash")
-        if saved_hash:
-            valid, needs_upgrade = _verify_password(pin_or_pass, saved_hash)
-            if not valid:
-                return False, "PIN / Password salah! Silakan periksa kembali."
-            if needs_upgrade:
-                new_hash = hash_password(pin_or_pass)
-                cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, u_dict["id"]))
-                conn.commit()
-                u_dict["password_hash"] = new_hash
+        if not saved_hash:
+            return False, "Akun ini terhubung lewat Google/WhatsApp dan belum memakai PIN lokal. Gunakan Masuk Google atau daftar akun ber-PIN."
+
+        valid, needs_upgrade = _verify_password(pin_or_pass, saved_hash)
+        if not valid:
+            return False, "PIN / Password salah! Silakan periksa kembali."
+        if needs_upgrade:
+            new_hash = hash_password(pin_or_pass)
+            cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, u_dict["id"]))
+            conn.commit()
+            u_dict["password_hash"] = new_hash
 
         return True, u_dict
 
 
+def _normalize_user_id(user_id: str) -> str:
+    raw = (user_id or "").strip()
+    if not raw or raw.lower() == "tamu (demo)":
+        return "Tamu (Demo)"
+    return raw.lower()
+
+
 def get_or_create_user(user_id: str, display_name: str = "", auth_provider: str = "local"):
-    """Mengambil data user atau membuat profil baru jika belum ada."""
+    """Mengambil data user atau membuat profil baru secara case-insensitive agar akun tidak terduplikasi."""
+    norm_id = _normalize_user_id(user_id)
+    is_guest = (norm_id == "Tamu (Demo)")
     with _db_session() as (conn, cur):
-        is_admin = is_admin_user(user_id)
-        initial_tier = "pro" if is_admin else ("beta" if (OPEN_BETA_MODE and user_id != "Tamu (Demo)") else "free")
+        is_admin = is_admin_user(norm_id)
+        initial_tier = "pro" if is_admin else ("beta" if (OPEN_BETA_MODE and not is_guest) else "free")
         initial_expiry = "2099-12-31 23:59:59" if is_admin else None
         now_str = get_local_now(DEFAULT_TIMEZONE_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
 
-        row = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (norm_id.lower(),)).fetchone()
         if not row:
-            name = display_name or user_id.split("@")[0].capitalize()
+            name = display_name or (norm_id if is_guest else norm_id.split("@")[0].capitalize())
             cur.execute(
                 """
                 INSERT INTO users (user_id, display_name, auth_provider, daily_calorie_target, subscription_tier, pro_until, timezone_offset, focus_goal, created_at)
                 VALUES (?, ?, ?, 2000.0, ?, ?, ?, 'Diet Sehat', ?)
                 """,
-                (user_id, name, auth_provider, initial_tier, initial_expiry, DEFAULT_TIMEZONE_OFFSET, now_str),
+                (norm_id, name, auth_provider, initial_tier, initial_expiry, DEFAULT_TIMEZONE_OFFSET, now_str),
             )
             conn.commit()
-            row = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (norm_id.lower(),)).fetchone()
         elif is_admin and row["subscription_tier"] != "pro":
-            cur.execute("UPDATE users SET subscription_tier = 'pro', pro_until = '2099-12-31 23:59:59' WHERE user_id = ?", (user_id,))
+            cur.execute("UPDATE users SET subscription_tier = 'pro', pro_until = '2099-12-31 23:59:59' WHERE LOWER(user_id) = ?", (norm_id.lower(),))
             conn.commit()
-            row = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (norm_id.lower(),)).fetchone()
 
         return dict(row)
 
@@ -1673,24 +1688,49 @@ def export_user_data_json(user_id: str) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
+def _safe_float(val, default: float = 0.0) -> float:
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
-    """Memulihkan kembali riwayat catatan makan & berat badan pengguna dari file JSON cadangan."""
+    """Memulihkan kembali riwayat catatan makan, berat badan, & makanan kustom dari file JSON cadangan."""
     import json
     try:
-        data = json.loads(json_str)
-        meal_logs = data.get("meal_logs", [])
-        weight_logs = data.get("weight_logs", [])
-        if not meal_logs and not weight_logs:
-            return False, "File cadangan tidak memuat catatan makanan atau berat badan."
+        clean_raw = (json_str or "").lstrip("\ufeff").strip()
+        data = json.loads(clean_raw)
+        if not isinstance(data, dict):
+            return False, "Format file cadangan harus berupa objek JSON yang valid."
 
+        meal_logs = data.get("meal_logs") or []
+        weight_logs = data.get("weight_logs") or []
+        custom_foods = data.get("custom_foods") or []
+        if not meal_logs and not weight_logs and not custom_foods:
+            return False, "File cadangan tidak memuat catatan makanan, berat badan, atau makanan kustom."
+
+        norm_uid = _normalize_user_id(user_id)
+        now_fallback = get_local_now().strftime("%Y-%m-%d %H:%M:%S")
         with _db_session() as (conn, cur):
             imported_count = 0
             for m in meal_logs:
+                if not isinstance(m, dict):
+                    continue
+                dish = str(m.get("dish_name") or "").strip()
+                if not dish:
+                    continue
+                logged_val = str(m.get("logged_at") or "").strip() or now_fallback
                 existing = cur.execute(
                     "SELECT id FROM meal_logs WHERE user_id = ? AND dish_name = ? AND logged_at = ?",
-                    (user_id, m["dish_name"], m.get("logged_at", "")),
+                    (norm_uid, dish, logged_val),
                 ).fetchone()
                 if not existing:
+                    port_mult = _safe_float(m.get("portion_multiplier"), 1.0)
+                    if port_mult <= 0:
+                        port_mult = 1.0
                     cur.execute(
                         """
                         INSERT INTO meal_logs
@@ -1698,35 +1738,71 @@ def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            user_id,
-                            m["dish_name"],
-                            float(m.get("energy_kcal", 0.0)),
-                            float(m.get("protein_g", 0.0)),
-                            float(m.get("fat_g", 0.0)),
-                            float(m.get("carb_g", 0.0)),
-                            float(m.get("fiber_g", 0.0)),
-                            float(m.get("sodium_mg", 0.0)),
-                            float(m.get("portion_multiplier", 1.0)),
-                            m.get("photo_caption", ""),
-                            m.get("meal_type", "Makan Siang"),
-                            m.get("logged_at", get_local_now().strftime("%Y-%m-%d %H:%M:%S")),
+                            norm_uid,
+                            dish,
+                            _safe_float(m.get("energy_kcal"), 0.0),
+                            _safe_float(m.get("protein_g"), 0.0),
+                            _safe_float(m.get("fat_g"), 0.0),
+                            _safe_float(m.get("carb_g"), 0.0),
+                            _safe_float(m.get("fiber_g"), 0.0),
+                            _safe_float(m.get("sodium_mg"), 0.0),
+                            port_mult,
+                            str(m.get("photo_caption") or ""),
+                            str(m.get("meal_type") or "Makan Siang"),
+                            logged_val,
                         ),
                     )
                     imported_count += 1
 
+            weight_count = 0
             for w in weight_logs:
-                if w.get("recorded_date") and w.get("weight_kg"):
+                if not isinstance(w, dict):
+                    continue
+                rec_date = str(w.get("recorded_date") or "").strip()
+                w_kg = _safe_float(w.get("weight_kg"), 0.0)
+                if rec_date and w_kg > 0:
                     cur.execute(
                         """
                         INSERT INTO weight_logs (user_id, weight_kg, recorded_date, note)
                         VALUES (?, ?, ?, ?)
                         ON CONFLICT(user_id, recorded_date) DO NOTHING
                         """,
-                        (user_id, float(w["weight_kg"]), w["recorded_date"], w.get("note", "")),
+                        (norm_uid, w_kg, rec_date, str(w.get("note") or "")),
                     )
+                    weight_count += 1
+
+            custom_count = 0
+            for cf in custom_foods:
+                if not isinstance(cf, dict):
+                    continue
+                fname = str(cf.get("food_name") or "").strip()
+                if not fname:
+                    continue
+                ex_cf = cur.execute(
+                    "SELECT id FROM custom_foods WHERE user_id = ? AND LOWER(food_name) = LOWER(?) LIMIT 1",
+                    (norm_uid, fname),
+                ).fetchone()
+                if not ex_cf:
+                    cur.execute(
+                        """
+                        INSERT INTO custom_foods (user_id, food_name, serving_size, energy_kcal, protein_g, fat_g, carb_g, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            norm_uid,
+                            fname,
+                            str(cf.get("serving_size") or "1 porsi"),
+                            _safe_float(cf.get("energy_kcal"), 0.0),
+                            _safe_float(cf.get("protein_g"), 0.0),
+                            _safe_float(cf.get("fat_g"), 0.0),
+                            _safe_float(cf.get("carb_g"), 0.0),
+                            now_fallback,
+                        ),
+                    )
+                    custom_count += 1
 
             conn.commit()
-        return True, f"Berhasil memulihkan {imported_count} catatan makanan!"
+        return True, f"Berhasil memulihkan {imported_count} catatan makan, {weight_count} berat badan, & {custom_count} menu kustom!"
     except Exception as e:
         return False, f"Format file cadangan tidak valid: {str(e)}"
 
@@ -1787,7 +1863,7 @@ def publish_food_to_catalog(food_name: str, category: str, kcal_100: float, p_10
     """
     clean_name = food_name.strip()
     clean_barcode = barcode.strip() if barcode else None
-    code_hash = hashlib.md5(clean_name.encode("utf-8")).hexdigest()[:6].upper()
+    code_hash = hashlib.md5(clean_name.lower().encode("utf-8")).hexdigest()[:8].upper()
     food_code = f"MN_{code_hash}"
     now_str = get_local_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1842,31 +1918,53 @@ def publish_food_to_catalog(food_name: str, category: str, kcal_100: float, p_10
     # 2. Perbarui status draft & simpan ke katalog cloud permanen
     with _db_session() as (conn, cur):
         if conn.backend == "postgres":
-            cur.execute(
-                """
-                INSERT INTO food_catalog_additions
-                (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode, updated_at)
-                VALUES (?, ?, ?, ?, ?, 100.0, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (food_name) DO UPDATE SET
-                    category = excluded.category,
-                    serving_unit = excluded.serving_unit,
-                    default_serving_weight = excluded.default_serving_weight,
-                    energy_kcal = excluded.energy_kcal,
-                    protein_g = excluded.protein_g,
-                    fat_g = excluded.fat_g,
-                    carb_g = excluded.carb_g,
-                    fiber_g = excluded.fiber_g,
-                    sodium_mg = excluded.sodium_mg,
-                    barcode = COALESCE(excluded.barcode, food_catalog_additions.barcode),
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    food_code, clean_name, category, serving_unit, float(serving_weight),
-                    round(float(kcal_100), 1), round(float(p_100), 1), round(float(f_100), 1),
-                    round(float(c_100), 1), round(float(fib_100), 1), round(float(sod_100), 1),
-                    clean_barcode, now_str,
-                ),
-            )
+            existing_cloud = cur.execute(
+                "SELECT id, food_code FROM food_catalog_additions WHERE LOWER(food_name) = LOWER(?) LIMIT 1",
+                (clean_name,),
+            ).fetchone()
+            if existing_cloud:
+                cur.execute(
+                    """
+                    UPDATE food_catalog_additions
+                    SET food_name = ?, category = ?, serving_unit = ?, default_serving_weight = ?,
+                        energy_kcal = ?, protein_g = ?, fat_g = ?, carb_g = ?, fiber_g = ?, sodium_mg = ?,
+                        barcode = COALESCE(?, barcode), updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        clean_name, category, serving_unit, float(serving_weight),
+                        round(float(kcal_100), 1), round(float(p_100), 1), round(float(f_100), 1),
+                        round(float(c_100), 1), round(float(fib_100), 1), round(float(sod_100), 1),
+                        clean_barcode, now_str, existing_cloud["id"],
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO food_catalog_additions
+                    (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 100.0, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (food_code) DO UPDATE SET
+                        food_name = excluded.food_name,
+                        category = excluded.category,
+                        serving_unit = excluded.serving_unit,
+                        default_serving_weight = excluded.default_serving_weight,
+                        energy_kcal = excluded.energy_kcal,
+                        protein_g = excluded.protein_g,
+                        fat_g = excluded.fat_g,
+                        carb_g = excluded.carb_g,
+                        fiber_g = excluded.fiber_g,
+                        sodium_mg = excluded.sodium_mg,
+                        barcode = COALESCE(excluded.barcode, food_catalog_additions.barcode),
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        food_code, clean_name, category, serving_unit, float(serving_weight),
+                        round(float(kcal_100), 1), round(float(p_100), 1), round(float(f_100), 1),
+                        round(float(c_100), 1), round(float(fib_100), 1), round(float(sod_100), 1),
+                        clean_barcode, now_str,
+                    ),
+                )
         if pending_id is not None:
             cur.execute("UPDATE pending_foods SET status = 'published' WHERE id = ?", (pending_id,))
         conn.commit()

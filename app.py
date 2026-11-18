@@ -131,8 +131,8 @@ def _fetch_dashboard_bundle_cached(uid: str, target_date_str: str, tz_offset: in
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _fetch_pending_foods_cached(mut_ver: int):
-    return get_pending_foods(status="pending")
+def _fetch_pending_foods_cached(status_filter: str, mut_ver: int):
+    return get_pending_foods(status=status_filter)
 
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -173,6 +173,14 @@ def _mark_db_mutated():
     st.session_state["db_mutation_ver"] = st.session_state.get("db_mutation_ver", 0) + 1
 
 
+def _reset_ephemeral_user_state():
+    """Membersihkan state sementara milik akun sebelumnya saat logout atau berganti akun."""
+    st.session_state["nutrition_data"] = None
+    st.session_state["last_saved_item"] = None
+    st.session_state.pop("prepared_backup_json", None)
+    st.session_state.pop("selected_diary_date", None)
+
+
 _ensure_schema_ready(getattr(db_history, "_MODULE_MTIME", 0.0))
 
 # Tangani Redirect Google OAuth Callback (?code=...)
@@ -185,12 +193,12 @@ if auth_code:
         if not user_info:
             user_info, err_details = exchange_code_for_user(auth_code, "http://localhost:8501")
         
-    if user_info and user_info.get("email"):
-        email = user_info["email"]
+    if user_info and user_info.get("email") and user_info.get("verified_email"):
+        email = user_info["email"].strip().lower()
         name = user_info.get("name") or email.split("@")[0]
         u = get_or_create_user(email, display_name=name, auth_provider="google")
         st.session_state["user"] = u
-        st.session_state["nutrition_data"] = None
+        _reset_ephemeral_user_state()
         _mark_db_mutated()
         st.query_params.clear()
         st.query_params["u"] = u["user_id"]
@@ -208,8 +216,9 @@ saved_sig_param = st.query_params.get("s", "")
 saved_auth_param = st.query_params.get("auth", "local")
 
 if "user" not in st.session_state:
+    safe_auth_param = saved_auth_param if saved_auth_param in {"local", "google"} else "local"
     if saved_user_param and verify_session_token(saved_user_param, saved_sig_param):
-        st.session_state["user"] = get_or_create_user(saved_user_param.strip(), auth_provider=saved_auth_param)
+        st.session_state["user"] = get_or_create_user(saved_user_param.strip().lower(), auth_provider=safe_auth_param)
     else:
         if saved_user_param and saved_user_param.strip().lower() != "tamu (demo)":
             st.session_state["auth_url_warning"] = saved_user_param.strip()
@@ -955,7 +964,7 @@ with st.sidebar:
         """, unsafe_allow_html=True)
         if st.button("🚪 Keluar Akun (Logout)", use_container_width=True, key="sb_btn_logout"):
             st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
-            st.session_state["nutrition_data"] = None
+            _reset_ephemeral_user_state()
             st.query_params.clear()
             _mark_db_mutated()
             st.toast("Anda telah berhasil keluar dari akun.")
@@ -1065,7 +1074,7 @@ with st.sidebar:
                 )
             up_bk = st.file_uploader("Pulihkan dari file .json:", type=["json"], key="sb_up_restore_json")
             if up_bk and st.button("♻️ Pulihkan Sekarang", use_container_width=True, key="sb_btn_do_restore"):
-                ok_imp, msg_imp = import_user_data_json(current_user["user_id"], up_bk.getvalue().decode("utf-8"))
+                ok_imp, msg_imp = import_user_data_json(current_user["user_id"], up_bk.getvalue().decode("utf-8-sig", errors="replace"))
                 if ok_imp:
                     _mark_db_mutated()
                     st.success(msg_imp)
@@ -1165,7 +1174,7 @@ with col_head2:
                     st.markdown("---")
                     if st.button("🚪 Keluar dari Akun (Logout)", type="primary", use_container_width=True, key="btn_logout_top"):
                         st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
-                        st.session_state["nutrition_data"] = None
+                        _reset_ephemeral_user_state()
                         st.query_params.clear()
                         _mark_db_mutated()
                         st.toast("Anda telah berhasil keluar dari akun.")
@@ -1184,7 +1193,7 @@ with col_head2:
                         success, res = authenticate_user(in_uid, in_pin)
                         if success:
                             st.session_state["user"] = res
-                            st.session_state["nutrition_data"] = None
+                            _reset_ephemeral_user_state()
                             st.query_params["u"] = res["user_id"]
                             st.query_params["s"] = create_session_token(res["user_id"])
                             st.query_params["auth"] = "local"
@@ -1249,7 +1258,7 @@ with col_head2:
                             )
                             if success:
                                 st.session_state["user"] = res
-                                st.session_state["nutrition_data"] = None
+                                _reset_ephemeral_user_state()
                                 st.query_params["u"] = res["user_id"]
                                 st.query_params["s"] = create_session_token(res["user_id"])
                                 st.query_params["auth"] = "local"
@@ -1361,6 +1370,7 @@ if current_user["user_id"] == "Tamu (Demo)":
                         )
                         if success:
                             st.session_state["user"] = res
+                            _reset_ephemeral_user_state()
                             st.query_params["u"] = res["user_id"]
                             st.query_params["s"] = create_session_token(res["user_id"])
                             st.query_params["auth"] = "local"

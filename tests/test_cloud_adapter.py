@@ -306,6 +306,54 @@ class TestCloudAdapterAndV4(unittest.TestCase):
             mock_reload.assert_called_once_with(stale)
             self.assertIs(res2, db_history)
 
+    def test_null_ai_values_barcode_sentence_guard_and_bom_backup_restore(self):
+        import json
+        from unittest.mock import patch
+        import nutrition_engine
+
+        # BUG-06: nilai None pada komponen AI & JSON BOM + null fields saat restore
+        res_null = nutrition_engine.calculate_dish_nutrition(
+            [{
+                "name": "Hidangan Test Null",
+                "weight_g": None,
+                "energy_kcal_per_100g": None,
+                "protein_g_per_100g": 5.0,
+                "fat_g_per_100g": None,
+                "carb_g_per_100g": None,
+                "fiber_g_per_100g": None,
+                "sodium_mg_per_100g": None,
+            }],
+            portion_multiplier=None,
+            auto_learn=False,
+        )
+        self.assertEqual(res_null["totals"]["energy_kcal"], 0.0)
+
+        bom_backup = "\ufeff" + json.dumps({
+            "meal_logs": [{
+                "dish_name": "Soto BOM",
+                "energy_kcal": 250.0,
+                "protein_g": None,
+                "fat_g": None,
+                "carb_g": None,
+                "fiber_g": None,
+                "sodium_mg": None,
+                "portion_multiplier": None,
+                "photo_caption": None,
+                "meal_type": None,
+                "logged_at": None,
+            }],
+            "weight_logs": [{"recorded_date": "2026-11-18", "weight_kg": 66.5, "note": None}],
+            "custom_foods": [{"food_name": "Kopi Susu Custom", "serving_size": "1 gelas", "energy_kcal": 140.0, "protein_g": None}],
+        })
+        ok_imp, msg_imp = db_history.import_user_data_json(self.test_uid, bom_backup)
+        self.assertTrue(ok_imp, msg_imp)
+        self.assertEqual(len(db_history.get_custom_foods(self.test_uid)), 1)
+
+        # BUG-07: kalimat makanan dengan total >= 8 digit tidak boleh memicu API Open Food Facts
+        with patch("nutrition_engine.fetch_open_food_facts") as mock_off:
+            nutrition_engine.find_best_match("2 telur 100g + nasi putih 150g + tahu 50g")
+            mock_off.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

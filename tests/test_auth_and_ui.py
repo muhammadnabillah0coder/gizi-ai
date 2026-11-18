@@ -163,5 +163,69 @@ class TestAuthAndUI(unittest.TestCase):
         self.assertEqual(r2["dish_name"], "Nasi Goreng")
         self.assertEqual(fake_model.generate_content.call_count, 1)
 
+    def test_oauth_null_password_cannot_login_with_pin_and_case_normalization(self):
+        from db_history import _verify_password
+        oauth_email_upper = f"OAuth.Tester.{uuid.uuid4().hex[:6]}@GMAIL.COM"
+        norm_email = oauth_email_upper.lower()
+        try:
+            u1 = get_or_create_user(oauth_email_upper, display_name="OAuth User", auth_provider="google")
+            self.assertEqual(u1["user_id"], norm_email)
+
+            u2 = get_or_create_user(norm_email.upper(), auth_provider="google")
+            self.assertEqual(u1["id"], u2["id"], "Case berbeda pada user_id tidak boleh membuat akun duplikat")
+
+            # BUG-02: akun tanpa password_hash tidak boleh lolos authenticate_user
+            self.assertEqual(_verify_password("1234", ""), (False, False))
+            self.assertEqual(_verify_password("1234", None), (False, False))
+            ok_bypass, msg_bypass = authenticate_user(norm_email, "apa_saja_1234")
+            self.assertFalse(ok_bypass)
+            self.assertIn("google", msg_bypass.lower())
+
+            ok_guest, _ = authenticate_user("Tamu (Demo)", "1234")
+            self.assertFalse(ok_guest)
+        finally:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("DELETE FROM users WHERE LOWER(user_id) = ?", (norm_email,))
+            conn.commit()
+            conn.close()
+
+    def test_gemini_model_fallback_and_list_json_payload(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GEMINI_MODEL", None)
+            model_name = gemini_extractor._get_gemini_model_name()
+            self.assertEqual(model_name, "gemini-2.5-flash-lite")
+
+        parsed = gemini_extractor._parse_json_payload('[{"dish_name": "Soto Ayam", "components": []}]')
+        self.assertIsInstance(parsed, dict)
+        self.assertEqual(parsed["dish_name"], "Soto Ayam")
+        self.assertFalse(parsed["is_shared_platter"])
+
+    def test_whatsapp_webhook_fail_closed_and_ssrf_guard(self):
+        import asyncio
+        import whatsapp_bot
+        from starlette.requests import Request
+
+        def _make_req(body_bytes: bytes, headers: list = None):
+            async def receive():
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+            return Request({"type": "http", "method": "POST", "path": "/webhook/whatsapp", "headers": headers or []}, receive)
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WHATSAPP_WEBHOOK_SECRET", None)
+            resp_503 = asyncio.run(whatsapp_bot.whatsapp_webhook(_make_req(b'{"sender":"628123","message":"halo"}')))
+            self.assertEqual(resp_503.status_code, 503)
+
+        with patch.dict(os.environ, {"WHATSAPP_WEBHOOK_SECRET": "rahasia-super"}):
+            resp_401 = asyncio.run(whatsapp_bot.whatsapp_webhook(
+                _make_req(b'{"sender":"628123","message":"halo"}', headers=[(b"x-webhook-secret", b"salah")])
+            ))
+            self.assertEqual(resp_401.status_code, 401)
+
+        self.assertEqual(whatsapp_bot._dashboard_url("nabillah"), whatsapp_bot.DASHBOARD_BASE_URL)
+        self.assertFalse(whatsapp_bot._is_safe_public_https_url("http://example.com/a.jpg"))
+        self.assertFalse(whatsapp_bot._is_safe_public_https_url("https://127.0.0.1/admin"))
+        self.assertFalse(whatsapp_bot._is_safe_public_https_url("https://169.254.169.254/latest/meta-data"))
+
+
 if __name__ == "__main__":
     unittest.main()
