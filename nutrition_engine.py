@@ -6,31 +6,124 @@ Mencari padanan item hasil deteksi AI ke Database TKPI Kemenkes dan menghitung n
 
 import sqlite3
 import os
+import re
 import difflib
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db")
+
+# Kamus bahan pokok Indonesia -> nama tepat di database TKPI Kemenkes
+BASE_INGREDIENT_SYNONYMS = {
+    "gula": "Gula putih (Sugar cane)",
+    "gula pasir": "Gula putih (Sugar cane)",
+    "gula putih": "Gula putih (Sugar cane)",
+    "gula tebu": "Gula putih (Sugar cane)",
+    "gula merah": "Gula aren (Sugar, palm)",
+    "gula aren": "Gula aren (Sugar, palm)",
+    "gula jawa": "Gula kelapa",
+    "pisang": "Pisang ambon, segar (Banana, fresh)",
+    "pisang segar": "Pisang ambon, segar (Banana, fresh)",
+    "pisang ambon": "Pisang ambon, segar (Banana, fresh)",
+    "pisang kepok": "Pisang kepok, segar (Banana, kepok, fresh)",
+    "pepaya": "Pepaya, segar (Papaya, fresh)",
+    "pepaya potong": "Pepaya, segar (Papaya, fresh)",
+    "pepaya segar": "Pepaya, segar (Papaya, fresh)",
+    "buah pepaya": "Pepaya, segar (Papaya, fresh)",
+    "telur": "Telur ayam ras, segar (Domestic chicken, egg, fresh)",
+    "telur ayam": "Telur ayam ras, segar (Domestic chicken, egg, fresh)",
+    "telur segar": "Telur ayam ras, segar (Domestic chicken, egg, fresh)",
+    "telur mentah": "Telur ayam ras, segar (Domestic chicken, egg, fresh)",
+    "telur rebus": "Telur ayam rebus",
+    "ayam": "Ayam, daging, segar (Chicken, meat, fresh)",
+    "daging ayam": "Ayam, daging, segar (Chicken, meat, fresh)",
+    "ayam segar": "Ayam, daging, segar (Chicken, meat, fresh)",
+    "nasi": "Nasi putih",
+    "nasi putih": "Nasi putih",
+    "minyak": "Minyak kelapa sawit (Palm oil)",
+    "minyak goreng": "Minyak kelapa sawit (Palm oil)",
+    "minyak sawit": "Minyak kelapa sawit (Palm oil)",
+    "santan": "Santan (dengan air) (Coconut milk mixed with water)",
+    "santan kelapa": "Santan (dengan air) (Coconut milk mixed with water)",
+    "santan encer": "Santan (dengan air) (Coconut milk mixed with water)",
+    "santan kental": "Santan murni (Coconut milk, pured)",
+    "santan murni": "Santan murni (Coconut milk, pured)",
+    "tepung": "Tepung terigu",
+    "tepung terigu": "Tepung terigu",
+    "terigu": "Tepung terigu",
+    "tepung beras": "Tepung beras, mentah",
+    "tahu": "Tahu, mentah",
+    "tahu putih": "Tahu, mentah",
+    "tempe": "Tempe pasar",
+    "tempe mentah": "Tempe pasar",
+    "susu": "Susu sapi, segar",
+    "susu sapi": "Susu sapi, segar",
+    "susu segar": "Susu sapi, segar",
+    "roti": "Roti putih",
+    "roti tawar": "Roti putih",
+    "kecap": "Kecap (Soyabean sauce)",
+    "kecap manis": "Kecap (Soyabean sauce)",
+    "bawang merah": "Bawang merah, segar (Shallot)",
+    "bawang putih": "Bawang putih, segar (Garlic)",
+    "bingka": "Bingka",
+    "kue bingka": "Bingka",
+    "bingka pisang": "Bingka",
+}
+
+COOKING_MODIFIERS = {
+    "goreng", "tepung", "balado", "gulai", "rendang", "keripik",
+    "pepes", "bakar", "panggang", "tumis", "rebus", "bacem", "kuah", "masakan"
+}
+
+
+def _strip_tkpi_parens(name: str) -> str:
+    return re.sub(r"\s*\([^)]*\)", "", name or "").strip()
+
+
+def compute_macro_targets(target_kcal: float, focus_goal: str = "Diet Sehat") -> dict:
+    """Menghitung target gram makronutrien, serat, dan natrium harian sesuai fokus klinis."""
+    kcal = max(800.0, float(target_kcal or 2000.0))
+    focus_low = (focus_goal or "Diet Sehat").lower()
+    if "hamil" in focus_low:
+        p_pct, f_pct, c_pct, fib_g, sod_mg = 0.22, 0.28, 0.50, 28.0, 2000.0
+    elif "diabetes" in focus_low or "gula" in focus_low:
+        p_pct, f_pct, c_pct, fib_g, sod_mg = 0.22, 0.33, 0.45, 30.0, 2000.0
+    elif "hipertensi" in focus_low or "natrium" in focus_low:
+        p_pct, f_pct, c_pct, fib_g, sod_mg = 0.20, 0.28, 0.52, 28.0, 1500.0
+    else:
+        p_pct, f_pct, c_pct, fib_g, sod_mg = 0.22, 0.28, 0.50, 25.0, 2000.0
+
+    return {
+        "protein_g": round((kcal * p_pct) / 4.0, 1),
+        "fat_g": round((kcal * f_pct) / 9.0, 1),
+        "carb_g": round((kcal * c_pct) / 4.0, 1),
+        "fiber_g": fib_g,
+        "sodium_mg": sod_mg,
+    }
+
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def find_best_match(query_name: str):
     """
     Mencari kecocokan terbaik di database TKPI dengan scoring prioritas:
     1. Special drinks (air, kopi, teh)
-    2. Exact match
-    3. Prefix / Word boundary match
-    4. Substring match (diprioritaskan pada nama yang lebih ringkas & spesifik)
-    5. Strict fuzzy match
+    2. Barcode lookup (lokal + Open Food Facts)
+    3. Exact match & Kamus sinonim bahan dasar Indonesia
+    4. Core-name match tanpa teks kurung Inggris + penalti olahan jika tak diminta
+    5. Strict fuzzy match (cutoff 0.85) agar tidak salah cocok antar bahan berbeda
     """
     conn = get_db_connection()
     cur = conn.cursor()
     rows = cur.execute("SELECT * FROM food_composition").fetchall()
     conn.close()
-    
-    query_lower = query_name.lower().strip()
-    
+
+    query_lower = " ".join((query_name or "").lower().strip().split())
+    if not query_lower:
+        return None
+
     # 1. Pengecualian khusus: Air mineral / seduhan
     if query_lower in ["air", "air putih", "air mineral", "air panas", "air dingin"]:
         return {
@@ -68,7 +161,7 @@ def find_best_match(query_name: str):
             "fiber_g": 0.0,
             "sodium_mg": 3.0
         }
-    
+
     # 1.5. Cek pencarian via Barcode jika input berupa angka (8-14 digit)
     clean_digits = "".join(filter(str.isdigit, query_name))
     if len(clean_digits) >= 8:
@@ -80,39 +173,62 @@ def find_best_match(query_name: str):
         if off_product:
             return off_product
 
-    # 2. Cek exact match
+    # 2. Kamus sinonim bahan pokok Indonesia (anti salah cocok olahan/sayur)
+    syn_target = BASE_INGREDIENT_SYNONYMS.get(query_lower)
+    if syn_target:
+        syn_low = syn_target.lower()
+        for row in rows:
+            if row["food_name"].lower() == syn_low:
+                return dict(row)
+
+    # 3. Cek exact match langsung (penuh atau tanpa terjemahan dalam kurung)
     for row in rows:
-        if query_lower == row["food_name"].lower():
+        fname_low = row["food_name"].lower()
+        core_low = _strip_tkpi_parens(fname_low)
+        if query_lower == fname_low or query_lower == core_low:
             return dict(row)
 
-    # 3. Cek apakah query ada di dalam nama makanan di DB, urutkan berdasarkan prioritas:
-    # - Prioritaskan kata yang diawali dengan query (prefix)
-    # - Beri penalti jika nama terlalu panjang dibanding query
+    # 4. Word-boundary & substring scoring pada nama inti TKPI (bebas penalti teks Inggris)
     matching_substrings = []
-    query_words = [w for w in query_lower.split() if len(w) >= 3]
+    query_words = [w for w in re.split(r"[\s,]+", query_lower) if len(w) >= 3]
+    query_wants_modifier = any(mod in query_words for mod in COOKING_MODIFIERS)
+
     for row in rows:
         name_lower = row["food_name"].lower()
-        if len(query_lower) >= 3 and query_lower in name_lower:
-            starts_bonus = 2.0 if name_lower.startswith(query_lower) else 1.0
-            score = (len(query_lower) / len(name_lower)) * starts_bonus
-            matching_substrings.append((score, dict(row)))
-        elif query_words and all(w in name_lower for w in query_words):
-            score = sum(len(w) for w in query_words) / len(name_lower)
-            matching_substrings.append((score, dict(row)))
-            
+        core_name = _strip_tkpi_parens(name_lower)
+        core_tokens = [t for t in re.split(r"[\s,]+", core_name) if t]
+
+        base_score = 0.0
+        if len(query_lower) >= 3 and re.search(rf"\b{re.escape(query_lower)}\b", core_name):
+            starts_bonus = 2.0 if core_name.startswith(query_lower) else 1.2
+            base_score = (len(query_lower) / max(len(core_name), 1)) * starts_bonus
+        elif query_words and all(any(tok == w or tok.startswith(w) for tok in core_tokens) for w in query_words):
+            starts_bonus = 1.6 if core_tokens and core_tokens[0] == query_words[0] else 1.0
+            base_score = (sum(len(w) for w in query_words) / max(len(core_name), 1)) * starts_bonus
+
+        if base_score > 0:
+            # Jika pengguna mencari bahan mentah/sederhana, beri penalti pada masakan/olahan goreng
+            if not query_wants_modifier and any(tok in COOKING_MODIFIERS for tok in core_tokens):
+                base_score *= 0.55
+            elif not query_wants_modifier and ("segar" in core_tokens or "mentah" in core_tokens):
+                base_score *= 1.15
+            matching_substrings.append((base_score, dict(row)))
+
     if matching_substrings:
         matching_substrings.sort(key=lambda x: x[0], reverse=True)
         return matching_substrings[0][1]
-            
-    # 4. Fuzzy match dengan batas kemiripan ketat (cutoff 0.70)
-    names = [row["food_name"] for row in rows]
-    matches = difflib.get_close_matches(query_name, names, n=1, cutoff=0.70)
-    if matches:
-        best_name = matches[0]
+
+    # 5. Fuzzy match ketat (cutoff 0.85) pada nama inti agar typo wajar terbantu tanpa false positive
+    if len(query_lower) >= 4:
+        core_to_row = {}
         for row in rows:
-            if row["food_name"] == best_name:
-                return dict(row)
-                
+            ck = _strip_tkpi_parens(row["food_name"]).lower()
+            if ck not in core_to_row:
+                core_to_row[ck] = row
+        matches = difflib.get_close_matches(query_lower, list(core_to_row.keys()), n=1, cutoff=0.85)
+        if matches:
+            return dict(core_to_row[matches[0]])
+
     return None
 
 def fetch_open_food_facts(barcode: str):
@@ -366,7 +482,8 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
         raw_name = comp.get("name", "")
         weight = float(comp.get("weight_g", 0)) * portion_multiplier
         
-        match = find_best_match(raw_name)
+        is_override = bool(comp.get("custom_override"))
+        match = None if is_override else find_best_match(raw_name)
         if match:
             factor = (weight * (match["bdd_rate"] / 100.0)) / 100.0
             
@@ -390,7 +507,7 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
                 "sodium_mg": sodium
             }
         else:
-            # Gunakan data nutrisi per 100g yang diekstrak langsung oleh AI
+            # Gunakan data nutrisi per 100g yang diekstrak langsung oleh AI atau koreksi manual user
             kcal_100 = float(comp.get("energy_kcal_per_100g", 0.0))
             p_100 = float(comp.get("protein_g_per_100g", 0.0))
             f_100 = float(comp.get("fat_g_per_100g", 0.0))
@@ -398,14 +515,14 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
             fib_100 = float(comp.get("fiber_g_per_100g", 0.0))
             sod_100 = float(comp.get("sodium_mg_per_100g", 0.0))
             
-            # Auto-Learning: Simpan otomatis ke database lokal untuk pencarian masa depan (0 token)
-            if kcal_100 > 0:
+            # Auto-Learning: Simpan otomatis ke antrean staging jika hasil dari ekstraksi AI
+            if kcal_100 > 0 and not is_override:
                 auto_learn_food(raw_name, "Pangan Olahan (Auto-Learn AI)", kcal_100, p_100, f_100, c_100, fib_100, sod_100)
             
             factor = weight / 100.0
             item_res = {
                 "input_name": raw_name,
-                "tkpi_matched_name": f"(Auto-Learned AI: {raw_name.title()})",
+                "tkpi_matched_name": comp.get("source_label") or f"(Auto-Learned AI: {raw_name.title()})",
                 "category": "Pangan Olahan (Auto-Learn AI)",
                 "weight_g": round(weight, 1),
                 "energy_kcal": round(kcal_100 * factor, 1),

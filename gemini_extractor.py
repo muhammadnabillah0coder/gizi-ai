@@ -43,13 +43,17 @@ Tugasmu: Amati foto makanan/minuman atau teks, kenali hidangan, dan uraikan menj
 Aturan Khusus:
 1. Air mineral / air seduhan (kopi hitam polos, teh tawar) memiliki 0 Kalori, 0g Protein, 0g Lemak, 0g Karbohidrat. Jangan pernah menyamakan air dengan makanan padat!
 2. Kopi hitam tanpa gula 1 cangkir (~150-200ml) totalnya hanya ~2-5 Kalori murni dari sari biji kopi.
-3. Untuk makanan komposit (gado-gado, soto, nasi uduk, dll), perkirakan porsi per bahan secara wajar berdasarkan Ukuran Rumah Tangga (URT).
+3. Untuk makanan komposit (gado-gado, soto, nasi uduk, dll), perkirakan porsi per bahan secara wajar berdasarkan Ukuran Rumah Tangga (URT) Indonesia.
+4. ATURAN PORSI PERORANGAN & WADAH BERSAMA (WAJIB): Jika foto memperlihatkan makanan dalam wadah besar, 1 loyang kue utuh (misal bingka, bolu, lapis, martabak), piring lauk bersama, atau sebaskom buah potong, JANGAN menghitung seluruh isi loyang/wadah kecuali keterangan pengguna secara eksplisit menyatakan makan seluruhnya sendirian. Selalu taksir untuk 1 PORSI MAKAN PERORANGAN YANG WAJAR (misal 1 potong sedang kue bingka ~75-85g, atau 1 porsi buah potong ~120-150g), isi `"is_shared_platter": true`, dan tuliskan patokannya di `"serving_reference"` (misal `"1 potong sedang dari loyang (~80g)"`).
+5. Gunakan nama bahan tunggal Indonesia yang baku sesuai TKPI Kemenkes (misal "Gula putih", "Tepung terigu", "Santan", "Telur ayam", "Pisang ambon", "Pepaya segar", "Nasi putih").
 
 Keluaran WAJIB berupa JSON murni dengan format schema berikut tanpa narasi tambahan:
 {
   "dish_name": "Nama Makanan/Minuman",
   "confidence": "high/medium/low",
   "portion_category": "kecil/sedang/besar",
+  "is_shared_platter": false,
+  "serving_reference": "1 porsi/piring sedang (~250g)",
   "components": [
     {
       "name": "Nama Bahan",
@@ -92,7 +96,11 @@ def _parse_json_payload(raw_text: str) -> dict:
         clean = clean.strip("`")
         if clean.startswith("json"):
             clean = clean[4:].strip()
-    return json.loads(clean)
+    parsed = json.loads(clean)
+    if isinstance(parsed, dict):
+        parsed.setdefault("is_shared_platter", False)
+        parsed.setdefault("serving_reference", "")
+    return parsed
 
 def get_gemini_client(api_key: str = None):
     key = api_key or os.environ.get("GEMINI_API_KEY")
@@ -133,7 +141,11 @@ def analyze_food_image(image_input, caption: str = "", api_key: str = None):
         img = img.copy()
         img.thumbnail((max_dim, max_dim))
 
-    prompt = "Identifikasi makanan pada foto ini dan berikan taksiran porsi serta berat bahan-bahannya sesuai format JSON."
+    prompt = (
+        "Identifikasi makanan pada foto ini untuk taksiran 1 porsi makan perorangan yang wajar "
+        "(jika terlihat loyang/wadah saji bersama, hitung 1 potong atau 1 porsi sedang saja dan isi is_shared_platter=true), "
+        "lalu berikan berat bahan-bahannya sesuai format JSON."
+    )
     if caption and caption.strip():
         prompt += f"\nCatatan/keterangan tambahan dari pengguna: '{caption.strip()}' (Gunakan catatan ini untuk memperjelas bahan tersembunyi, bumbu, atau taksiran porsi riil)."
 

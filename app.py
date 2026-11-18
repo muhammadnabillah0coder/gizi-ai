@@ -21,10 +21,15 @@ importlib.reload(nutrition_engine)
 importlib.reload(db_history)
 
 from gemini_extractor import analyze_food_image, analyze_food_text
-from nutrition_engine import calculate_dish_nutrition, fetch_open_food_facts, evaluate_nutri_grade
+from nutrition_engine import (
+    calculate_dish_nutrition, fetch_open_food_facts, evaluate_nutri_grade,
+    compute_macro_targets, find_best_match
+)
 from db_history import (
-    init_user_history_tables, get_or_create_user, log_meal, delete_meal_log, 
-    get_user_history_stats, update_calorie_target, update_user_theme, 
+    init_user_history_tables, get_or_create_user, log_meal, delete_meal_log,
+    update_meal_log, scale_meal_log_portion, find_duplicate_meals,
+    remove_duplicate_meals_for_date, get_frequent_meals, copy_meals_from_date,
+    get_user_history_stats, update_calorie_target, update_user_theme,
     add_custom_food, get_custom_foods, delete_custom_food,
     get_user_scan_status, record_scan_usage,
     log_water_intake, get_water_intake,
@@ -32,16 +37,27 @@ from db_history import (
     stage_pending_food, get_pending_foods, publish_food_to_catalog, reject_pending_food,
     export_user_data_json, import_user_data_json,
     get_local_now, create_session_token, verify_session_token,
-    update_user_preferences, log_weight_entry, get_weight_history, get_logging_streak
+    update_user_preferences, log_weight_entry, get_weight_history, get_logging_streak,
+    get_storage_backend_info
 )
 from google_auth import get_google_auth_url, exchange_code_for_user
 
-APP_VERSION = "v3.0.0-beta"
+APP_VERSION = "v4.0.0-beta"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v3.0.0-beta (Terbaru)",
+        "version": "v4.0.0-beta (Terbaru)",
+        "date": "18 Nov 2026",
+        "highlights": [
+            "🛡️ Alur 1-Pintu Anti-Double: Auto-save diam-diam dihapus! Semua jalur catat menampilkan Preview dulu; edit sesi/porsi setelah simpan meng-update catatan yang sama.",
+            "🍽️ Smart Porsi Loyang/Wadah Bersama & Pilihan ¼x–2x: Foto kue se-loyang atau buah sebaskom ditaksir per 1 porsi wajar + bisa lepas centang bahan.",
+            "✏️ Edit Inline 2-Detik, Pembersih Menu Kembar, Chip 'Sering Kamu Makan', Salin Kemarin, Target Gram Makro, & Persentase Kalori Jujur (>100%).",
+            "☁️ Dual-Backend Cloud Database (Supabase PostgreSQL via pg8000 + fallback SQLite) & Pencocokan Bahan Dasar TKPI Gen-2."
+        ]
+    },
+    {
+        "version": "v3.0.0-beta",
         "date": "14 Nov 2026",
         "highlights": [
             "🎟️ Mode Open Beta Nyaman: Modul QRIS simulasi ditutup; akun terdaftar mendapat 5x scan foto AI/hari (3x makan berat + 2x jajan) & fitur teks/barcode unlimited.",
@@ -129,6 +145,12 @@ else:
 
 if "nutrition_data" not in st.session_state:
     st.session_state["nutrition_data"] = None
+if "preview_origin_tab" not in st.session_state:
+    st.session_state["preview_origin_tab"] = "scanner"
+if "comp_toggle_nonce" not in st.session_state:
+    st.session_state["comp_toggle_nonce"] = 0
+if "last_saved_item" not in st.session_state:
+    st.session_state["last_saved_item"] = None
 
 # Deteksi Tema Tersimpan Milik Pengguna
 current_user = st.session_state["user"]
@@ -472,6 +494,324 @@ FOCUS_GOALS = [
     "Kendali Natrium (Hipertensi)"
 ]
 
+PORTION_OPTIONS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+PORTION_LABELS = {
+    0.25: "¼ Porsi / 1 Potong Kecil (0.25x)",
+    0.5: "½ Porsi (0.5x)",
+    0.75: "¾ Porsi (0.75x)",
+    1.0: "1 Porsi Standar (1.0x)",
+    1.5: "1.5x Porsi",
+    2.0: "2x Porsi",
+}
+MEAL_SESSION_MAP = {
+    "🌅 Sarapan": "Sarapan",
+    "☀️ Makan Siang": "Makan Siang",
+    "🌙 Makan Malam": "Makan Malam",
+    "🍪 Camilan": "Camilan",
+}
+
+
+def _infer_meal_type(tz_offset: int) -> str:
+    h = get_local_now(tz_offset).hour
+    if 4 <= h < 11:
+        return "Sarapan"
+    if 11 <= h < 16:
+        return "Makan Siang"
+    if 16 <= h < 21:
+        return "Makan Malam"
+    return "Camilan"
+
+
+def _closest_portion_opt(val: float) -> float:
+    try:
+        v = float(val or 1.0)
+    except (TypeError, ValueError):
+        v = 1.0
+    return min(PORTION_OPTIONS, key=lambda opt: abs(opt - v))
+
+
+def _normalize_meal_key(raw_mtype: str) -> str:
+    if not raw_mtype:
+        return "Lainnya"
+    for k in ["Sarapan", "Makan Siang", "Makan Malam", "Camilan"]:
+        if k.lower() in raw_mtype.lower():
+            return k
+    return raw_mtype
+
+
+def _open_food_preview(payload: dict, origin_tab: str = "scanner"):
+    """Membuka kartu Preview secara seragam tanpa langsung menyimpan (zero double-save)."""
+    clean_payload = dict(payload)
+    clean_payload.pop("saved_log_id", None)
+    clean_payload.pop("saved_meal_type", None)
+    clean_payload.pop("saved_multiplier", None)
+    st.session_state["nutrition_data"] = clean_payload
+    st.session_state["preview_origin_tab"] = origin_tab
+    st.session_state["comp_toggle_nonce"] = st.session_state.get("comp_toggle_nonce", 0) + 1
+
+
+def format_whatsapp_daily_report(display_name: str, diary_date, today_kcal: float, target_kcal: float, pct_actual: float, today_totals: dict, today_meals: list) -> str:
+    """Menyusun laporan WhatsApp rapi per waktu makan dengan persentase jujur (>100% tidak terpotong)."""
+    meal_icons = {
+        "Sarapan": "🌅 Sarapan",
+        "Makan Siang": "☀️ Makan Siang",
+        "Makan Malam": "🌙 Makan Malam",
+        "Camilan": "🍪 Camilan",
+    }
+    grouped = {}
+    for m in today_meals:
+        mt = _normalize_meal_key(m.get("meal_type"))
+        grouped.setdefault(mt, []).append(m)
+
+    lines = [
+        f"🥗 *Laporan Nutrisi Harian Saya ({diary_date.strftime('%d %B %Y')})*",
+        f"👤 Akun: {display_name}",
+        f"🔥 *Total Kalori:* {today_kcal:,.1f} / {target_kcal:,.0f} kkal ({pct_actual}%)",
+        f"🥩 P: {today_totals['protein_g']}g | 🥑 L: {today_totals['fat_g']}g | 🍚 K: {today_totals['carb_g']}g | 🥦 S: {today_totals['fiber_g']}g",
+        "",
+        "📋 *Menu Hari Ini:*",
+    ]
+    idx_num = 1
+    for mt in ["Sarapan", "Makan Siang", "Makan Malam", "Camilan", "Lainnya"]:
+        if mt not in grouped:
+            continue
+        lines.append(f"*{meal_icons.get(mt, mt)}*")
+        for m in grouped[mt]:
+            lines.append(f"{idx_num}. {m['dish_name']} ({m['energy_kcal']} kkal)")
+            idx_num += 1
+
+    lines.append("\nCek & hitung nutrisi makananmu di: https://nutrisi-cerdas.streamlit.app")
+    return "\n".join(lines)
+
+
+def render_nutrition_preview_card(context_key: str, active_user: dict, active_date_str: str, tz_offset: int, is_adm: bool):
+    """Kartu Preview & Simpan Tunggal Idempoten (anti-double save di semua tab)."""
+    data = st.session_state.get("nutrition_data")
+    if not data:
+        return
+
+    nonce = st.session_state.get("comp_toggle_nonce", 0)
+    saved_id = data.get("saved_log_id")
+    saved_mt = data.get("saved_meal_type") or ""
+
+    with st.container(border=True):
+        if saved_id:
+            st.markdown(f"""<div style="background: rgba(16, 185, 129, 0.14); border: 1.5px solid #10b981; border-radius: 14px; padding: 0.7rem 1rem; margin-bottom: 0.7rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;"><span style="font-weight: 800; color: #10b981;">🟢 SUDAH TERSIMPAN di Sesi {saved_mt}</span><span style="font-size: 0.82rem; opacity: 0.88;">Mengubah porsi/sesi di bawah akan memperbarui catatan ini (tidak mendobel).</span></div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""<div style="background: rgba(245, 158, 11, 0.14); border: 1.5px solid #f59e0b; border-radius: 14px; padding: 0.7rem 1rem; margin-bottom: 0.7rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;"><span style="font-weight: 800; color: #d97706;">🟡 PREVIEW — BELUM DISIMPAN</span><span style="font-size: 0.82rem; opacity: 0.88;">Atur ukuran porsi & pilih waktu makan, lalu klik <strong>Simpan ke Buku Harian</strong>.</span></div>""", unsafe_allow_html=True)
+
+        st.markdown(f"### 🍽️ **{data.get('dish_name', 'Menu Makanan')}**")
+        serving_ref = (data.get("serving_reference") or "").strip()
+        if data.get("is_shared_platter"):
+            ref_txt = serving_ref or "1 potong / 1 porsi makan perorangan"
+            st.info(f"🍰 **Porsi Perorangan Terdeteksi:** Foto terlihat menampilkan loyang/wadah bersama. Nilai `1.0x` ditaksir untuk **{ref_txt}** (bukan seisi loyang). Sesuaikan ke `¼x–2x` bila perlu.")
+        elif serving_ref:
+            st.caption(f"📏 Patokan 1.0x: **{serving_ref}**")
+
+        all_components = data.get("components", [])
+        active_components = all_components
+        if len(all_components) > 1:
+            with st.expander(f"🧩 **Pilih Komponen Piring ({len(all_components)} bahan — lepas centang yang tidak dimakan)**", expanded=False):
+                chk_cols = st.columns(2)
+                chosen = []
+                for idx_c, comp in enumerate(all_components):
+                    with chk_cols[idx_c % 2]:
+                        checked = st.checkbox(
+                            f"{comp.get('name', 'Bahan')} (~{comp.get('weight_g', 0)}g)",
+                            value=True,
+                            key=f"prev_comp_{context_key}_{nonce}_{idx_c}"
+                        )
+                        if checked:
+                            chosen.append(comp)
+                active_components = chosen
+
+        if not active_components:
+            st.warning("⚠️ Pilih minimal 1 komponen bahan untuk menghitung kalori.")
+            if st.button("❌ Tutup Preview", key=f"prev_close_empty_{context_key}_{nonce}"):
+                st.session_state["nutrition_data"] = None
+                st.rerun()
+            return
+
+        st.markdown("##### ⚖️ Sesuaikan Ukuran Porsi:")
+        default_mult = _closest_portion_opt(data.get("saved_multiplier") or 1.0)
+        p_mult = st.select_slider(
+            "Porsi:",
+            options=PORTION_OPTIONS,
+            value=default_mult,
+            format_func=lambda x: PORTION_LABELS[x],
+            label_visibility="collapsed",
+            key=f"prev_mult_{context_key}_{nonce}"
+        )
+
+        calc_res = calculate_dish_nutrition(active_components, portion_multiplier=p_mult)
+        t_tot = calc_res["totals"]
+
+        ng = evaluate_nutri_grade(
+            t_tot["energy_kcal"], t_tot["protein_g"], t_tot["fat_g"],
+            t_tot["carb_g"], t_tot["fiber_g"], t_tot.get("sodium_mg", 0.0)
+        )
+        badges_html = " ".join([
+            f'<span style="background: rgba(125,125,125,0.12); color: {b_col}; border: 1px solid {b_col}; font-size: 0.75rem; font-weight: 800; padding: 0.2rem 0.6rem; border-radius: 999px;">{b_txt}</span>'
+            for b_txt, b_col in ng["badges"]
+        ])
+        st.markdown(f"""<div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; background: rgba(125, 125, 125, 0.06); border: 1px solid rgba(125, 125, 125, 0.16); border-radius: 16px; padding: 0.85rem 1.2rem; margin: 0.6rem 0;"><div style="display: flex; align-items: center; gap: 12px;"><div style="background: {ng['color']}; color: #ffffff; font-size: 1.4rem; font-weight: 900; width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center; justify-content: center;">{ng['grade']}</div><div><div style="font-size: 0.75rem; font-weight: 800; opacity: 0.75; text-transform: uppercase;">Indeks Nutri-Grade & GGL</div><div style="font-size: 1.0rem; font-weight: 800;">{ng['label']}</div></div></div><div style="display: flex; gap: 6px; flex-wrap: wrap;">{badges_html}</div></div>""", unsafe_allow_html=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(f"<div class='macro-pill'><div class='macro-num'>{t_tot['energy_kcal']}</div><div class='macro-lbl'>Kalori (kkal)</div></div>", unsafe_allow_html=True)
+        c2.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#0284c7;'>{t_tot['protein_g']}g</div><div class='macro-lbl'>Protein</div></div>", unsafe_allow_html=True)
+        c3.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#d97706;'>{t_tot['fat_g']}g</div><div class='macro-lbl'>Lemak</div></div>", unsafe_allow_html=True)
+        c4.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#059669;'>{t_tot['carb_g']}g</div><div class='macro-lbl'>Karbohidrat</div></div>", unsafe_allow_html=True)
+
+        meal_keys = list(MEAL_SESSION_MAP.keys())
+        meal_vals = list(MEAL_SESSION_MAP.values())
+        target_mt = saved_mt or _infer_meal_type(tz_offset)
+        def_idx = meal_vals.index(target_mt) if target_mt in meal_vals else 1
+
+        st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+        sel_meal_label = st.radio(
+            "Waktu Makan:",
+            meal_keys,
+            horizontal=True,
+            index=def_idx,
+            label_visibility="collapsed",
+            key=f"prev_meal_{context_key}_{nonce}"
+        )
+        sel_meal_clean = MEAL_SESSION_MAP[sel_meal_label]
+
+        if not saved_id:
+            col_act1, col_act2 = st.columns([3, 1])
+            with col_act1:
+                if st.button(f"💾 Simpan ke Buku Harian ({active_user['display_name']})", type="primary", use_container_width=True, key=f"prev_btn_save_{context_key}_{nonce}"):
+                    res_log = log_meal(
+                        user_id=active_user["user_id"],
+                        dish_name=data.get("dish_name", "Menu Sehat"),
+                        totals=t_tot,
+                        multiplier=p_mult,
+                        caption=data.get("user_caption", ""),
+                        meal_type=sel_meal_clean,
+                        log_date=active_date_str,
+                        tz_offset=tz_offset
+                    )
+                    st.session_state["last_saved_item"] = res_log
+                    st.session_state["nutrition_data"]["saved_log_id"] = res_log["id"]
+                    st.session_state["nutrition_data"]["saved_meal_type"] = sel_meal_clean
+                    st.session_state["nutrition_data"]["saved_multiplier"] = p_mult
+                    st.toast(f"✅ {data.get('dish_name')} tersimpan ke {sel_meal_clean}!")
+                    st.rerun()
+            with col_act2:
+                if st.button("❌ Tutup", use_container_width=True, key=f"prev_btn_clear_{context_key}_{nonce}"):
+                    st.session_state["nutrition_data"] = None
+                    st.rerun()
+        else:
+            col_u1, col_u2, col_u3 = st.columns([2.2, 1.3, 1.3])
+            with col_u1:
+                if st.button(f"🔄 Perbarui Catatan Ini ({sel_meal_clean})", type="primary", use_container_width=True, key=f"prev_btn_upd_{context_key}_{nonce}"):
+                    res_upd = update_meal_log(
+                        log_id=saved_id,
+                        user_id=active_user["user_id"],
+                        dish_name=data.get("dish_name", "Menu Sehat"),
+                        totals=t_tot,
+                        multiplier=p_mult,
+                        meal_type=sel_meal_clean,
+                    )
+                    if res_upd:
+                        st.session_state["last_saved_item"] = res_upd
+                    st.session_state["nutrition_data"]["saved_meal_type"] = sel_meal_clean
+                    st.session_state["nutrition_data"]["saved_multiplier"] = p_mult
+                    st.toast(f"🔄 Catatan diperbarui ke {sel_meal_clean} ({t_tot['energy_kcal']} kkal)!")
+                    st.rerun()
+            with col_u2:
+                if st.button("↩️ Batalkan Simpan", use_container_width=True, key=f"prev_btn_undo_{context_key}_{nonce}"):
+                    delete_meal_log(saved_id, active_user["user_id"])
+                    st.session_state["nutrition_data"].pop("saved_log_id", None)
+                    st.session_state["nutrition_data"].pop("saved_meal_type", None)
+                    if st.session_state.get("last_saved_item") and st.session_state["last_saved_item"].get("id") == saved_id:
+                        st.session_state["last_saved_item"] = None
+                    st.toast("↩️ Simpanan dibatalkan. Kini kembali ke mode Preview.")
+                    st.rerun()
+            with col_u3:
+                if st.button("➕ Menu Baru", use_container_width=True, key=f"prev_btn_new_{context_key}_{nonce}"):
+                    st.session_state["nutrition_data"] = None
+                    st.rerun()
+
+        if data.get("health_tip"):
+            st.markdown(f"""<div class="apple-tip">💡 <strong>Saran Nutrisi:</strong> {data['health_tip']}</div>""", unsafe_allow_html=True)
+
+        with st.expander("🔍 **Lihat Rincian Komposisi Lab & Koreksi Angka Gizi**", expanded=False):
+            table_rows = [{
+                "Bahan": it["input_name"],
+                "Referensi Lab": it["tkpi_matched_name"],
+                "Berat": f"{it['weight_g']} g",
+                "Kalori": f"{it['energy_kcal']} kkal",
+                "Protein": f"{it['protein_g']} g",
+                "Lemak": f"{it['fat_g']} g",
+                "Karbo": f"{it['carb_g']} g"
+            } for it in calc_res["items"]]
+            st.dataframe(table_rows, use_container_width=True, hide_index=True)
+
+            st.markdown("##### ✏️ **Koreksi / Edit Nilai Gizi**")
+            ed_c1, ed_c2 = st.columns(2)
+            with ed_c1:
+                ed_name = st.text_input("Nama Pangan / Produk:", value=data.get("dish_name", "Menu Makanan"), key=f"ed_res_name_{context_key}_{nonce}")
+                ed_cat = st.text_input("Kategori Pangan:", value="Produk Terverifikasi MN", key=f"ed_res_cat_{context_key}_{nonce}")
+                ed_bc = st.text_input("Nomor Barcode (Opsional):", value=str(data.get("barcode") or ""), key=f"ed_res_bc_{context_key}_{nonce}")
+                ed_serv = st.text_input("Satuan Saji:", value=str(data.get("serving_unit") or "1 porsi"), key=f"ed_res_serv_{context_key}_{nonce}")
+            with ed_c2:
+                ed_kcal = st.number_input("Kalori (kkal):", min_value=0.0, value=float(t_tot["energy_kcal"]), step=5.0, key=f"ed_res_kcal_{context_key}_{nonce}")
+                ed_p = st.number_input("Protein (g):", min_value=0.0, value=float(t_tot["protein_g"]), step=0.5, key=f"ed_res_p_{context_key}_{nonce}")
+                ed_f = st.number_input("Lemak (g):", min_value=0.0, value=float(t_tot["fat_g"]), step=0.5, key=f"ed_res_f_{context_key}_{nonce}")
+                ed_c = st.number_input("Karbohidrat (g):", min_value=0.0, value=float(t_tot["carb_g"]), step=0.5, key=f"ed_res_c_{context_key}_{nonce}")
+
+            col_pub1, col_pub2 = st.columns(2)
+            with col_pub1:
+                if st.button("✅ Terapkan Koreksi ke Hasil Ini", use_container_width=True, key=f"btn_apply_edit_local_{context_key}_{nonce}"):
+                    # Bagi proporsional agar saat p_mult = 1.0x nilai akhir sama persis dengan ed_kcal
+                    inv_mult = 1.0 / max(p_mult, 0.1)
+                    st.session_state["nutrition_data"]["dish_name"] = ed_name
+                    st.session_state["nutrition_data"]["components"] = [{
+                        "name": ed_name,
+                        "weight_g": round(100.0 * inv_mult, 2),
+                        "energy_kcal_per_100g": ed_kcal,
+                        "protein_g_per_100g": ed_p,
+                        "fat_g_per_100g": ed_f,
+                        "carb_g_per_100g": ed_c,
+                        "fiber_g_per_100g": float(t_tot.get("fiber_g", 0.0)),
+                        "sodium_mg_per_100g": float(t_tot.get("sodium_mg", 0.0)),
+                        "custom_override": True,
+                        "source_label": f"Koreksi Pengguna ({ed_name})"
+                    }]
+                    if saved_id:
+                        new_tot = {
+                            "energy_kcal": ed_kcal, "protein_g": ed_p, "fat_g": ed_f,
+                            "carb_g": ed_c, "fiber_g": float(t_tot.get("fiber_g", 0.0)),
+                            "sodium_mg": float(t_tot.get("sodium_mg", 0.0)),
+                        }
+                        res_upd = update_meal_log(saved_id, active_user["user_id"], dish_name=ed_name, totals=new_tot, multiplier=p_mult, meal_type=sel_meal_clean)
+                        if res_upd:
+                            st.session_state["last_saved_item"] = res_upd
+                    st.toast("Nilai gizi pada kartu hasil berhasil diperbarui!")
+                    st.rerun()
+            with col_pub2:
+                if is_adm:
+                    if st.button("🚀 Publikasikan Resmi ke Katalog Utama (Admin)", type="primary", use_container_width=True, key=f"btn_pub_catalog_now_{context_key}_{nonce}"):
+                        publish_food_to_catalog(
+                            food_name=ed_name, category=ed_cat,
+                            kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
+                            fib_100=float(t_tot.get("fiber_g", 0.0)),
+                            barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0
+                        )
+                        st.success(f"🎉 '{ed_name}' berhasil dipublikasikan secara resmi ke katalog utama!")
+                else:
+                    if st.button("📥 Ajukan ke Antrean Kurasi Admin", type="primary", use_container_width=True, key=f"btn_stage_catalog_now_{context_key}_{nonce}"):
+                        stage_pending_food(
+                            food_name=ed_name, category=ed_cat,
+                            kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
+                            fib_100=float(t_tot.get("fiber_g", 0.0)),
+                            barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0,
+                            source_origin="Koreksi Pengguna", submitted_by=active_user["user_id"]
+                        )
+                        st.success("✅ Berhasil diajukan ke antrean kurasi Admin sebelum dipublikasikan!")
+
 # Sidebar: Akun Pribadi & Target Harian (Efisien, Bersih, & Kompak)
 with st.sidebar:
     # 1. Branding Header Ramping + Badge original by MN (Versi teknis hanya untuk Admin)
@@ -618,8 +958,23 @@ with st.sidebar:
                 else:
                     st.error(msg_imp)
 
-    # 5. Informasi Versi Web Patch Update & Changelog (Hanya Tampil untuk Admin)
+    # 5. Informasi Versi Web Patch Update & Status Cloud Database (Hanya Tampil untuk Admin)
     if is_admin:
+        backend_info = get_storage_backend_info()
+        with st.expander("☁️ Status Cloud Database (Admin Only)", expanded=False):
+            if backend_info["mode"] == "supabase":
+                st.success(f"🟢 **{backend_info['label']}**\nHost: `{backend_info['host']}`")
+            else:
+                st.warning(f"🟡 **{backend_info['label']}**")
+                if backend_info.get("error"):
+                    st.caption(f"Detail: `{backend_info['error'][:120]}`")
+                st.caption(
+                    "Agar akun & diary tersimpan permanen lintas restart Streamlit Cloud:\n"
+                    "1. Buat proyek gratis di **supabase.com** (Region Singapore).\n"
+                    "2. Klik **Connect → Session Pooler** lalu salin URI PostgreSQL.\n"
+                    "3. Tempel `DATABASE_URL = \"...\"` di **Streamlit Cloud → Settings → Secrets**."
+                )
+
         with st.expander(f"📋 Web Patch Update ({APP_VERSION} - Admin Only)", expanded=False):
             st.caption(f"Dikembangkan oleh **Muhammad Nabillah ({APP_CREATOR})**")
             for p in PATCH_NOTES:
@@ -929,7 +1284,9 @@ stats = get_user_history_stats(st.session_state["user"]["user_id"], target_date=
 streak_days = get_logging_streak(st.session_state["user"]["user_id"], tz_offset=user_tz)
 target_kcal = float(st.session_state["user"].get("daily_calorie_target") or 2000.0)
 today_kcal = stats["today_totals"]["energy_kcal"]
-pct_today = min(round((today_kcal / target_kcal) * 100, 1), 100.0) if target_kcal > 0 else 0
+pct_today_actual = round((today_kcal / target_kcal) * 100, 1) if target_kcal > 0 else 0.0
+pct_today_bar = min(pct_today_actual / 100.0, 1.0)
+macro_targets = compute_macro_targets(target_kcal, user_focus)
 
 # ================= TAB 1: DASHBOARD REKAPAN KALORI =================
 with tab_diary:
@@ -974,11 +1331,17 @@ with tab_diary:
         </div>
         """, unsafe_allow_html=True)
 
-    # Banner Cincin Aktivitas Kalori Hari Ini (Apple Health Style + Streak & Fokus)
+    # Banner Cincin Aktivitas Kalori Hari Ini (Apple Health Style + Streak & Fokus + Persentase Jujur)
     streak_badge_html = (
         f"<span style='background: rgba(245, 158, 11, 0.16); color: #d97706; padding: 0.4rem 0.9rem; border-radius: 9999px; font-weight: 800; font-size: 0.85rem;'>🔥 Streak {streak_days} Hari</span>"
         if streak_days > 0 else
         "<span style='background: rgba(125, 125, 125, 0.14); padding: 0.4rem 0.9rem; border-radius: 9999px; font-weight: 700; font-size: 0.82rem;'>🌱 Mulai Streak Hari Ini</span>"
+    )
+    kcal_delta = target_kcal - today_kcal
+    budget_text = (
+        f"Sisa budget: <strong>{kcal_delta:,.1f} kkal</strong>"
+        if kcal_delta >= 0 else
+        f"Melebihi target: <strong style='color:#ef4444;'>+{abs(kcal_delta):,.1f} kkal</strong>"
     )
     st.markdown(f"""
     <div class="apple-ring-card">
@@ -986,7 +1349,7 @@ with tab_diary:
             <div>
                 <div class="ring-title">🎯 Cincin Kalori ({active_diary_date.strftime('%d %B %Y')}) • Fokus: {user_focus}</div>
                 <div class="ring-val">{today_kcal:,.1f} <span style="font-size: 1.1rem; color: #64748b; font-weight: 500;">/ {target_kcal:,.0f} kkal</span></div>
-                <div class="ring-sub">Tercapai <strong>{pct_today}%</strong> • Sisa budget: <strong>{max(0.0, target_kcal - today_kcal):,.1f} kkal</strong></div>
+                <div class="ring-sub">Tercapai <strong>{pct_today_actual}%</strong> • {budget_text}</div>
             </div>
             <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 0.3rem;">
                 {streak_badge_html}
@@ -999,35 +1362,35 @@ with tab_diary:
     """, unsafe_allow_html=True)
     
     # Progress Bar Lembut
-    st.progress(pct_today / 100.0)
+    st.progress(pct_today_bar)
 
-    # 4 Makronutrien Hari Ini
+    # 4 Makronutrien Hari Ini + Target Gram Klinis
     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
     with col_m1:
         st.markdown(f"""
         <div class="macro-pill">
-            <div class="macro-num" style="color: #0284c7;">{stats['today_totals']['protein_g']}g</div>
+            <div class="macro-num" style="color: #0284c7;">{stats['today_totals']['protein_g']}g <span style="font-size: 0.78rem; opacity: 0.65;">/ {macro_targets['protein_g']}g</span></div>
             <div class="macro-lbl">Protein Hari Ini</div>
         </div>
         """, unsafe_allow_html=True)
     with col_m2:
         st.markdown(f"""
         <div class="macro-pill">
-            <div class="macro-num" style="color: #d97706;">{stats['today_totals']['fat_g']}g</div>
+            <div class="macro-num" style="color: #d97706;">{stats['today_totals']['fat_g']}g <span style="font-size: 0.78rem; opacity: 0.65;">/ {macro_targets['fat_g']}g</span></div>
             <div class="macro-lbl">Lemak Hari Ini</div>
         </div>
         """, unsafe_allow_html=True)
     with col_m3:
         st.markdown(f"""
         <div class="macro-pill">
-            <div class="macro-num" style="color: #059669;">{stats['today_totals']['carb_g']}g</div>
+            <div class="macro-num" style="color: #059669;">{stats['today_totals']['carb_g']}g <span style="font-size: 0.78rem; opacity: 0.65;">/ {macro_targets['carb_g']}g</span></div>
             <div class="macro-lbl">Karbohidrat</div>
         </div>
         """, unsafe_allow_html=True)
     with col_m4:
         st.markdown(f"""
         <div class="macro-pill">
-            <div class="macro-num" style="color: #7c3aed;">{stats['today_totals']['fiber_g']}g</div>
+            <div class="macro-num" style="color: #7c3aed;">{stats['today_totals']['fiber_g']}g <span style="font-size: 0.78rem; opacity: 0.65;">/ {macro_targets['fiber_g']}g</span></div>
             <div class="macro-lbl">Serat</div>
         </div>
         """, unsafe_allow_html=True)
@@ -1047,7 +1410,7 @@ with tab_diary:
         <div style="background: rgba(125, 125, 125, 0.06); border: 1px solid rgba(125, 125, 125, 0.14); border-radius: 16px; padding: 0.85rem 1.2rem; margin: 1rem 0;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.45rem; font-size: 0.82rem; font-weight: 700;">
                 <span>📊 Rasio Makronutrien Hari Ini</span>
-                <span style="opacity: 0.75;">Total Nutrisi: {macro_sum:.1f}g • Natrium: {sod_mg:,.0f} mg</span>
+                <span style="opacity: 0.75;">Total Makro: {macro_sum:.1f}g • Natrium: {sod_mg:,.0f} / {macro_targets['sodium_mg']:,.0f} mg</span>
             </div>
             <div style="display: flex; height: 10px; border-radius: 999px; overflow: hidden; margin-bottom: 0.55rem; background: rgba(125, 125, 125, 0.15);">
                 <div style="width: {p_pct}%; background: #0284c7;" title="Protein {p_pct}%"></div>
@@ -1098,22 +1461,52 @@ with tab_diary:
         </div>
         """, unsafe_allow_html=True)
 
-    # ⚡ Aksi Cepat Catat Makanan Langsung di Dashboard (Quick Log Bar + Piring Cepat 1-Klik)
+    # ⚡ Aksi Cepat Catat Makanan Langsung di Dashboard (Seragam: Selalu Preview Dulu, Bebas Salah Sesi/Dobel)
     with st.container(border=True):
         st.markdown("##### ⚡ **Catat Cepat Menu Makan Hari Ini**")
         qc_col1, qc_col2 = st.columns([3.2, 1.3], vertical_alignment="center")
         with qc_col1:
             dash_quick_text = st.text_input(
                 "Ketik menu makanan langsung:",
-                placeholder="Misal: 1 porsi soto ayam + nasi putih + telur rebus",
+                placeholder="Misal: 1 potong bingka pisang, atau 1 porsi soto ayam + nasi",
                 key="dash_quick_input",
                 label_visibility="collapsed"
             )
         with qc_col2:
-            dash_btn_calc = st.button("⚡ Hitung & Catat", type="primary", use_container_width=True, key="btn_dash_quick")
+            dash_btn_calc = st.button("🔍 Preview & Hitung", type="primary", use_container_width=True, key="btn_dash_quick")
 
-        # Inovasi: Piring Cepat 1-Klik (Tanpa Perlu Mengetik)
-        st.caption("🔥 **1-Klik Menu Harian Populer (Langsung Catat Tanpa Ketik):**")
+        # Inovasi 1: Sering Kamu Makan (Otomatis dari Riwayat Akunmu)
+        freq_meals = get_frequent_meals(st.session_state["user"]["user_id"], limit=6)
+        if freq_meals:
+            st.caption("⭐ **Sering Kamu Makan (1-Klik Preview Porsi 1.0x):**")
+            fq_cols = st.columns(3)
+            for idx_fq, fq_item in enumerate(freq_meals):
+                with fq_cols[idx_fq % 3]:
+                    if st.button(f"⭐ {fq_item['dish_name'][:22]} ({fq_item['energy_kcal']:.0f} kkal)", use_container_width=True, key=f"dash_fq_{idx_fq}"):
+                        _open_food_preview({
+                            "dish_name": fq_item["dish_name"],
+                            "confidence": "high",
+                            "portion_category": "1 porsi kebiasaan Anda",
+                            "serving_reference": "1 porsi normal sesuai catatan sebelumnya",
+                            "user_caption": f"Sering dimakan ({fq_item['freq']}x)",
+                            "components": [{
+                                "name": fq_item["dish_name"],
+                                "weight_g": 100.0,
+                                "energy_kcal_per_100g": fq_item["energy_kcal"],
+                                "protein_g_per_100g": fq_item["protein_g"],
+                                "fat_g_per_100g": fq_item["fat_g"],
+                                "carb_g_per_100g": fq_item["carb_g"],
+                                "fiber_g_per_100g": fq_item["fiber_g"],
+                                "sodium_mg_per_100g": fq_item["sodium_mg"],
+                                "custom_override": True,
+                                "source_label": "Riwayat Pribadi (1.0x)"
+                            }],
+                            "health_tip": "Menu favorit harianmu siap disesuaikan porsi & sesi makannya sebelum disimpan."
+                        }, origin_tab="diary")
+                        st.rerun()
+
+        # Inovasi 2: Piring Cepat Populer Indonesia (Preview Cepat Tanpa Ketik)
+        st.caption("🔥 **Menu Harian Populer (1-Klik Preview Tanpa Ketik):**")
         QUICK_PLATES = [
             ("🍛 Nasi + Telur Dadar", "Nasi Putih + Telur Dadar", {"energy_kcal": 315.0, "protein_g": 11.5, "fat_g": 12.0, "carb_g": 40.0, "fiber_g": 1.0, "sodium_mg": 240.0}),
             ("🍗 Nasi + Ayam Bakar", "Nasi Putih + Ayam Bakar Dada", {"energy_kcal": 385.0, "protein_g": 32.0, "fat_g": 8.5, "carb_g": 43.0, "fiber_g": 1.2, "sodium_mg": 380.0}),
@@ -1126,61 +1519,49 @@ with tab_diary:
         for idx_qp, (qp_label, qp_name, qp_tot) in enumerate(QUICK_PLATES):
             with qp_cols[idx_qp % 3]:
                 if st.button(qp_label, use_container_width=True, key=f"dash_qp_{idx_qp}"):
-                    current_hour = get_local_now(user_tz).hour
-                    auto_meal = "Sarapan" if 4 <= current_hour < 11 else ("Makan Siang" if 11 <= current_hour < 16 else ("Makan Malam" if 16 <= current_hour < 21 else "Camilan"))
-                    res_log = log_meal(
-                        user_id=st.session_state["user"]["user_id"],
-                        dish_name=qp_name,
-                        totals=qp_tot,
-                        multiplier=1.0,
-                        caption="Piring Cepat 1-Klik",
-                        meal_type=auto_meal,
-                        log_date=active_diary_date_str,
-                        tz_offset=user_tz
-                    )
-                    st.session_state["last_saved_item"] = res_log
-                    st.toast(f"✅ {qp_name} ({qp_tot['energy_kcal']} kkal) dicatat ke {auto_meal}!")
+                    _open_food_preview({
+                        "dish_name": qp_name,
+                        "confidence": "high",
+                        "portion_category": "1 porsi standar",
+                        "serving_reference": "1 porsi standar URT",
+                        "user_caption": "Piring Cepat 1-Klik",
+                        "components": [{
+                            "name": qp_name,
+                            "weight_g": 100.0,
+                            "energy_kcal_per_100g": qp_tot["energy_kcal"],
+                            "protein_g_per_100g": qp_tot["protein_g"],
+                            "fat_g_per_100g": qp_tot["fat_g"],
+                            "carb_g_per_100g": qp_tot["carb_g"],
+                            "fiber_g_per_100g": qp_tot["fiber_g"],
+                            "sodium_mg_per_100g": qp_tot["sodium_mg"],
+                            "custom_override": True,
+                            "source_label": "Standar Menu Populer"
+                        }],
+                        "health_tip": "Pilih ukuran porsi & sesi makan di bawah lalu klik Simpan ke Buku Harian."
+                    }, origin_tab="diary")
                     st.rerun()
-            
+
         if dash_btn_calc:
             if not dash_quick_text.strip():
                 st.warning("Ketikkan nama menu makanan terlebih dahulu.")
             elif not api_key:
                 st.error("⚠️ API Key belum disetel di Secrets.")
             else:
-                with st.spinner("Menganalisis nutrisi makanan..."):
+                with st.spinner("Menghitung estimasi nutrisi..."):
                     try:
                         res = analyze_food_text(dash_quick_text.strip(), api_key=api_key)
                         res["user_caption"] = dash_quick_text.strip()
-                        calc_res = calculate_dish_nutrition(res.get("components", []), portion_multiplier=1.0)
-                        totals = calc_res["totals"]
-                        
-                        current_hour = get_local_now(user_tz).hour
-                        if 4 <= current_hour < 11:
-                            auto_meal = "Sarapan"
-                        elif 11 <= current_hour < 16:
-                            auto_meal = "Makan Siang"
-                        elif 16 <= current_hour < 21:
-                            auto_meal = "Makan Malam"
-                        else:
-                            auto_meal = "Camilan"
-                            
-                        res_log = log_meal(
-                            user_id=st.session_state["user"]["user_id"],
-                            dish_name=res.get("dish_name", dash_quick_text.strip()),
-                            totals=totals,
-                            multiplier=1.0,
-                            caption=dash_quick_text.strip(),
-                            meal_type=auto_meal,
-                            log_date=active_diary_date_str,
-                            tz_offset=user_tz
-                        )
-                        st.session_state["last_saved_item"] = res_log
-                        st.balloons()
-                        st.toast(f"Berhasil mencatat {res.get('dish_name')} ({totals['energy_kcal']} kkal) ke {auto_meal}!")
+                        _open_food_preview(res, origin_tab="diary")
+                        st.toast("✅ Preview siap! Pilih porsi & waktu makan di bawah sebelum disimpan.")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Gagal mencatat makanan: {e}")
+                        st.error(f"Gagal menganalisis makanan: {e}")
+
+    if st.session_state.get("nutrition_data"):
+        if st.session_state.get("preview_origin_tab") == "diary":
+            render_nutrition_preview_card("diary", current_user, active_diary_date_str, user_tz, is_admin)
+        else:
+            st.info(f"🍽️ Sedang ada Preview terbuka untuk **{st.session_state['nutrition_data'].get('dish_name')}** di tab **{st.session_state.get('preview_origin_tab', 'scanner').title()}**.")
 
     # Widget Pelacak Air Minum Harian & Pelacak Berat Badan
     water_data = get_water_intake(st.session_state["user"]["user_id"], tz_offset=user_tz)
@@ -1273,32 +1654,33 @@ with tab_diary:
         </div>
         """, unsafe_allow_html=True)
 
-    # Riwayat Makan Hari Ini & Tombol Hapus Baris
+    # Riwayat Makan Hari Ini, Pembersih Duplikat, Salin Kemarin, & Edit Inline 2-Detik
     st.markdown("### 📝 **Buku Harian Makan Hari Ini**")
-    
-    # Normalisasi nama waktu makan lama yang mungkin memiliki emoji di depannya
-    def normalize_meal_key(raw_mtype: str) -> str:
-        if not raw_mtype:
-            return "Lainnya"
-        for k in ["Sarapan", "Makan Siang", "Makan Malam", "Camilan"]:
-            if k.lower() in raw_mtype.lower():
-                return k
-        return raw_mtype
+
+    dup_ids = find_duplicate_meals(stats["today_meals"])
+    if dup_ids:
+        c_dup1, c_dup2 = st.columns([2.6, 1.4], vertical_alignment="center")
+        with c_dup1:
+            st.warning(f"⚠️ Terdeteksi **{len(dup_ids)} catatan menu kembar** di hari ini (misal tercatat ganda sebelumnya).")
+        with c_dup2:
+            if st.button(f"🧹 Rapikan Menu Kembar ({len(dup_ids)})", type="primary", use_container_width=True, key="btn_clean_dups"):
+                del_cnt = remove_duplicate_meals_for_date(st.session_state["user"]["user_id"], active_diary_date_str)
+                st.toast(f"🧹 Berhasil merapikan {del_cnt} catatan kembar!")
+                st.rerun()
+
+    yest_for_copy = (active_diary_date - timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Tombol Bagikan ke WhatsApp & Ekspor
     if stats["today_meals"]:
-        wa_text = (
-            f"🥗 *Laporan Nutrisi Harian Saya ({active_diary_date.strftime('%d %B %Y')})*\n"
-            f"👤 Akun: {current_user['display_name']}\n"
-            f"🔥 *Total Kalori:* {today_kcal} / {target_kcal:.0f} kkal ({pct_today}%)\n"
-            f"🥩 Protein: {stats['today_totals']['protein_g']}g | 🥑 Lemak: {stats['today_totals']['fat_g']}g | 🍚 Karbo: {stats['today_totals']['carb_g']}g\n\n"
-            f"📋 *Menu Hari Ini:*\n"
+        wa_text = format_whatsapp_daily_report(
+            display_name=current_user["display_name"],
+            diary_date=active_diary_date,
+            today_kcal=today_kcal,
+            target_kcal=target_kcal,
+            pct_actual=pct_today_actual,
+            today_totals=stats["today_totals"],
+            today_meals=stats["today_meals"],
         )
-        for idx, m in enumerate(stats["today_meals"], 1):
-            m_type = normalize_meal_key(m.get("meal_type"))
-            wa_text += f"{idx}. [{m_type}] {m['dish_name']} ({m['energy_kcal']} kkal)\n"
-        wa_text += "\nCek & hitung nutrisi makananmu di: https://nutrisi-cerdas.streamlit.app"
-        
         wa_encoded = urllib.parse.quote(wa_text)
         wa_url = f"https://api.whatsapp.com/send?text={wa_encoded}"
         
@@ -1332,7 +1714,7 @@ with tab_diary:
         
         grouped_meals = {}
         for m in stats["today_meals"]:
-            mtype = normalize_meal_key(m.get("meal_type"))
+            mtype = _normalize_meal_key(m.get("meal_type"))
             if mtype not in grouped_meals:
                 grouped_meals[mtype] = []
             grouped_meals[mtype].append(m)
@@ -1342,6 +1724,8 @@ with tab_diary:
         for k in grouped_meals:
             if k not in ordered_keys:
                 ordered_keys.append(k)
+
+        EDIT_MEAL_CHOICES = ["Sarapan", "Makan Siang", "Makan Malam", "Camilan"]
 
         for mtype in ordered_keys:
             meals_in_group = grouped_meals[mtype]
@@ -1370,15 +1754,36 @@ with tab_diary:
                     is_just_saved = ("last_saved_item" in st.session_state and st.session_state["last_saved_item"] and st.session_state["last_saved_item"].get("id") == m["id"])
                     saved_badge = '<span style="background: rgba(16,185,129,0.18); color: #10b981; font-size: 0.68rem; font-weight: 800; padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid rgba(16,185,129,0.3); margin-left: 6px;">🟢 BARU DISIMPAN</span>' if is_just_saved else ''
 
-                    col_row1, col_row2, col_row3 = st.columns([3.2, 2.0, 0.8], vertical_alignment="center")
+                    col_row1, col_row2, col_row3, col_row4 = st.columns([3.0, 1.9, 0.55, 0.55], vertical_alignment="center")
                     with col_row1:
-                        st.markdown(f"**{m['dish_name']}** {saved_badge}", unsafe_allow_html=True)
+                        mult_lbl = f" • {m.get('portion_multiplier', 1.0)}x" if float(m.get("portion_multiplier") or 1.0) != 1.0 else ""
+                        st.markdown(f"**{m['dish_name']}**{mult_lbl} {saved_badge}", unsafe_allow_html=True)
                         sub_cap = f"_{m['photo_caption']}_" if m['photo_caption'] else ""
                         st.caption(f"🕒 {time_str} {sub_cap}")
                     with col_row2:
                         st.markdown(f"**{m['energy_kcal']} kkal**")
                         st.caption(f"P: {m['protein_g']}g • L: {m['fat_g']}g • K: {m['carb_g']}g")
                     with col_row3:
+                        with st.popover("✏️", use_container_width=True, help="Ubah waktu makan atau porsi"):
+                            st.markdown(f"##### ✏️ Edit: **{m['dish_name']}**")
+                            cur_mt = _normalize_meal_key(m.get("meal_type"))
+                            mt_idx = EDIT_MEAL_CHOICES.index(cur_mt) if cur_mt in EDIT_MEAL_CHOICES else 1
+                            ed_mt = st.selectbox("Pindah Waktu Makan:", EDIT_MEAL_CHOICES, index=mt_idx, key=f"ed_mt_{m['id']}")
+                            cur_mult = _closest_portion_opt(m.get("portion_multiplier") or 1.0)
+                            ed_mult = st.select_slider(
+                                "Ubah Porsi:",
+                                options=PORTION_OPTIONS,
+                                value=cur_mult,
+                                format_func=lambda x: PORTION_LABELS[x],
+                                key=f"ed_mult_{m['id']}"
+                            )
+                            if st.button("💾 Simpan Perubahan", type="primary", use_container_width=True, key=f"btn_ed_save_{m['id']}"):
+                                res_sc = scale_meal_log_portion(m["id"], st.session_state["user"]["user_id"], ed_mult, new_meal_type=ed_mt)
+                                if res_sc:
+                                    st.session_state["last_saved_item"] = res_sc
+                                st.toast(f"✅ {m['dish_name']} diperbarui ({ed_mt}, {ed_mult}x)!")
+                                st.rerun()
+                    with col_row4:
                         if st.button("🗑️", key=f"del_{m['id']}", help="Hapus menu ini", use_container_width=True):
                             delete_meal_log(m["id"], st.session_state["user"]["user_id"])
                             st.toast("Catatan makanan berhasil dihapus.")
@@ -1389,10 +1794,17 @@ with tab_diary:
             <div style="font-size: 2.5rem; margin-bottom: 0.5rem;">🥗</div>
             <div style="font-weight: 700; font-size: 1.05rem; margin-bottom: 0.3rem;">Buku Harian Masih Kosong Hari Ini</div>
             <div style="font-size: 0.88rem; opacity: 0.75; max-width: 450px; margin: 0 auto;">
-                Gunakan kotak <strong>Catat Cepat</strong> di atas atau buka tab <strong>📸 Catat Makan</strong> untuk memotret makananmu dan melacak kalori secara akurat.
+                Gunakan kotak <strong>Catat Cepat</strong> di atas, salin menu kemarin, atau buka tab <strong>📸 Catat</strong> untuk memotret makananmu.
             </div>
         </div>
         """, unsafe_allow_html=True)
+        if st.button("📋 Salin Daftar Menu dari Kemarin", use_container_width=True, key="btn_copy_yesterday_empty"):
+            cnt_cp = copy_meals_from_date(st.session_state["user"]["user_id"], yest_for_copy, active_diary_date_str, tz_offset=user_tz)
+            if cnt_cp > 0:
+                st.toast(f"📋 Berhasil menyalin {cnt_cp} menu dari kemarin ({yest_for_copy})!")
+                st.rerun()
+            else:
+                st.info("Belum ada catatan makan kemarin untuk disalin.")
 
 # ================= TAB 2: CATAT MAKANAN BARU (SIMPEL, 3 SUB-TAB MUAT 1 LAYAR HP) =================
 with tab_scanner:
@@ -1425,10 +1837,8 @@ with tab_scanner:
         with c_up2:
             if active_img_file:
                 st.markdown("#### Siap Menganalisis?")
-                st.caption("AI memindai porsi URT & mencocokkan ke 1.300+ data laboratorium resmi TKPI Kemenkes & produk ritel.")
-                
-                auto_save_opt = st.checkbox("⚡ **Langsung Simpan Otomatis** ke Buku Harian setelah selesai analisis", value=True, key="opt_autosave_photo")
-                
+                st.caption("AI memindai porsi perorangan URT & mencocokkan ke 1.300+ data lab TKPI Kemenkes. Hasil akan tampil sebagai **Preview** terlebih dahulu agar Anda bisa cek porsi & sesi makan.")
+
                 if not scan_status["can_scan"]:
                     max_sc = scan_status["max_scans"]
                     if current_user["user_id"] == "Tamu (Demo)":
@@ -1438,31 +1848,14 @@ with tab_scanner:
                         st.warning(f"⚠️ **Kuota Scan Foto Hari Ini Tercapai ({max_sc}/{max_sc} — 3x Makan Berat & 2x Jajan).**")
                         st.info("Jangan khawatir! Anda tetap bisa mencatat **sepuasnya tanpa batas** melalui tab **✍️ Ketik & Menu Cepat**, **1-Klik Menu Harian**, atau **🏷️ Barcode & Manual**.")
                 else:
-                    if st.button("🚀 Analisis Nutrisi Foto Sekarang", type="primary", use_container_width=True, key="btn_foto"):
+                    if st.button("🔍 Cek & Hitung Gizi Foto", type="primary", use_container_width=True, key="btn_foto"):
                         with st.spinner("Menganalisis visual foto makanan..."):
                             try:
                                 res = analyze_food_image(im, caption=p_caption, api_key=api_key)
-                                res["user_caption"] = p_caption
+                                res["user_caption"] = p_caption or "Foto Piring"
                                 record_scan_usage(current_user["user_id"], tz_offset=user_tz)
-                                
-                                if auto_save_opt:
-                                    calc_res_temp = calculate_dish_nutrition(res.get("components", []), portion_multiplier=1.0)
-                                    curr_h = get_local_now(user_tz).hour
-                                    auto_meal = "Sarapan" if 4 <= curr_h < 11 else ("Makan Siang" if 11 <= curr_h < 16 else ("Makan Malam" if 16 <= curr_h < 21 else "Camilan"))
-                                    res_log = log_meal(
-                                        user_id=current_user["user_id"],
-                                        dish_name=res.get("dish_name", "Menu Sehat"),
-                                        totals=calc_res_temp["totals"],
-                                        multiplier=1.0,
-                                        caption=p_caption or "Foto Piring",
-                                        meal_type=auto_meal,
-                                        log_date=active_diary_date_str,
-                                        tz_offset=user_tz
-                                    )
-                                    st.session_state["last_saved_item"] = res_log
-                                    st.toast(f"✅ {res.get('dish_name')} berhasil dianalisis & disimpan otomatis ke {auto_meal}!")
-                                
-                                st.session_state["nutrition_data"] = res
+                                _open_food_preview(res, origin_tab="scanner")
+                                st.toast("🔍 Foto berhasil dianalisis! Cek porsi & pilih waktu makan di bawah sebelum Simpan.")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Gagal memproses gambar: {e}")
@@ -1482,8 +1875,8 @@ with tab_scanner:
                     try:
                         res = analyze_food_text(t_input, api_key=api_key)
                         res["user_caption"] = t_input
-                        st.session_state["nutrition_data"] = res
-                        st.toast("✅ Analisis berhasil! Lihat hasil di bawah.")
+                        _open_food_preview(res, origin_tab="scanner")
+                        st.toast("✅ Analisis berhasil! Lihat Preview di bawah sebelum Simpan.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Gagal memproses teks: {e}")
@@ -1502,10 +1895,11 @@ with tab_scanner:
         for idx_pm, (pm_btn, pm_title, pm_w, pm_k, pm_p, pm_f, pm_c, pm_fib) in enumerate(PRESET_MENUS):
             with pm_cols[idx_pm % 3]:
                 if st.button(pm_btn, use_container_width=True, key=f"pm_fast_{idx_pm}"):
-                    st.session_state["nutrition_data"] = {
+                    _open_food_preview({
                         "dish_name": pm_title,
                         "confidence": "high",
                         "portion_category": "1 porsi standar",
+                        "serving_reference": f"1 porsi standar (~{pm_w:.0f}g)",
                         "source_origin": "Standar Lab TKPI Kemenkes RI",
                         "components": [{
                             "name": pm_title,
@@ -1515,10 +1909,12 @@ with tab_scanner:
                             "fat_g_per_100g": pm_f,
                             "carb_g_per_100g": pm_c,
                             "fiber_g_per_100g": pm_fib,
-                            "sodium_mg_per_100g": 320.0
+                            "sodium_mg_per_100g": 320.0,
+                            "custom_override": True,
+                            "source_label": "Standar Lab TKPI Kemenkes RI"
                         }],
-                        "health_tip": "Menu populer harian Indonesia. Anda dapat langsung menyimpan ke Buku Harian atau mengatur ukuran porsinya."
-                    }
+                        "health_tip": "Menu populer harian Indonesia. Atur porsi & sesi makan di bawah lalu klik Simpan."
+                    }, origin_tab="scanner")
                     st.rerun()
 
     with subtab_barcode:
@@ -1549,15 +1945,15 @@ with tab_scanner:
 
         target_bc = sample_code or (in_barcode.strip() if btn_barcode else "")
         if target_bc:
-            from nutrition_engine import find_best_match
             with st.spinner(f"🔍 Mencari barcode `{target_bc}`..."):
                 matched = find_best_match(target_bc)
             if matched:
                 src_info = matched.get("source_origin") or "Katalog Terverifikasi Lokal"
-                st.session_state["nutrition_data"] = {
+                _open_food_preview({
                     "dish_name": matched["food_name"],
                     "confidence": "high",
                     "portion_category": "standar kemasan",
+                    "serving_reference": matched.get("serving_unit") or "1 kemasan",
                     "barcode": matched.get("barcode") or target_bc,
                     "source_origin": src_info,
                     "serving_unit": matched.get("serving_unit") or "1 kemasan",
@@ -1569,10 +1965,12 @@ with tab_scanner:
                         "fat_g_per_100g": matched["fat_g"],
                         "carb_g_per_100g": matched["carb_g"],
                         "fiber_g_per_100g": matched.get("fiber_g") or 0.0,
-                        "sodium_mg_per_100g": matched.get("sodium_mg") or 0.0
+                        "sodium_mg_per_100g": matched.get("sodium_mg") or 0.0,
+                        "custom_override": True,
+                        "source_label": src_info
                     }],
                     "health_tip": f"Sumber Data: {src_info}. Ukuran saji: {matched.get('serving_unit', '100g')}."
-                }
+                }, origin_tab="scanner")
                 st.toast(f"✅ Produk ditemukan: {matched['food_name']}")
                 st.rerun()
             else:
@@ -1588,7 +1986,7 @@ with tab_scanner:
                         try:
                             res = analyze_food_image(im_pkg, caption="Kemasan produk ritel / tabel informasi nilai gizi", api_key=api_key)
                             res["source_origin"] = "Ekstraksi Vision Label Gizi"
-                            st.session_state["nutrition_data"] = res
+                            _open_food_preview(res, origin_tab="scanner")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Gagal membaca foto kemasan: {e}")
@@ -1676,174 +2074,30 @@ with tab_scanner:
                 else:
                     st.info("Makanan manual yang Anda simpan akan muncul di sini untuk dicatat ulang dengan 1 klik.")
 
-    # HASIL ANALISIS MAKANAN (RINGKAS, TOMBOL SIMPAN DI ATAS AGAR TIDAK PERLU SCROLL JAUH)
-    if st.session_state["nutrition_data"]:
-        data = st.session_state["nutrition_data"]
-        st.markdown("---")
-        
-        st.markdown(f"## 🍽️ **{data.get('dish_name', 'Menu Makanan')}**")
-        
-        # Slider Porsi Interaktif
-        st.markdown("##### ⚖️ Sesuaikan Porsi:")
-        p_mult = st.select_slider(
-            "Porsi:",
-            options=[0.7, 1.0, 1.3, 1.5],
-            value=1.0,
-            format_func=lambda x: {
-                0.7: "Sedikit (0.7x)",
-                1.0: "Normal (1.0x)",
-                1.3: "Banyak (1.3x)",
-                1.5: "Jumbo (1.5x)"
-            }[x],
-            label_visibility="collapsed"
-        )
-        
-        calc_res = calculate_dish_nutrition(data.get("components", []), portion_multiplier=p_mult)
-        t_tot = calc_res["totals"]
-        
-        # Evaluasi Nutri-Grade (A-D) & Rambu Peringatan GGL Kemenkes
-        ng = evaluate_nutri_grade(
-            t_tot["energy_kcal"], t_tot["protein_g"], t_tot["fat_g"],
-            t_tot["carb_g"], t_tot["fiber_g"], t_tot.get("sodium_mg", 0.0)
-        )
-        badges_html = " ".join([
-            f'<span style="background: rgba(125,125,125,0.12); color: {b_col}; border: 1px solid {b_col}; font-size: 0.75rem; font-weight: 800; padding: 0.2rem 0.6rem; border-radius: 999px;">{b_txt}</span>'
-            for b_txt, b_col in ng["badges"]
-        ])
-        st.markdown(f"""
-        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; background: rgba(125, 125, 125, 0.06); border: 1px solid rgba(125, 125, 125, 0.16); border-radius: 16px; padding: 0.85rem 1.2rem; margin: 0.6rem 0;">
-            <div style="display: flex; align-items: center; gap: 12px;">
-                <div style="background: {ng['color']}; color: #ffffff; font-size: 1.4rem; font-weight: 900; width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center; justify-content: center;">
-                    {ng['grade']}
-                </div>
-                <div>
-                    <div style="font-size: 0.75rem; font-weight: 800; opacity: 0.75; text-transform: uppercase;">Indeks Nutri-Grade & GGL</div>
-                    <div style="font-size: 1.0rem; font-weight: 800;">{ng['label']}</div>
-                </div>
-            </div>
-            <div style="display: flex; gap: 6px; flex-wrap: wrap;">{badges_html}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    # KARTU PREVIEW & SIMPAN TUNGGAL ANTI-DOBEL + MINI-REKAP HARI INI
+    if st.session_state.get("nutrition_data"):
+        if st.session_state.get("preview_origin_tab", "scanner") == "scanner":
+            st.markdown("---")
+            render_nutrition_preview_card("scanner", current_user, active_diary_date_str, user_tz, is_admin)
+        else:
+            st.info(f"🍽️ Sedang ada Preview terbuka untuk **{st.session_state['nutrition_data'].get('dish_name')}** di tab lain.")
 
-        # Kartu 4 Makro Utama
-        c1, c2, c3, c4 = st.columns(4)
-        c1.markdown(f"<div class='macro-pill'><div class='macro-num'>{t_tot['energy_kcal']}</div><div class='macro-lbl'>Kalori (kkal)</div></div>", unsafe_allow_html=True)
-        c2.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#0284c7;'>{t_tot['protein_g']}g</div><div class='macro-lbl'>Protein</div></div>", unsafe_allow_html=True)
-        c3.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#d97706;'>{t_tot['fat_g']}g</div><div class='macro-lbl'>Lemak</div></div>", unsafe_allow_html=True)
-        c4.markdown(f"<div class='macro-pill'><div class='macro-num' style='color:#059669;'>{t_tot['carb_g']}g</div><div class='macro-lbl'>Karbohidrat</div></div>", unsafe_allow_html=True)
-
-        # Pilihan Kategori Waktu Makan & Tombol Simpan Langsung di Atas (Tanpa Perlu Scroll Jauh)
-        curr_h = get_local_now(user_tz).hour
-        def_idx = 0 if 4 <= curr_h < 11 else (1 if 11 <= curr_h < 16 else (2 if 16 <= curr_h < 21 else 3))
-
-        MEAL_SCAN_MAP = {
-            "🌅 Sarapan": "Sarapan",
-            "☀️ Makan Siang": "Makan Siang",
-            "🌙 Makan Malam": "Makan Malam",
-            "🍪 Camilan": "Camilan"
-        }
-        st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
-        sel_meal_label = st.radio(
-            "Waktu Makan:",
-            list(MEAL_SCAN_MAP.keys()),
-            horizontal=True,
-            index=def_idx,
-            label_visibility="collapsed"
-        )
-        sel_meal_clean = MEAL_SCAN_MAP[sel_meal_label]
-        
-        col_act1, col_act2 = st.columns([3, 1])
-        with col_act1:
-            if st.button(f"💾 Simpan ke Buku Harian ({st.session_state['user']['display_name']})", type="primary", use_container_width=True):
-                res_log = log_meal(
-                    user_id=st.session_state["user"]["user_id"],
-                    dish_name=data.get("dish_name", "Menu Sehat"),
-                    totals=t_tot,
-                    multiplier=p_mult,
-                    caption=data.get("user_caption", ""),
-                    meal_type=sel_meal_clean,
-                    log_date=active_diary_date_str,
-                    tz_offset=user_tz
-                )
-                st.session_state["last_saved_item"] = res_log
-                st.session_state["nutrition_data"] = None
-                st.toast(f"✅ {data.get('dish_name')} berhasil disimpan ke {sel_meal_clean}!")
-                st.rerun()
-        with col_act2:
-            if st.button("❌ Bersihkan", use_container_width=True):
-                st.session_state["nutrition_data"] = None
-                st.rerun()
-
-        if data.get("health_tip"):
-            st.markdown(f"""
-            <div class="apple-tip">
-                💡 <strong>Saran Nutrisi:</strong> {data['health_tip']}
-            </div>
-            """, unsafe_allow_html=True)
-
-        # Rincian Komposisi & Edit Gizi di dalam Expander Rapi
-        with st.expander("🔍 **Lihat Rincian Komposisi Lab & Koreksi Angka Gizi**", expanded=False):
-            table_rows = []
-            for it in calc_res["items"]:
-                table_rows.append({
-                    "Bahan": it["input_name"],
-                    "Referensi Lab": it["tkpi_matched_name"],
-                    "Berat": f"{it['weight_g']} g",
-                    "Kalori": f"{it['energy_kcal']} kkal",
-                    "Protein": f"{it['protein_g']} g",
-                    "Lemak": f"{it['fat_g']} g",
-                    "Karbo": f"{it['carb_g']} g"
-                })
-            st.dataframe(table_rows, use_container_width=True, hide_index=True)
-
-            st.markdown("##### ✏️ **Koreksi / Edit Nilai Gizi**")
-            ed_c1, ed_c2 = st.columns(2)
-            with ed_c1:
-                ed_name = st.text_input("Nama Pangan / Produk:", value=data.get("dish_name", "Menu Makanan"), key="ed_res_name")
-                ed_cat = st.text_input("Kategori Pangan:", value="Produk Terverifikasi MN", key="ed_res_cat")
-                ed_bc = st.text_input("Nomor Barcode (Opsional):", value=str(data.get("barcode") or ""), key="ed_res_bc")
-                ed_serv = st.text_input("Satuan Saji:", value=str(data.get("serving_unit") or "1 porsi"), key="ed_res_serv")
-            with ed_c2:
-                ed_kcal = st.number_input("Kalori (kkal):", min_value=0.0, value=float(t_tot["energy_kcal"]), step=5.0, key="ed_res_kcal")
-                ed_p = st.number_input("Protein (g):", min_value=0.0, value=float(t_tot["protein_g"]), step=0.5, key="ed_res_p")
-                ed_f = st.number_input("Lemak (g):", min_value=0.0, value=float(t_tot["fat_g"]), step=0.5, key="ed_res_f")
-                ed_c = st.number_input("Karbohidrat (g):", min_value=0.0, value=float(t_tot["carb_g"]), step=0.5, key="ed_res_c")
-
-            col_pub1, col_pub2 = st.columns(2)
-            with col_pub1:
-                if st.button("✅ Terapkan Koreksi ke Hasil Ini", use_container_width=True, key="btn_apply_edit_local"):
-                    st.session_state["nutrition_data"]["dish_name"] = ed_name
-                    st.session_state["nutrition_data"]["components"] = [{
-                        "name": ed_name,
-                        "weight_g": 100.0,
-                        "energy_kcal_per_100g": ed_kcal,
-                        "protein_g_per_100g": ed_p,
-                        "fat_g_per_100g": ed_f,
-                        "carb_g_per_100g": ed_c,
-                        "fiber_g_per_100g": float(t_tot.get("fiber_g", 0.0))
-                    }]
-                    st.toast("Nilai gizi pada kartu hasil berhasil diperbarui!")
-                    st.rerun()
-            with col_pub2:
-                if is_admin:
-                    if st.button("🚀 Publikasikan Resmi ke Katalog Utama (Admin)", type="primary", use_container_width=True, key="btn_pub_catalog_now"):
-                        publish_food_to_catalog(
-                            food_name=ed_name, category=ed_cat,
-                            kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
-                            fib_100=float(t_tot.get("fiber_g", 0.0)),
-                            barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0
-                        )
-                        st.success(f"🎉 '{ed_name}' berhasil dipublikasikan secara resmi ke katalog utama!")
-                else:
-                    if st.button("📥 Ajukan ke Antrean Kurasi Admin", type="primary", use_container_width=True, key="btn_stage_catalog_now"):
-                        stage_pending_food(
-                            food_name=ed_name, category=ed_cat,
-                            kcal_100=ed_kcal, p_100=ed_p, f_100=ed_f, c_100=ed_c,
-                            fib_100=float(t_tot.get("fiber_g", 0.0)),
-                            barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0,
-                            source_origin="Koreksi Pengguna", submitted_by=current_user["user_id"]
-                        )
-                        st.success("✅ Berhasil diajukan ke antrean kurasi Admin sebelum dipublikasikan!")
+    st.markdown("---")
+    with st.expander(f"📋 **Sudah Masuk Hari Ini ({stats['today_totals']['count']} Menu · {today_kcal:,.1f} kkal)**", expanded=bool(stats["today_meals"])):
+        if stats["today_meals"]:
+            for mr in stats["today_meals"]:
+                mr_c1, mr_c2, mr_c3 = st.columns([3.2, 1.5, 0.6], vertical_alignment="center")
+                with mr_c1:
+                    st.markdown(f"**[{_normalize_meal_key(mr.get('meal_type'))}] {mr['dish_name']}**")
+                with mr_c2:
+                    st.caption(f"{mr['energy_kcal']} kkal")
+                with mr_c3:
+                    if st.button("🗑️", key=f"mini_del_{mr['id']}", help="Hapus dari hari ini"):
+                        delete_meal_log(mr["id"], st.session_state["user"]["user_id"])
+                        st.toast("Catatan dihapus.")
+                        st.rerun()
+        else:
+            st.caption("Belum ada makanan yang disimpan pada tanggal ini. Setelah Analisis, klik **💾 Simpan ke Buku Harian**.")
 
 # ================= TAB 3: SUMBER DATA & ENSIKLOPEDIA NUTRISI =================
 with tab_sources:
@@ -2000,8 +2254,49 @@ with tab_sources:
             })
         st.dataframe(table_kb, use_container_width=True, hide_index=True)
         st.caption(f"Menampilkan {len(results)} hasil teratas dari total {total_db_count:,} entri pangan terverifikasi.")
+
+        # Catat Langsung dari Hasil Pencarian Database (0 Kuota AI)
+        with st.container(border=True):
+            st.markdown("##### ⚡ **Catat Langsung dari Database TKPI (0 Kuota AI)**")
+            db_c1, db_c2, db_c3 = st.columns([2.2, 1.0, 1.3], vertical_alignment="bottom")
+            with db_c1:
+                pick_idx = st.selectbox(
+                    "Pilih pangan dari tabel di atas:",
+                    range(len(results)),
+                    format_func=lambda idx: f"{results[idx][0]} ({results[idx][2]} kkal/100g)",
+                    key="db_pick_idx"
+                )
+            with db_c2:
+                pick_grams = st.number_input("Berat (gram):", min_value=5.0, max_value=2000.0, value=100.0, step=10.0, key="db_pick_grams")
+            with db_c3:
+                if st.button("➕ Preview & Catat", type="primary", use_container_width=True, key="btn_db_to_preview"):
+                    chosen = results[pick_idx]
+                    _open_food_preview({
+                        "dish_name": chosen[0],
+                        "confidence": "high",
+                        "portion_category": f"{pick_grams:.0f}g dari database TKPI",
+                        "serving_reference": f"{pick_grams:.0f} gram (basis data lab per 100g)",
+                        "user_caption": f"Database Lab ({pick_grams:.0f}g)",
+                        "components": [{
+                            "name": chosen[0],
+                            "weight_g": float(pick_grams),
+                            "energy_kcal_per_100g": float(chosen[2] or 0.0),
+                            "protein_g_per_100g": float(chosen[3] or 0.0),
+                            "fat_g_per_100g": float(chosen[4] or 0.0),
+                            "carb_g_per_100g": float(chosen[5] or 0.0),
+                            "fiber_g_per_100g": float(chosen[6] or 0.0),
+                            "sodium_mg_per_100g": float(chosen[7] or 0.0),
+                            "custom_override": True,
+                            "source_label": f"Katalog Resmi ({chosen[1] or 'TKPI'})"
+                        }],
+                        "health_tip": "Data resmi terverifikasi lab TKPI Kemenkes / Open Food Facts."
+                    }, origin_tab="database")
+                    st.rerun()
     else:
         st.info("Tidak ada bahan makanan yang cocok dengan kata kunci tersebut. Coba kata kunci lain.")
+
+    if st.session_state.get("nutrition_data") and st.session_state.get("preview_origin_tab") == "database":
+        render_nutrition_preview_card("database", current_user, active_diary_date_str, user_tz, is_admin)
 
 # ================= TAB 4: PANDUAN PENGGUNAAN =================
 with tab_guide:
@@ -2040,15 +2335,15 @@ with tab_guide:
         with st.container(border=True):
             st.markdown("### 3️⃣ **3 Cara Mudah Mencatat Makanan**")
             st.markdown("""
-            * **Cara A (1-Klik Tanpa Ketik):** Sentuh langsung tombol menu harian populer di halaman depan!
-            * **Cara B (Foto Piring HP):** Buka tab **📸 Catat**, klik *Browse files* untuk memotret atau memilih foto dari galeri *(5x/hari pada Open Beta)*.
-            * **Cara C (Teks AI & Barcode):** Ketik nama masakan atau cek barcode produk ritel secara *unlimited*.
+            * **Cara A (1-Klik & Preview Cepat):** Sentuh menu *Sering Kamu Makan*, *Menu Populer*, atau ketik langsung di Beranda — semua tampil sebagai **Preview anti-dobel** sebelum disimpan!
+            * **Cara B (Foto Piring HP):** Buka tab **📸 Catat**, unggah foto *(5x/hari Open Beta)*; hidangan se-loyang/wadah besar otomatis ditaksir 1 porsi wajar.
+            * **Cara C (Teks AI, Barcode, & Database TKPI):** Ketik menu, pindai barcode, atau catat langsung dari **1.301+ pangan tab Database** secara *unlimited*.
             """)
 
         with st.container(border=True):
-            st.markdown("### 4️⃣ **Skor Nutri-Grade, Berat Badan & Streak**")
+            st.markdown("### 4️⃣ **Edit Inline, Nutri-Grade, Berat Badan & Streak**")
             st.markdown("""
-            * **Nutri-Grade (A–D) & Rambu GGL:** Setiap makanan dilengkapi skor kesehatan (A s/d D) dan rambu kepadatan kalori, protein, lemak, & natrium.
+            * **Edit 2-Detik & Anti-Dobel:** Salah waktu makan atau ukuran porsi? Klik **`✏️`** di Buku Harian atau ubah di kartu Preview tanpa khawatir menu ter-double.
             * **Pelacak Berat Badan & Streak:** Catat berat badan berkala dan bangun **Streak Harian** agar kebiasaan makan sehat makin konsisten.
             """)
 
@@ -2066,7 +2361,7 @@ with tab_guide:
     with st.expander("❓ Dari mana data kalori dan nutrisi ini diambil?"):
         st.write("Data nutrisi kami berbasis Tabel Komposisi Pangan Indonesia (TKPI) resmi Kementerian Kesehatan RI, USDA FoodData Central, Open Food Facts Global Database, dan NilaiGizi.")
     with st.expander("❓ Bagaimana jika hasil estimasi porsi ingin saya sesuaikan?"):
-        st.write("Anda dapat menggeser slider ukuran porsi (Sedikit 0.7x, Normal 1.0x, Banyak 1.3x, Jumbo 1.5x) atau membuka menu 'Lihat Rincian Komposisi Lab & Koreksi Angka Gizi' sebelum menekan tombol Simpan.")
+        st.write("Anda dapat menggeser slider ukuran porsi mulai dari ¼ Porsi (0.25x), ½ Porsi (0.5x), ¾ Porsi (0.75x), 1x, 1.5x, hingga 2x Porsi, melepas centang komponen bahan yang tidak dimakan, atau mengedit langsung lewat tombol ✏️ di Buku Harian.")
     with st.expander("⚖️ Disclaimer Medis & Edukasi Gizi"):
         st.write(
             "Nutrisi Cerdas adalah alat bantu edukasi dan pemantauan gizi harian berbasis TKPI Kemenkes RI. "
