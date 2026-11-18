@@ -3,13 +3,70 @@ Google OAuth 2.0 Helper untuk Platform Nutrisi Cerdas
 Menghandle pembuatan URL login Google dan pertukaran auth code menjadi data profil user (email, nama, foto).
 """
 
+import hashlib
+import hmac
 import os
+import secrets
+import threading
+import time
 import urllib.parse
 import requests
 
-import os
-import urllib.parse
-import requests
+_MODULE_MTIME = round(os.path.getmtime(__file__), 6) if os.path.exists(__file__) else 0.0
+_OAUTH_STATE_LOCK = threading.Lock()
+_CONSUMED_OAUTH_STATES: dict[str, int] = {}
+_FALLBACK_STATE_SECRET = secrets.token_bytes(32)
+
+
+def _get_oauth_state_secret() -> bytes:
+    """Mengambil kunci penandatangan HMAC untuk parameter OAuth state tanpa hardcode."""
+    try:
+        from db_history import _get_session_secret_key
+        return _get_session_secret_key()
+    except Exception:
+        _, sec = get_credentials()
+        if sec:
+            return hashlib.sha256(f"nutrisi_cerdas_oauth::{sec}".encode("utf-8")).digest()
+        return _FALLBACK_STATE_SECRET
+
+
+def create_oauth_state(ttl_seconds: int = 600) -> str:
+    """Membuat parameter state bertanda tangan HMAC dengan nonce acak sekali pakai (anti-Login CSRF)."""
+    exp_ts = int(time.time()) + int(ttl_seconds)
+    nonce = secrets.token_hex(12)
+    key = _get_oauth_state_secret()
+    sig = hmac.new(key, f"oauth|{exp_ts}|{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    return f"{exp_ts}.{nonce}.{sig}"
+
+
+def verify_oauth_state(state: str, max_ttl_seconds: int = 600, consume: bool = True) -> bool:
+    """Memvalidasi integritas, masa berlaku, dan keunikan parameter state OAuth."""
+    raw = str(state or "").strip()
+    parts = raw.split(".")
+    if len(parts) != 3:
+        return False
+    exp_str, nonce, sig = parts
+    if not exp_str.isdigit() or len(nonce) < 8 or len(sig) != 24:
+        return False
+    exp_ts = int(exp_str)
+    now_ts = int(time.time())
+    if exp_ts <= now_ts or exp_ts > (now_ts + max_ttl_seconds + 60):
+        return False
+    key = _get_oauth_state_secret()
+    expected = hmac.new(key, f"oauth|{exp_ts}|{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    if not hmac.compare_digest(expected, sig):
+        return False
+
+    with _OAUTH_STATE_LOCK:
+        expired_keys = [k for k, ts in _CONSUMED_OAUTH_STATES.items() if ts <= now_ts]
+        for k in expired_keys:
+            _CONSUMED_OAUTH_STATES.pop(k, None)
+        if nonce in _CONSUMED_OAUTH_STATES:
+            return False
+        if consume:
+            _CONSUMED_OAUTH_STATES[nonce] = exp_ts
+    return True
+
 
 def get_credentials():
     """Mengambil credentials dari environment atau st.secrets tanpa hardcode."""
@@ -27,8 +84,8 @@ def get_credentials():
         
     return client_id, client_secret
 
-def get_google_auth_url(redirect_uri: str) -> str:
-    """Membuat URL resmi Sign-In with Google."""
+def get_google_auth_url(redirect_uri: str, state: str = None) -> str:
+    """Membuat URL resmi Sign-In with Google lengkap dengan parameter state anti-CSRF."""
     client_id, _ = get_credentials()
     if not client_id:
         return "#"
@@ -40,7 +97,8 @@ def get_google_auth_url(redirect_uri: str) -> str:
         "response_type": "code",
         "scope": "openid email profile",
         "access_type": "online",
-        "prompt": "select_account"
+        "prompt": "select_account",
+        "state": state or create_oauth_state(),
     }
     return f"{base_url}?{urllib.parse.urlencode(params)}"
 

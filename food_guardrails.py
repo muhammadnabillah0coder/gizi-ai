@@ -6,8 +6,10 @@ angka fisika gizi palsu, dan injeksi prompt/HTML mencemari aplikasi maupun datab
 """
 
 import html
+import math
 import os
 import re
+import warnings
 
 _MODULE_MTIME = round(os.path.getmtime(__file__), 6) if os.path.exists(__file__) else 0.0
 
@@ -19,6 +21,13 @@ MAX_DENSITY_KCAL_PER_100G = 920.0
 MAX_DAILY_MEALS_PER_USER = 25
 MAX_DAILY_KCAL_PER_USER = 12000.0
 MAX_FREE_UNCLEAR_IMAGE_RETRIES_PER_DAY = 2
+MAX_SAFE_IMAGE_PIXELS = 25_000_000
+
+try:
+    from PIL import Image as _PIL_Image
+    _PIL_Image.MAX_IMAGE_PIXELS = MAX_SAFE_IMAGE_PIXELS
+except Exception:
+    pass
 
 # Frasa kuliner Indonesia sah yang memakai nama hewan/benda agar tidak pernah salah diblokir
 CULINARY_IDIOM_ALLOWLIST = (
@@ -145,6 +154,49 @@ def sanitize_html_text(value, default: str = "") -> str:
     """Meng-escape tag HTML dari input user/AI sebelum dirender ke blok markdown unsafe_allow_html."""
     raw = default if value is None else str(value)
     return html.escape(raw, quote=True)
+
+
+def sanitize_csv_cell(value):
+    """Mencegah CSV formula injection (=, +, -, @, tab, CR) pada kolom teks saat ekspor CSV/Excel."""
+    if not isinstance(value, str) or not value:
+        return value
+    stripped = value.lstrip()
+    if value[0] in ("=", "+", "-", "@", "\t", "\r") or (stripped and stripped[0] in ("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def open_safe_image(image_source, max_pixels: int = MAX_SAFE_IMAGE_PIXELS):
+    """Membuka file/bytes gambar dengan batas resolusi maksimum untuk mencegah serangan OOM/decompression bomb."""
+    from PIL import Image, UnidentifiedImageError
+
+    Image.MAX_IMAGE_PIXELS = max_pixels
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        try:
+            img = Image.open(image_source)
+            w, h = img.size
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+            raise FoodGuardrailRejected(
+                "non_food",
+                "Resolusi gambar terlalu besar (maks. 25 megapiksel). Perkecil resolusi gambar lalu coba lagi.",
+            )
+        except UnidentifiedImageError:
+            raise FoodGuardrailRejected(
+                "non_food",
+                "Berkas yang diunggah bukan gambar valid (gunakan format JPG, PNG, atau WebP).",
+            )
+
+    if w <= 0 or h <= 0 or (w * h) > max_pixels:
+        try:
+            img.close()
+        except Exception:
+            pass
+        raise FoodGuardrailRejected(
+            "non_food",
+            "Resolusi gambar melebihi batas aman (maks. 25 megapiksel).",
+        )
+    return img
 
 
 def _mask_culinary_idioms(text: str) -> str:
@@ -321,14 +373,23 @@ def _check_quantity_plausibility(text: str, allow_trailing_model_code: bool = Fa
             )
 
 
-def validate_food_text_query(text_input: str) -> str:
-    """Memvalidasi teks menu makanan pengguna sebelum memanggil Gemini API (0 token bila invalid)."""
-    clean = " ".join((text_input or "").strip().split())
+def _validate_food_name_core(raw_text: str, allow_trailing_model_code: bool = False) -> str:
+    clean = " ".join((raw_text or "").strip().split())
+    if clean.startswith(("=", "@")):
+        raise FoodGuardrailRejected(
+            "prompt_injection",
+            "Format awal teks ('=' atau '@') tidak valid sebagai nama makanan.",
+        )
     check_prompt_injection(clean)
     _check_text_gibberish(clean)
     _check_taboo_and_non_food(clean)
-    _check_quantity_plausibility(clean)
+    _check_quantity_plausibility(clean, allow_trailing_model_code=allow_trailing_model_code)
     return clean
+
+
+def validate_food_text_query(text_input: str) -> str:
+    """Memvalidasi teks menu makanan pengguna sebelum memanggil Gemini API (0 token bila invalid)."""
+    return _validate_food_name_core(text_input, allow_trailing_model_code=False)
 
 
 def validate_photo_caption(caption: str) -> str:
@@ -361,6 +422,8 @@ def validate_nutrition_sanity(
     fib = float(fiber_g or 0.0)
     w = float(weight_g or 100.0)
 
+    if any(not math.isfinite(v) for v in (kcal, p, f, c, fib, w)):
+        raise FoodGuardrailRejected("invalid_nutrition", "Angka nutrisi harus berupa bilangan nyata (bukan NaN/Infinity).")
     if any(v < 0 for v in (kcal, p, f, c, fib)) or w <= 0:
         raise FoodGuardrailRejected("invalid_nutrition", "Angka nutrisi atau berat pangan tidak boleh negatif.")
 
@@ -411,11 +474,7 @@ def validate_food_candidate(
     is_catalog_entry: bool = True,
 ) -> str:
     """Memvalidasi kelayakan nama pangan sekaligus kewajaran angka gizinya sebelum disimpan ke katalog/staging."""
-    clean_name = " ".join((food_name or "").strip().split())
-    check_prompt_injection(clean_name)
-    _check_text_gibberish(clean_name)
-    _check_taboo_and_non_food(clean_name)
-    _check_quantity_plausibility(clean_name, allow_trailing_model_code=is_catalog_entry)
+    clean_name = _validate_food_name_core(food_name, allow_trailing_model_code=is_catalog_entry)
     validate_nutrition_sanity(
         energy_kcal=energy_kcal,
         protein_g=protein_g,

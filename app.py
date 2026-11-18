@@ -18,6 +18,7 @@ import importlib
 import sqlite3
 import food_guardrails
 import gemini_extractor
+import google_auth
 import nutrition_engine
 import db_history
 
@@ -44,6 +45,7 @@ def _sync_module_from_disk(mod):
 
 food_guardrails = _sync_module_from_disk(food_guardrails)
 gemini_extractor = _sync_module_from_disk(gemini_extractor)
+google_auth = _sync_module_from_disk(google_auth)
 nutrition_engine = _sync_module_from_disk(nutrition_engine)
 db_history = _sync_module_from_disk(db_history)
 
@@ -51,6 +53,8 @@ from food_guardrails import (
     FoodGuardrailRejected,
     MAX_FREE_UNCLEAR_IMAGE_RETRIES_PER_DAY,
     is_excluded_from_public_catalog,
+    open_safe_image,
+    sanitize_csv_cell,
     sanitize_html_text,
     validate_extracted_dish_totals,
     validate_food_candidate,
@@ -72,18 +76,27 @@ from db_history import (
     is_admin_user, register_user, authenticate_user,
     stage_pending_food, get_pending_foods, publish_food_to_catalog, reject_pending_food,
     export_user_data_json, import_user_data_json,
-    get_local_now, create_session_token, verify_session_token,
+    get_local_now, create_session_token, verify_session_token, session_token_needs_refresh,
     update_user_preferences, log_weight_entry, get_weight_history, get_logging_streak,
     get_storage_backend_info, get_dashboard_bundle
 )
-from google_auth import get_google_auth_url, exchange_code_for_user
+from google_auth import get_google_auth_url, exchange_code_for_user, verify_oauth_state
 
-APP_VERSION = "v4.0.0-beta"
+APP_VERSION = "v4.1.1-beta"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v4.0.0-beta (Terbaru)",
+        "version": "v4.1.1-beta (Terbaru)",
+        "date": "18 Nov 2026",
+        "highlights": [
+            "🔒 Hardening Keamanan Lengkap (Bug Hunter Pass 2): Enforcement kuota AI Vision pada scanner label kemasan, anti-CSRF OAuth `state`, & token URL sesi bergulir 30 hari.",
+            "🛡️ Proteksi Backup & CSV: Restore `.json` kini melewati guardrail pangan/gizi, progress bar aman dari nilai negatif, ekspor CSV bebas formula injection (`=`, `+`, `-`, `@`).",
+            "⚖️ Konsistensi Batas Harian & Decompression Guard: Edit/skala porsi/salin kemarin mematuhi batas 12.000 kkal & 25 menu/hari; gambar dibatasi aman maks. 25 megapiksel."
+        ]
+    },
+    {
+        "version": "v4.0.0-beta",
         "date": "18 Nov 2026",
         "highlights": [
             "🛡️ Alur 1-Pintu Anti-Double: Auto-save diam-diam dihapus! Semua jalur catat menampilkan Preview dulu; edit sesi/porsi setelah simpan meng-update catatan yang sama.",
@@ -223,6 +236,71 @@ def _consume_scan_or_free_unclear(uid: str, tz_offset: int, g_err: FoodGuardrail
         _mark_db_mutated()
 
 
+def _render_scan_quota_exhausted_notice(active_user: dict, sc_status: dict):
+    """Menampilkan informasi batas kuota scan foto harian secara seragam pada semua pemindai visual."""
+    max_sc = sc_status["max_scans"]
+    if active_user["user_id"] == "Tamu (Demo)":
+        st.warning(f"⚠️ **Batas Scan Foto Mode Demo Tercapai ({max_sc}/{max_sc} Hari Ini).**")
+        st.info("Buat akun gratis dalam 15 detik di bagian atas untuk membuka **5x Scan Foto AI/hari** (3x makan berat + 2x jajan) atau gunakan tab **✍️ Ketik & Menu Cepat** sepuasnya!")
+    else:
+        st.warning(f"⚠️ **Kuota Scan Foto Hari Ini Tercapai ({max_sc}/{max_sc} — 3x Makan Berat & 2x Jajan).**")
+        st.info("Jangan khawatir! Anda tetap bisa mencatat **sepuasnya tanpa batas** melalui tab **✍️ Ketik & Menu Cepat**, **1-Klik Menu Harian**, atau **🏷️ Barcode & Manual**.")
+
+
+def _safe_open_uploaded_image(uploaded_file):
+    """Membuka foto unggahan dengan proteksi batas piksel 25MP dan penanganan error ramah pengguna."""
+    try:
+        return open_safe_image(uploaded_file)
+    except FoodGuardrailRejected as g_err:
+        _render_guardrail_rejection_card(g_err)
+    except Exception as exc:
+        st.error(f"Gagal membaca file gambar: {exc}")
+    return None
+
+
+def _execute_vision_scan_and_open_preview(
+    img_obj,
+    prompt_caption: str,
+    notice_channel: str,
+    active_user: dict,
+    tz_offset: int,
+    api_key_val: str,
+    sc_status: dict,
+    spinner_text: str,
+    user_caption: str = "",
+    source_origin: str = "",
+    toast_msg: str = "",
+):
+    """Menjalankan scan Vision AI secara aman dengan gerbang kuota, guardrail porsi, dan Preview terpadu."""
+    if not sc_status.get("can_scan"):
+        _render_scan_quota_exhausted_notice(active_user, sc_status)
+        return
+    if not api_key_val:
+        st.warning("⚠️ API Key AI belum disetel di Secrets server.")
+        return
+    with st.spinner(spinner_text):
+        try:
+            res = analyze_food_image(img_obj, caption=prompt_caption, api_key=api_key_val)
+            calc_chk = calculate_dish_nutrition(res.get("components", []), auto_learn=False)
+            validate_extracted_dish_totals(res.get("dish_name", ""), calc_chk["totals"])
+            if user_caption:
+                res["user_caption"] = user_caption
+            if source_origin:
+                res["source_origin"] = source_origin
+            record_scan_usage(active_user["user_id"], tz_offset=tz_offset)
+            _mark_db_mutated()
+            _open_food_preview(res, origin_tab="scanner")
+            if toast_msg:
+                st.toast(toast_msg)
+            st.rerun()
+        except FoodGuardrailRejected as g_err:
+            _consume_scan_or_free_unclear(active_user["user_id"], tz_offset, g_err)
+            st.session_state["scanner_guardrail_notice"] = (notice_channel, g_err.rejection_type, g_err.message)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Gagal memproses gambar: {exc}")
+
+
 def _analyze_and_open_text_preview(raw_text: str, api_key_val: str, origin_tab: str) -> FoodGuardrailRejected | None:
     """Validasi lokal 0-token lalu analisis teks AI + validasi total porsi sebelum membuka Preview."""
     try:
@@ -263,34 +341,39 @@ def _reset_ephemeral_user_state():
 
 _ensure_schema_ready(getattr(db_history, "_MODULE_MTIME", 0.0))
 
-# Tangani Redirect Google OAuth Callback (?code=...)
+# Tangani Redirect Google OAuth Callback (?code=...&state=...)
 auth_code = st.query_params.get("code", "")
+auth_state = st.query_params.get("state", "")
 if auth_code:
-    redirect_uri = "https://nutrisi-cerdas.streamlit.app"
-    user_info, err_details = exchange_code_for_user(auth_code, redirect_uri)
-    if not user_info:
-        user_info, err_details = exchange_code_for_user(auth_code, "https://nutrisicerdas.streamlit.app")
-        if not user_info:
-            user_info, err_details = exchange_code_for_user(auth_code, "http://localhost:8501")
-        
-    if user_info and user_info.get("email") and user_info.get("verified_email"):
-        email = user_info["email"].strip().lower()
-        name = user_info.get("name") or email.split("@")[0]
-        u = get_or_create_user(email, display_name=name, auth_provider="google")
-        st.session_state["user"] = u
-        _reset_ephemeral_user_state()
-        _mark_db_mutated()
+    if not verify_oauth_state(auth_state):
         st.query_params.clear()
-        st.query_params["u"] = u["user_id"]
-        st.query_params["s"] = create_session_token(u["user_id"])
-        st.query_params["auth"] = "google"
-        st.toast(f"Selamat datang, {name}! Akun Google Anda berhasil terhubung.")
-        st.rerun()
+        st.error("⚠️ Gagal memverifikasi sesi login Google: parameter keamanan `state` tidak valid atau telah kedaluwarsa. Silakan ulangi proses masuk.")
     else:
-        st.error(f"⚠️ Gagal memverifikasi login Google: {err_details}")
-        st.caption("Tips: Pastikan Redirect URI di Google Cloud Console persis `https://nutrisi-cerdas.streamlit.app` dan Client ID/Secret sudah ada di Secrets.")
+        redirect_uri = "https://nutrisi-cerdas.streamlit.app"
+        user_info, err_details = exchange_code_for_user(auth_code, redirect_uri)
+        if not user_info:
+            user_info, err_details = exchange_code_for_user(auth_code, "https://nutrisicerdas.streamlit.app")
+            if not user_info:
+                user_info, err_details = exchange_code_for_user(auth_code, "http://localhost:8501")
 
-# Inisialisasi Sesi Akun Pengguna dengan Verifikasi Token HMAC (Mencegah Pembajakan ?u=)
+        if user_info and user_info.get("email") and user_info.get("verified_email"):
+            email = user_info["email"].strip().lower()
+            name = user_info.get("name") or email.split("@")[0]
+            u = get_or_create_user(email, display_name=name, auth_provider="google")
+            st.session_state["user"] = u
+            _reset_ephemeral_user_state()
+            _mark_db_mutated()
+            st.query_params.clear()
+            st.query_params["u"] = u["user_id"]
+            st.query_params["s"] = create_session_token(u["user_id"])
+            st.query_params["auth"] = "google"
+            st.toast(f"Selamat datang, {name}! Akun Google Anda berhasil terhubung.")
+            st.rerun()
+        else:
+            st.error(f"⚠️ Gagal memverifikasi login Google: {err_details}")
+            st.caption("Tips: Pastikan Redirect URI di Google Cloud Console persis `https://nutrisi-cerdas.streamlit.app` dan Client ID/Secret sudah ada di Secrets.")
+
+# Inisialisasi Sesi Akun Pengguna dengan Verifikasi Token HMAC TTL 30 Hari (Mencegah Pembajakan ?u=)
 saved_user_param = st.query_params.get("u", "")
 saved_sig_param = st.query_params.get("s", "")
 saved_auth_param = st.query_params.get("auth", "local")
@@ -308,9 +391,12 @@ else:
     active_uid = st.session_state["user"]["user_id"]
     active_auth = st.session_state["user"].get("auth_provider", "local")
     if active_uid != "Tamu (Demo)":
-        st.query_params["u"] = active_uid
-        st.query_params["s"] = create_session_token(active_uid)
-        st.query_params["auth"] = active_auth
+        same_user_param = saved_user_param.strip().lower() == active_uid.lower()
+        tok_valid = same_user_param and verify_session_token(active_uid, saved_sig_param)
+        if not tok_valid or session_token_needs_refresh(saved_sig_param):
+            st.query_params["u"] = active_uid
+            st.query_params["s"] = create_session_token(active_uid)
+            st.query_params["auth"] = active_auth
 
 if "nutrition_data" not in st.session_state:
     st.session_state["nutrition_data"] = None
@@ -898,21 +984,24 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
             col_u1, col_u2, col_u3 = st.columns([2.2, 1.3, 1.3])
             with col_u1:
                 if st.button(f"🔄 Perbarui Catatan Ini ({sel_meal_clean})", type="primary", use_container_width=True, key=f"prev_btn_upd_{context_key}_{nonce}"):
-                    res_upd = update_meal_log(
-                        log_id=saved_id,
-                        user_id=active_user["user_id"],
-                        dish_name=data.get("dish_name", "Menu Sehat"),
-                        totals=t_tot,
-                        multiplier=p_mult,
-                        meal_type=sel_meal_clean,
-                    )
-                    if res_upd:
-                        st.session_state["last_saved_item"] = res_upd
-                    st.session_state["nutrition_data"]["saved_meal_type"] = sel_meal_clean
-                    st.session_state["nutrition_data"]["saved_multiplier"] = p_mult
-                    _mark_db_mutated()
-                    st.toast(f"🔄 Catatan diperbarui ke {sel_meal_clean} ({t_tot['energy_kcal']} kkal)!")
-                    st.rerun()
+                    try:
+                        res_upd = update_meal_log(
+                            log_id=saved_id,
+                            user_id=active_user["user_id"],
+                            dish_name=data.get("dish_name", "Menu Sehat"),
+                            totals=t_tot,
+                            multiplier=p_mult,
+                            meal_type=sel_meal_clean,
+                        )
+                        if res_upd:
+                            st.session_state["last_saved_item"] = res_upd
+                        st.session_state["nutrition_data"]["saved_meal_type"] = sel_meal_clean
+                        st.session_state["nutrition_data"]["saved_multiplier"] = p_mult
+                        _mark_db_mutated()
+                        st.toast(f"🔄 Catatan diperbarui ke {sel_meal_clean} ({t_tot['energy_kcal']} kkal)!")
+                        st.rerun()
+                    except FoodGuardrailRejected as g_err:
+                        _render_guardrail_rejection_card(g_err)
             with col_u2:
                 if st.button("↩️ Batalkan Simpan", use_container_width=True, key=f"prev_btn_undo_{context_key}_{nonce}"):
                     delete_meal_log(saved_id, active_user["user_id"])
@@ -988,10 +1077,14 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                             "carb_g": ed_c, "fiber_g": float(t_tot.get("fiber_g", 0.0)),
                             "sodium_mg": float(t_tot.get("sodium_mg", 0.0)),
                         }
-                        res_upd = update_meal_log(saved_id, active_user["user_id"], dish_name=clean_ed_name, totals=new_tot, multiplier=p_mult, meal_type=sel_meal_clean)
-                        if res_upd:
-                            st.session_state["last_saved_item"] = res_upd
-                        _mark_db_mutated()
+                        try:
+                            res_upd = update_meal_log(saved_id, active_user["user_id"], dish_name=clean_ed_name, totals=new_tot, multiplier=p_mult, meal_type=sel_meal_clean)
+                            if res_upd:
+                                st.session_state["last_saved_item"] = res_upd
+                            _mark_db_mutated()
+                        except FoodGuardrailRejected as g_err:
+                            _render_guardrail_rejection_card(g_err)
+                            return
                     st.toast("Nilai gizi pada kartu hasil berhasil diperbarui!")
                     st.rerun()
             with col_pub2:
@@ -1520,7 +1613,7 @@ streak_days = dash_bundle["streak_days"]
 target_kcal = float(st.session_state["user"].get("daily_calorie_target") or 2000.0)
 today_kcal = stats["today_totals"]["energy_kcal"]
 pct_today_actual = round((today_kcal / target_kcal) * 100, 1) if target_kcal > 0 else 0.0
-pct_today_bar = min(pct_today_actual / 100.0, 1.0)
+pct_today_bar = max(0.0, min(pct_today_actual / 100.0, 1.0))
 macro_targets = compute_macro_targets(target_kcal, user_focus)
 
 # ================= TAB 1: DASHBOARD REKAPAN KALORI =================
@@ -1792,7 +1885,7 @@ with tab_diary:
 
     # Widget Pelacak Air Minum Harian & Pelacak Berat Badan
     water_data = dash_bundle.get("water_data") or {"glasses": 0, "target": 8, "ml": 0}
-    water_pct = min(1.0, water_data["glasses"] / max(1, water_data["target"]))
+    water_pct = max(0.0, min(1.0, water_data["glasses"] / max(1, water_data["target"])))
     
     c_track1, c_track2 = st.columns([1.15, 1], gap="medium")
     with c_track1:
@@ -1926,11 +2019,15 @@ with tab_diary:
             """, unsafe_allow_html=True)
             
         with col_share2:
-            # Unduh CSV
+            # Unduh CSV aman dari formula injection (CWE-1236)
             df_export = pd.DataFrame(stats["today_meals"])
             if not df_export.empty:
                 cols_to_export = [c for c in ["logged_at", "meal_type", "dish_name", "energy_kcal", "protein_g", "fat_g", "carb_g", "fiber_g", "sodium_mg", "photo_caption"] if c in df_export.columns]
-                csv_data = df_export[cols_to_export].to_csv(index=False).encode('utf-8')
+                safe_df = df_export[cols_to_export].copy()
+                for txt_col in ("logged_at", "meal_type", "dish_name", "photo_caption"):
+                    if txt_col in safe_df.columns:
+                        safe_df[txt_col] = safe_df[txt_col].map(lambda v: sanitize_csv_cell(v) if isinstance(v, str) else v)
+                csv_data = safe_df.to_csv(index=False).encode('utf-8')
                 st.download_button("📥 Unduh Rekap (CSV/Excel)", data=csv_data, file_name=f"nutrisi_harian_{active_diary_date.strftime('%Y%m%d')}.csv", mime="text/csv", use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
@@ -2009,12 +2106,15 @@ with tab_diary:
                                 key=f"ed_mult_{m['id']}"
                             )
                             if st.button("💾 Simpan Perubahan", type="primary", use_container_width=True, key=f"btn_ed_save_{m['id']}"):
-                                res_sc = scale_meal_log_portion(m["id"], st.session_state["user"]["user_id"], ed_mult, new_meal_type=ed_mt)
-                                if res_sc:
-                                    st.session_state["last_saved_item"] = res_sc
-                                _mark_db_mutated()
-                                st.toast(f"✅ {m['dish_name']} diperbarui ({ed_mt}, {ed_mult}x)!")
-                                st.rerun()
+                                try:
+                                    res_sc = scale_meal_log_portion(m["id"], st.session_state["user"]["user_id"], ed_mult, new_meal_type=ed_mt)
+                                    if res_sc:
+                                        st.session_state["last_saved_item"] = res_sc
+                                    _mark_db_mutated()
+                                    st.toast(f"✅ {m['dish_name']} diperbarui ({ed_mt}, {ed_mult}x)!")
+                                    st.rerun()
+                                except FoodGuardrailRejected as g_err:
+                                    _render_guardrail_rejection_card(g_err)
                     with col_row4:
                         if st.button("🗑️", key=f"del_{m['id']}", help="Hapus menu ini", use_container_width=True):
                             delete_meal_log(m["id"], st.session_state["user"]["user_id"])
@@ -2066,44 +2166,33 @@ with tab_scanner:
                 cam_file = st.camera_input("Arahkan kamera ke piring makanan:")
                 
             active_img_file = up_file or cam_file
-            if active_img_file:
-                im = Image.open(active_img_file)
+            im = _safe_open_uploaded_image(active_img_file) if active_img_file else None
+            if im is not None:
                 st.image(im, caption="Foto Makanan Siap Dianalisis", use_container_width=True)
                 p_caption = st.text_input("💬 Catatan / Keterangan (Opsional):", placeholder="Contoh: Bumbu kacang dipisah / ayam tanpa kulit", max_chars=160, key="f_cap")
             else:
                 p_caption = ""
         with c_up2:
-            if active_img_file:
+            if im is not None:
                 st.markdown("#### Siap Menganalisis?")
                 st.caption("AI memindai porsi perorangan URT & mencocokkan ke 1.300+ data lab TKPI Kemenkes. Hasil akan tampil sebagai **Preview** terlebih dahulu agar Anda bisa cek porsi & sesi makan.")
 
                 if not scan_status["can_scan"]:
-                    max_sc = scan_status["max_scans"]
-                    if current_user["user_id"] == "Tamu (Demo)":
-                        st.warning(f"⚠️ **Batas Scan Foto Mode Demo Tercapai ({max_sc}/{max_sc} Hari Ini).**")
-                        st.info("Buat akun gratis dalam 15 detik di bagian atas untuk membuka **5x Scan Foto AI/hari** (3x makan berat + 2x jajan) atau gunakan tab **✍️ Ketik & Menu Cepat** sepuasnya!")
-                    else:
-                        st.warning(f"⚠️ **Kuota Scan Foto Hari Ini Tercapai ({max_sc}/{max_sc} — 3x Makan Berat & 2x Jajan).**")
-                        st.info("Jangan khawatir! Anda tetap bisa mencatat **sepuasnya tanpa batas** melalui tab **✍️ Ketik & Menu Cepat**, **1-Klik Menu Harian**, atau **🏷️ Barcode & Manual**.")
+                    _render_scan_quota_exhausted_notice(current_user, scan_status)
                 else:
                     if st.button("🔍 Cek & Hitung Gizi Foto", type="primary", use_container_width=True, key="btn_foto"):
-                        with st.spinner("Menganalisis visual foto makanan..."):
-                            try:
-                                res = analyze_food_image(im, caption=p_caption, api_key=api_key)
-                                calc_chk = calculate_dish_nutrition(res.get("components", []), auto_learn=False)
-                                validate_extracted_dish_totals(res.get("dish_name", ""), calc_chk["totals"])
-                                res["user_caption"] = p_caption or "Foto Piring"
-                                record_scan_usage(current_user["user_id"], tz_offset=user_tz)
-                                _mark_db_mutated()
-                                _open_food_preview(res, origin_tab="scanner")
-                                st.toast("🔍 Foto berhasil dianalisis! Cek porsi & pilih waktu makan di bawah sebelum Simpan.")
-                                st.rerun()
-                            except FoodGuardrailRejected as g_err:
-                                _consume_scan_or_free_unclear(current_user["user_id"], user_tz, g_err)
-                                st.session_state["scanner_guardrail_notice"] = ("foto", g_err.rejection_type, g_err.message)
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Gagal memproses gambar: {e}")
+                        _execute_vision_scan_and_open_preview(
+                            img_obj=im,
+                            prompt_caption=p_caption,
+                            notice_channel="foto",
+                            active_user=current_user,
+                            tz_offset=user_tz,
+                            api_key_val=api_key,
+                            sc_status=scan_status,
+                            spinner_text="Menganalisis visual foto makanan...",
+                            user_caption=p_caption or "Foto Piring",
+                            toast_msg="🔍 Foto berhasil dianalisis! Cek porsi & pilih waktu makan di bawah sebelum Simpan.",
+                        )
             else:
                 st.info("💡 **Tips Praktis:** Foto piring makan dari atas agar semua lauk, nasi, dan sayuran tampak jelas dalam 1 bingkai.")
 
@@ -2219,24 +2308,27 @@ with tab_scanner:
 
         with st.expander("📸 **Scan Foto Tabel Informasi Nilai Gizi Kemasan**", expanded=False):
             pkg_file = st.file_uploader("Pilih foto bungkus / label gizi kemasan:", type=["jpg", "jpeg", "png", "webp"], key="scan_pkg_img")
-            if pkg_file and api_key:
-                im_pkg = Image.open(pkg_file)
-                st.image(im_pkg, caption="Foto Kemasan / Label Gizi", width=260)
-                if st.button("🔬 Ekstrak Tabel Nilai Gizi Kemasan", type="primary", key="btn_scan_pkg"):
-                    with st.spinner("Membaca tabel nilai gizi pada kemasan..."):
-                        try:
-                            res = analyze_food_image(im_pkg, caption="Kemasan produk ritel / tabel informasi nilai gizi", api_key=api_key)
-                            calc_chk = calculate_dish_nutrition(res.get("components", []), auto_learn=False)
-                            validate_extracted_dish_totals(res.get("dish_name", ""), calc_chk["totals"])
-                            res["source_origin"] = "Ekstraksi Vision Label Gizi"
-                            _open_food_preview(res, origin_tab="scanner")
-                            st.rerun()
-                        except FoodGuardrailRejected as g_err:
-                            _consume_scan_or_free_unclear(current_user["user_id"], user_tz, g_err)
-                            st.session_state["scanner_guardrail_notice"] = ("pkg", g_err.rejection_type, g_err.message)
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Gagal membaca foto kemasan: {e}")
+            if pkg_file:
+                im_pkg = _safe_open_uploaded_image(pkg_file)
+                if im_pkg is not None:
+                    st.image(im_pkg, caption="Foto Kemasan / Label Gizi", width=260)
+                    if not scan_status["can_scan"]:
+                        _render_scan_quota_exhausted_notice(current_user, scan_status)
+                    elif not api_key:
+                        st.warning("⚠️ Vision AI belum aktif karena `GEMINI_API_KEY` belum disetel.")
+                    elif st.button("🔬 Ekstrak Tabel Nilai Gizi Kemasan", type="primary", key="btn_scan_pkg"):
+                        _execute_vision_scan_and_open_preview(
+                            img_obj=im_pkg,
+                            prompt_caption="Kemasan produk ritel / tabel informasi nilai gizi",
+                            notice_channel="pkg",
+                            active_user=current_user,
+                            tz_offset=user_tz,
+                            api_key_val=api_key,
+                            sc_status=scan_status,
+                            spinner_text="Membaca tabel nilai gizi pada kemasan...",
+                            source_origin="Ekstraksi Vision Label Gizi",
+                            toast_msg="🔬 Label gizi kemasan berhasil diekstrak! Cek porsi sebelum Simpan.",
+                        )
 
         with st.expander("➕ **Input Manual Makanan / Resep Sendiri**", expanded=False):
             col_m1, col_m2 = st.columns([1.4, 1], gap="large")
@@ -2297,20 +2389,23 @@ with tab_scanner:
                             col_cbtn1, col_cbtn2 = st.columns([2, 1])
                             with col_cbtn1:
                                 if st.button("➕ Catat Lagi", key=f"quick_log_{c_item['id']}", use_container_width=True):
-                                    res_log = log_meal(
-                                        user_id=st.session_state["user"]["user_id"],
-                                        dish_name=c_item["food_name"],
-                                        totals={"energy_kcal": c_item["energy_kcal"], "protein_g": c_item["protein_g"], "fat_g": c_item["fat_g"], "carb_g": c_item["carb_g"], "fiber_g": 0.0, "sodium_mg": 0.0},
-                                        multiplier=1.0,
-                                        caption="Koleksi Pribadi",
-                                        meal_type=m_meal_clean,
-                                        log_date=active_diary_date_str,
-                                        tz_offset=user_tz
-                                    )
-                                    st.session_state["last_saved_item"] = res_log
-                                    _mark_db_mutated()
-                                    st.toast(f"Berhasil mencatat {c_item['food_name']}!")
-                                    st.rerun()
+                                    try:
+                                        res_log = log_meal(
+                                            user_id=st.session_state["user"]["user_id"],
+                                            dish_name=c_item["food_name"],
+                                            totals={"energy_kcal": c_item["energy_kcal"], "protein_g": c_item["protein_g"], "fat_g": c_item["fat_g"], "carb_g": c_item["carb_g"], "fiber_g": 0.0, "sodium_mg": 0.0},
+                                            multiplier=1.0,
+                                            caption="Koleksi Pribadi",
+                                            meal_type=m_meal_clean,
+                                            log_date=active_diary_date_str,
+                                            tz_offset=user_tz
+                                        )
+                                        st.session_state["last_saved_item"] = res_log
+                                        _mark_db_mutated()
+                                        st.toast(f"Berhasil mencatat {c_item['food_name']}!")
+                                        st.rerun()
+                                    except FoodGuardrailRejected as g_err:
+                                        _render_guardrail_rejection_card(g_err)
                             with col_cbtn2:
                                 if st.button("🗑️", key=f"del_c_{c_item['id']}"):
                                     delete_custom_food(c_item["id"], st.session_state["user"]["user_id"])

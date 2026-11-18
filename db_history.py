@@ -5,19 +5,20 @@ Mendukung Dual-Backend otomatis:
 2. SQLite lokal (tkpi_nutrition.db) sebagai fallback otomatis & untuk uji lokal.
 """
 
-import sqlite3
-import os
-import hmac
 import hashlib
+import hmac
+import math
+import os
 import secrets
-import urllib.parse
+import sqlite3
 import ssl
-import time
 import threading
+import time
+import urllib.parse
 from collections import deque
-from decimal import Decimal
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from food_guardrails import (
     FoodGuardrailRejected,
     MAX_DAILY_KCAL_PER_USER,
@@ -25,6 +26,8 @@ from food_guardrails import (
     MAX_SINGLE_DISH_KCAL,
     validate_display_name,
     validate_food_candidate,
+    validate_food_text_query,
+    validate_nutrition_sanity,
 )
 
 try:
@@ -42,6 +45,7 @@ OPEN_BETA_MODE = True
 BETA_DAILY_SCAN_LIMIT = 5
 GUEST_DAILY_SCAN_LIMIT = 3
 DEFAULT_TIMEZONE_OFFSET = 8  # WITA (Tanah Grogot / Kaltim)
+SESSION_TOKEN_TTL_SECONDS = 30 * 86400  # 30 hari masa berlaku token tautan sesi ?u=&s=
 
 ADMIN_IDENTIFIERS = {
     "nabillah",
@@ -474,22 +478,45 @@ def _get_session_secret_key() -> bytes:
     return secret_hex.encode("utf-8")
 
 
-def create_session_token(user_id: str) -> str:
-    """Membuat token HMAC bertanda tangan agar ?u= hanya valid untuk pengguna yang sudah login."""
+def create_session_token(user_id: str, ttl_seconds: int = SESSION_TOKEN_TTL_SECONDS) -> str:
+    """Membuat token HMAC bertanda tangan dengan masa kedaluwarsa (default 30 hari)."""
     clean_id = (user_id or "").strip().lower()
     if not clean_id or clean_id == "tamu (demo)":
         return ""
+    exp_ts = int(time.time()) + int(ttl_seconds)
     key = _get_session_secret_key()
-    return hmac.new(key, clean_id.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    payload = f"{clean_id}|{exp_ts}".encode("utf-8")
+    sig = hmac.new(key, payload, hashlib.sha256).hexdigest()[:24]
+    return f"{exp_ts}.{sig}"
 
 
 def verify_session_token(user_id: str, token: str) -> bool:
-    """Memvalidasi token HMAC URL menggunakan perbandingan constant-time."""
+    """Memvalidasi integritas & masa berlaku token HMAC URL secara constant-time."""
     clean_id = (user_id or "").strip().lower()
-    if not clean_id or not token or clean_id == "tamu (demo)":
+    tok_str = str(token or "").strip()
+    if not clean_id or not tok_str or clean_id == "tamu (demo)" or "." not in tok_str:
         return False
-    expected = create_session_token(clean_id)
-    return hmac.compare_digest(expected, str(token).strip())
+    exp_str, sig_str = tok_str.split(".", 1)
+    if not exp_str.isdigit() or not sig_str:
+        return False
+    exp_ts = int(exp_str)
+    now_ts = int(time.time())
+    if exp_ts <= now_ts or exp_ts > (now_ts + SESSION_TOKEN_TTL_SECONDS + 300):
+        return False
+    key = _get_session_secret_key()
+    expected = hmac.new(key, f"{clean_id}|{exp_ts}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    return hmac.compare_digest(expected, sig_str)
+
+
+def session_token_needs_refresh(token: str, refresh_window_seconds: int = 15 * 86400) -> bool:
+    """Mengembalikan True bila token perlu diperbarui (hilang atau sisa masa aktif < 15 hari)."""
+    tok_str = str(token or "").strip()
+    if "." not in tok_str:
+        return True
+    exp_str = tok_str.split(".", 1)[0]
+    if not exp_str.isdigit():
+        return True
+    return (int(exp_str) - int(time.time())) < refresh_window_seconds
 
 
 def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
@@ -1009,7 +1036,15 @@ def get_or_create_user(user_id: str, display_name: str = "", auth_provider: str 
 
 
 def add_custom_food(user_id: str, food_name: str, serving_size: str, kcal: float, protein: float, fat: float, carb: float):
-    """Menyimpan makanan manual buatan pengguna sendiri."""
+    """Menyimpan makanan manual buatan pengguna sendiri setelah lolos guardrail pangan."""
+    clean_name = validate_food_candidate(
+        food_name=food_name,
+        energy_kcal=float(kcal or 0.0),
+        protein_g=float(protein or 0.0),
+        fat_g=float(fat or 0.0),
+        carb_g=float(carb or 0.0),
+        is_catalog_entry=False,
+    )
     now_str = get_local_now().strftime("%Y-%m-%d %H:%M:%S")
     with _db_session() as (conn, cur):
         cur.execute(
@@ -1017,7 +1052,7 @@ def add_custom_food(user_id: str, food_name: str, serving_size: str, kcal: float
             INSERT INTO custom_foods (user_id, food_name, serving_size, energy_kcal, protein_g, fat_g, carb_g, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, food_name, serving_size, float(kcal), float(protein), float(fat), float(carb), now_str),
+            (user_id, clean_name, (serving_size or "1 porsi").strip()[:50], float(kcal), float(protein), float(fat), float(carb), now_str),
         )
         conn.commit()
     return True
@@ -1038,8 +1073,12 @@ def delete_custom_food(food_id: int, user_id: str):
 
 
 def update_calorie_target(user_id: str, target_kcal: float):
+    val = float(target_kcal)
+    if not math.isfinite(val):
+        raise ValueError("Target kalori harus berupa angka nyata.")
+    bounded = max(800.0, min(5000.0, round(val, 1)))
     with _db_session() as (conn, cur):
-        cur.execute("UPDATE users SET daily_calorie_target = ? WHERE user_id = ?", (float(target_kcal), user_id))
+        cur.execute("UPDATE users SET daily_calorie_target = ? WHERE user_id = ?", (bounded, user_id))
         conn.commit()
 
 
@@ -1063,8 +1102,11 @@ def update_user_preferences(user_id: str, timezone_offset: int = None, focus_goa
 
 def log_weight_entry(user_id: str, weight_kg: float, note: str = "", tz_offset: int = DEFAULT_TIMEZONE_OFFSET, recorded_date: str = None):
     """Mencatat atau memperbarui berat badan harian ke tabel weight_logs sekaligus sinkron profil user."""
-    clean_w = round(float(weight_kg), 1)
-    if clean_w <= 0:
+    raw_w = float(weight_kg)
+    if not math.isfinite(raw_w):
+        return False
+    clean_w = round(raw_w, 1)
+    if clean_w < 20.0 or clean_w > 300.0:
         return False
     local_now = get_local_now(tz_offset)
     r_date = recorded_date or local_now.strftime("%Y-%m-%d")
@@ -1257,41 +1299,124 @@ def activate_pro_tier(user_id: str, days: int = 30):
     return expiry
 
 
-def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0, caption: str = "", meal_type: str = "Makan Siang", log_date: str = None, tz_offset: int = DEFAULT_TIMEZONE_OFFSET):
-    """Menyimpan satu catatan makan ke buku harian pengguna dengan penjagaan batas biologis harian."""
-    local_now = get_local_now(tz_offset)
-    target_d = log_date or local_now.strftime("%Y-%m-%d")
-    custom_timestamp = f"{target_d} {local_now.strftime('%H:%M:%S')}"
-    meal_kcal = _safe_float((totals or {}).get("energy_kcal"), 0.0)
-    if meal_kcal < 0 or meal_kcal > (MAX_SINGLE_DISH_KCAL * 1.5):
+def _validate_meal_nutrients(
+    dish_name: str,
+    totals: dict,
+    validate_name: bool = True,
+    check_macro_atwater: bool = False,
+    raw_item: dict = None,
+) -> tuple[str, dict]:
+    """Memvalidasi nama hidangan dan kewajaran nilai gizi (bebas negatif/NaN/ekstrem)."""
+    clean_dish = " ".join(str(dish_name or "").strip().split())
+    if validate_name:
+        clean_dish = validate_food_text_query(clean_dish)
+    elif not clean_dish:
+        raise FoodGuardrailRejected("non_food", "Nama makanan tidak boleh kosong.")
+
+    src = raw_item if raw_item is not None else (totals or {})
+    for k in ("energy_kcal", "protein_g", "fat_g", "carb_g", "fiber_g", "sodium_mg"):
+        v_raw = src.get(k)
+        if v_raw not in (None, ""):
+            try:
+                v_num = float(v_raw)
+            except (TypeError, ValueError):
+                raise FoodGuardrailRejected("invalid_nutrition", f"Nilai '{k}' tidak valid secara numerik.")
+            if not math.isfinite(v_num) or v_num < 0:
+                raise FoodGuardrailRejected("invalid_nutrition", "Angka nutrisi tidak boleh negatif atau NaN/Infinity.")
+
+    kcal = _safe_float(src.get("energy_kcal"), 0.0)
+    prot = _safe_float(src.get("protein_g"), 0.0)
+    fat = _safe_float(src.get("fat_g"), 0.0)
+    carb = _safe_float(src.get("carb_g"), 0.0)
+    fib = _safe_float(src.get("fiber_g"), 0.0)
+    sod = _safe_float(src.get("sodium_mg"), 0.0)
+
+    if kcal < 0 or kcal > (MAX_SINGLE_DISH_KCAL * 1.5):
         raise FoodGuardrailRejected(
             "implausible_portion",
-            f"Kalori satu catatan ({meal_kcal:,.1f} kkal) melebihi batas wajar per sajian.",
+            f"Kalori satu catatan ({kcal:,.1f} kkal) melebihi batas wajar per sajian.",
         )
+    if prot > 250.0 or fat > 250.0 or carb > 600.0 or fib > 150.0 or sod > 25000.0:
+        raise FoodGuardrailRejected("invalid_nutrition", "Nilai makronutrien/serat/natrium melebihi batas wajar sajian.")
 
-    with _db_session() as (conn, cur):
+    if check_macro_atwater:
+        has_macros = any(src.get(k) not in (None, "") for k in ("protein_g", "fat_g", "carb_g"))
+        if has_macros:
+            macro_sum = prot + fat + carb
+            atwater_kcal = (4.0 * prot) + (9.0 * fat) + (4.0 * carb)
+            if kcal >= 150.0 and macro_sum < (kcal / 12.0):
+                raise FoodGuardrailRejected(
+                    "invalid_nutrition",
+                    "Angka kalori tinggi dengan makronutrien hampir nol tidak konsisten secara ilmiah.",
+                )
+            if macro_sum >= 15.0 and atwater_kcal > 0 and kcal > max(atwater_kcal * 2.2 + 120.0, 300.0):
+                raise FoodGuardrailRejected(
+                    "invalid_nutrition",
+                    "Angka kalori tidak selaras dengan perhitungan Atwater (4P + 9L + 4K).",
+                )
+
+    return clean_dish, {
+        "energy_kcal": round(kcal, 1),
+        "protein_g": round(prot, 1),
+        "fat_g": round(fat, 1),
+        "carb_g": round(carb, 1),
+        "fiber_g": round(fib, 1),
+        "sodium_mg": round(sod, 1),
+    }
+
+
+def _get_daily_meal_usage(cur: _UnifiedCursor, user_id: str, target_date: str, exclude_log_id: int = None) -> tuple[int, float]:
+    """Mengambil jumlah catatan makan & akumulasi kalori pada tanggal tertentu."""
+    if exclude_log_id is not None:
+        day_row = cur.execute(
+            """
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(energy_kcal), 0.0) AS tot_k
+            FROM meal_logs
+            WHERE user_id = ? AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) = ? AND id != ?
+            """,
+            (user_id, target_date, exclude_log_id),
+        ).fetchone()
+    else:
         day_row = cur.execute(
             """
             SELECT COUNT(*) AS cnt, COALESCE(SUM(energy_kcal), 0.0) AS tot_k
             FROM meal_logs
             WHERE user_id = ? AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) = ?
             """,
-            (user_id, target_d),
+            (user_id, target_date),
         ).fetchone()
-        if day_row:
-            cur_cnt = int(day_row[0] or 0)
-            cur_kcal = float(day_row[1] or 0.0)
-            if cur_cnt >= MAX_DAILY_MEALS_PER_USER:
-                raise FoodGuardrailRejected(
-                    "daily_cap_exceeded",
-                    f"Batas maksimal {MAX_DAILY_MEALS_PER_USER} catatan makan per hari tercapai untuk menjaga konsistensi diary.",
-                )
-            if (cur_kcal + meal_kcal) > MAX_DAILY_KCAL_PER_USER:
-                raise FoodGuardrailRejected(
-                    "daily_cap_exceeded",
-                    f"Akumulasi kalori harian akan melebihi batas biologis {MAX_DAILY_KCAL_PER_USER:,.0f} kkal/hari.",
-                )
+    if not day_row:
+        return 0, 0.0
+    return int(day_row[0] or 0), float(day_row[1] or 0.0)
 
+
+def _check_daily_meal_budget(cur: _UnifiedCursor, user_id: str, target_date: str, add_kcal: float, add_count: int = 1, exclude_log_id: int = None):
+    """Menjaga batas maksimal catatan makan & kalori harian tidak terlewati."""
+    cur_cnt, cur_kcal = _get_daily_meal_usage(cur, user_id, target_date, exclude_log_id=exclude_log_id)
+    if (cur_cnt + add_count) > MAX_DAILY_MEALS_PER_USER:
+        raise FoodGuardrailRejected(
+            "daily_cap_exceeded",
+            f"Batas maksimal {MAX_DAILY_MEALS_PER_USER} catatan makan per hari tercapai untuk menjaga konsistensi diary.",
+        )
+    if (cur_kcal + add_kcal) > MAX_DAILY_KCAL_PER_USER:
+        raise FoodGuardrailRejected(
+            "daily_cap_exceeded",
+            f"Akumulasi kalori harian akan melebihi batas biologis {MAX_DAILY_KCAL_PER_USER:,.0f} kkal/hari.",
+        )
+
+
+def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0, caption: str = "", meal_type: str = "Makan Siang", log_date: str = None, tz_offset: int = DEFAULT_TIMEZONE_OFFSET):
+    """Menyimpan satu catatan makan ke buku harian pengguna dengan penjagaan batas biologis harian."""
+    local_now = get_local_now(tz_offset)
+    target_d = log_date or local_now.strftime("%Y-%m-%d")
+    custom_timestamp = f"{target_d} {local_now.strftime('%H:%M:%S')}"
+    clean_dish, clean_tot = _validate_meal_nutrients(dish_name, totals, validate_name=True)
+    mult_val = _safe_float(multiplier, 1.0)
+    if mult_val <= 0 or mult_val > 5.0:
+        raise FoodGuardrailRejected("implausible_portion", "Pengali porsi harus berada di antara 0.1x hingga 5.0x.")
+
+    with _db_session() as (conn, cur):
+        _check_daily_meal_budget(cur, user_id, target_d, add_kcal=clean_tot["energy_kcal"], add_count=1)
         cur.execute(
             """
             INSERT INTO meal_logs
@@ -1300,14 +1425,14 @@ def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0
             """,
             (
                 user_id,
-                dish_name,
-                float(totals.get("energy_kcal", 0.0)),
-                float(totals.get("protein_g", 0.0)),
-                float(totals.get("fat_g", 0.0)),
-                float(totals.get("carb_g", 0.0)),
-                float(totals.get("fiber_g", 0.0)),
-                float(totals.get("sodium_mg", 0.0)),
-                float(multiplier),
+                clean_dish,
+                clean_tot["energy_kcal"],
+                clean_tot["protein_g"],
+                clean_tot["fat_g"],
+                clean_tot["carb_g"],
+                clean_tot["fiber_g"],
+                clean_tot["sodium_mg"],
+                mult_val,
                 caption,
                 meal_type,
                 custom_timestamp,
@@ -1318,40 +1443,50 @@ def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0
     return {
         "id": new_id,
         "user_id": user_id,
-        "dish_name": dish_name,
-        "energy_kcal": float(totals.get("energy_kcal", 0.0)),
+        "dish_name": clean_dish,
+        "energy_kcal": clean_tot["energy_kcal"],
         "meal_type": meal_type,
         "saved_at": local_now.strftime("%H:%M")
     }
 
 
 def update_meal_log(log_id: int, user_id: str, dish_name: str = None, totals: dict = None, multiplier: float = None, meal_type: str = None, caption: str = None):
-    """Memperbarui catatan makan yang sudah ada (mencegah double save saat mengubah sesi atau porsi)."""
+    """Memperbarui catatan makan yang sudah ada sekaligus menjaga batas kalori harian dan guardrail pangan."""
     with _db_session() as (conn, cur):
         row = cur.execute("SELECT * FROM meal_logs WHERE id = ? AND user_id = ?", (log_id, user_id)).fetchone()
         if not row:
             return None
 
         cur_row = dict(row)
-        new_dish = dish_name if dish_name is not None else cur_row["dish_name"]
+        raw_dish = dish_name if dish_name is not None else cur_row["dish_name"]
         new_meal_type = meal_type if meal_type is not None else cur_row["meal_type"]
         new_mult = float(multiplier) if multiplier is not None else float(cur_row.get("portion_multiplier") or 1.0)
+        if not math.isfinite(new_mult) or new_mult < 0.1 or new_mult > 5.0:
+            raise FoodGuardrailRejected("implausible_portion", "Pengali porsi harus berada di antara 0.1x hingga 5.0x.")
         new_cap = caption if caption is not None else (cur_row.get("photo_caption") or "")
 
-        if totals is not None:
-            e_kcal = round(float(totals.get("energy_kcal", cur_row["energy_kcal"])), 1)
-            p_g = round(float(totals.get("protein_g", cur_row["protein_g"])), 1)
-            f_g = round(float(totals.get("fat_g", cur_row["fat_g"])), 1)
-            c_g = round(float(totals.get("carb_g", cur_row["carb_g"])), 1)
-            fib_g = round(float(totals.get("fiber_g", cur_row["fiber_g"])), 1)
-            sod_mg = round(float(totals.get("sodium_mg", cur_row.get("sodium_mg") or 0.0)), 1)
-        else:
-            e_kcal = cur_row["energy_kcal"]
-            p_g = cur_row["protein_g"]
-            f_g = cur_row["fat_g"]
-            c_g = cur_row["carb_g"]
-            fib_g = cur_row["fiber_g"]
-            sod_mg = cur_row.get("sodium_mg") or 0.0
+        cand_totals = totals if totals is not None else {
+            "energy_kcal": cur_row["energy_kcal"],
+            "protein_g": cur_row["protein_g"],
+            "fat_g": cur_row["fat_g"],
+            "carb_g": cur_row["carb_g"],
+            "fiber_g": cur_row["fiber_g"],
+            "sodium_mg": cur_row.get("sodium_mg") or 0.0,
+        }
+        new_dish, clean_tot = _validate_meal_nutrients(
+            raw_dish,
+            cand_totals,
+            validate_name=(dish_name is not None),
+        )
+        row_date = str(cur_row.get("logged_at") or "")[:10] or get_local_now().strftime("%Y-%m-%d")
+        _check_daily_meal_budget(
+            cur,
+            user_id,
+            row_date,
+            add_kcal=clean_tot["energy_kcal"],
+            add_count=1,
+            exclude_log_id=log_id,
+        )
 
         cur.execute(
             """
@@ -1360,21 +1495,41 @@ def update_meal_log(log_id: int, user_id: str, dish_name: str = None, totals: di
                 sodium_mg = ?, portion_multiplier = ?, photo_caption = ?, meal_type = ?
             WHERE id = ? AND user_id = ?
             """,
-            (new_dish, e_kcal, p_g, f_g, c_g, fib_g, sod_mg, new_mult, new_cap, new_meal_type, log_id, user_id),
+            (
+                new_dish,
+                clean_tot["energy_kcal"],
+                clean_tot["protein_g"],
+                clean_tot["fat_g"],
+                clean_tot["carb_g"],
+                clean_tot["fiber_g"],
+                clean_tot["sodium_mg"],
+                new_mult,
+                new_cap,
+                new_meal_type,
+                log_id,
+                user_id,
+            ),
         )
         conn.commit()
     return {
         "id": log_id,
         "user_id": user_id,
         "dish_name": new_dish,
-        "energy_kcal": e_kcal,
+        "energy_kcal": clean_tot["energy_kcal"],
         "meal_type": new_meal_type,
         "saved_at": str(cur_row.get("logged_at", ""))[11:16] or get_local_now().strftime("%H:%M"),
     }
 
 
 def scale_meal_log_portion(log_id: int, user_id: str, new_multiplier: float, new_meal_type: str = None, new_dish_name: str = None):
-    """Mengubah porsi dan/atau waktu makan secara proporsional tanpa perlu memindai ulang."""
+    """Mengubah porsi dan/atau waktu makan secara proporsional dengan validasi batas harian."""
+    try:
+        raw_mult = float(new_multiplier)
+    except (TypeError, ValueError):
+        raise FoodGuardrailRejected("implausible_portion", "Pengali porsi tidak valid.")
+    if not math.isfinite(raw_mult) or raw_mult < 0.1 or raw_mult > 5.0:
+        raise FoodGuardrailRejected("implausible_portion", "Pengali porsi harus berada di antara 0.1x hingga 5.0x.")
+
     with _db_session() as (conn, cur):
         row = cur.execute("SELECT * FROM meal_logs WHERE id = ? AND user_id = ?", (log_id, user_id)).fetchone()
         if not row:
@@ -1384,23 +1539,22 @@ def scale_meal_log_portion(log_id: int, user_id: str, new_multiplier: float, new
     old_mult = float(cur_row.get("portion_multiplier") or 1.0)
     if old_mult <= 0:
         old_mult = 1.0
-    target_mult = max(0.1, float(new_multiplier))
-    ratio = target_mult / old_mult
+    ratio = raw_mult / old_mult
 
     scaled_totals = {
-        "energy_kcal": round(float(cur_row["energy_kcal"]) * ratio, 1),
-        "protein_g": round(float(cur_row["protein_g"]) * ratio, 1),
-        "fat_g": round(float(cur_row["fat_g"]) * ratio, 1),
-        "carb_g": round(float(cur_row["carb_g"]) * ratio, 1),
-        "fiber_g": round(float(cur_row["fiber_g"]) * ratio, 1),
-        "sodium_mg": round(float(cur_row.get("sodium_mg") or 0.0) * ratio, 1),
+        "energy_kcal": round(max(0.0, float(cur_row["energy_kcal"])) * ratio, 1),
+        "protein_g": round(max(0.0, float(cur_row["protein_g"])) * ratio, 1),
+        "fat_g": round(max(0.0, float(cur_row["fat_g"])) * ratio, 1),
+        "carb_g": round(max(0.0, float(cur_row["carb_g"])) * ratio, 1),
+        "fiber_g": round(max(0.0, float(cur_row["fiber_g"])) * ratio, 1),
+        "sodium_mg": round(max(0.0, float(cur_row.get("sodium_mg") or 0.0)) * ratio, 1),
     }
     return update_meal_log(
         log_id=log_id,
         user_id=user_id,
         dish_name=new_dish_name,
         totals=scaled_totals,
-        multiplier=target_mult,
+        multiplier=raw_mult,
         meal_type=new_meal_type,
     )
 
@@ -1505,12 +1659,25 @@ def copy_meals_from_date(user_id: str, source_date: str, target_date: str, tz_of
             (user_id, target_date),
         ).fetchall()
         existing_keys = {(r["dn"], r["meal_type"]) for r in existing_rows}
+        cur_cnt, cur_kcal = _get_daily_meal_usage(cur, user_id, target_date)
 
         copied = 0
+        added_kcal = 0.0
         for r in src_rows:
+            if (cur_cnt + copied) >= MAX_DAILY_MEALS_PER_USER:
+                break
             d = dict(r)
+            row_kcal = float(d.get("energy_kcal") or 0.0)
+            if row_kcal < 0 or row_kcal > (MAX_SINGLE_DISH_KCAL * 1.5):
+                continue
+            if (cur_kcal + added_kcal + row_kcal) > MAX_DAILY_KCAL_PER_USER:
+                continue
             key = (" ".join((d["dish_name"] or "").strip().lower().split()), d["meal_type"])
             if key in existing_keys:
+                continue
+            try:
+                clean_dish, clean_tot = _validate_meal_nutrients(d["dish_name"], d, validate_name=True)
+            except FoodGuardrailRejected:
                 continue
             existing_keys.add(key)
             cur.execute(
@@ -1521,20 +1688,21 @@ def copy_meals_from_date(user_id: str, source_date: str, target_date: str, tz_of
                 """,
                 (
                     user_id,
-                    d["dish_name"],
-                    float(d["energy_kcal"]),
-                    float(d["protein_g"]),
-                    float(d["fat_g"]),
-                    float(d["carb_g"]),
-                    float(d["fiber_g"]),
-                    float(d.get("sodium_mg") or 0.0),
-                    float(d.get("portion_multiplier") or 1.0),
+                    clean_dish,
+                    clean_tot["energy_kcal"],
+                    clean_tot["protein_g"],
+                    clean_tot["fat_g"],
+                    clean_tot["carb_g"],
+                    clean_tot["fiber_g"],
+                    clean_tot["sodium_mg"],
+                    min(5.0, max(0.1, float(d.get("portion_multiplier") or 1.0))),
                     d.get("photo_caption") or f"Disalin dari {source_date}",
                     d.get("meal_type") or "Makan Siang",
                     f"{target_date} {now_hms}",
                 ),
             )
             copied += 1
+            added_kcal += clean_tot["energy_kcal"]
         conn.commit()
     return copied
 
@@ -1732,13 +1900,33 @@ def _safe_float(val, default: float = 0.0) -> float:
     if val is None or val == "":
         return default
     try:
-        return float(val)
+        parsed = float(val)
+        return parsed if math.isfinite(parsed) else default
     except (TypeError, ValueError):
         return default
 
 
+def _normalize_backup_timestamp(raw_val, fallback: str) -> str | None:
+    raw = str(raw_val or "").strip()
+    if not raw:
+        return fallback
+    if len(raw) >= 19:
+        try:
+            dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+    if len(raw) >= 10:
+        try:
+            dt = datetime.strptime(raw[:10], "%Y-%m-%d")
+            return dt.strftime("%Y-%m-%d 12:00:00")
+        except ValueError:
+            return None
+    return None
+
+
 def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
-    """Memulihkan kembali riwayat catatan makan, berat badan, & makanan kustom dari file JSON cadangan."""
+    """Memulihkan riwayat catatan makan, berat badan, & makanan kustom dari JSON dengan validasi guardrail ketat."""
     import json
     try:
         clean_raw = (json_str or "").lstrip("\ufeff").strip()
@@ -1754,22 +1942,47 @@ def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
 
         norm_uid = _normalize_user_id(user_id)
         now_fallback = get_local_now().strftime("%Y-%m-%d %H:%M:%S")
+        skipped_invalid = 0
+
         with _db_session() as (conn, cur):
+            day_usage_cache: dict[str, list[float | int]] = {}
             imported_count = 0
             for m in meal_logs:
                 if not isinstance(m, dict):
+                    skipped_invalid += 1
                     continue
-                dish = str(m.get("dish_name") or "").strip()
-                if not dish:
+                logged_val = _normalize_backup_timestamp(m.get("logged_at"), now_fallback)
+                if not logged_val:
+                    skipped_invalid += 1
                     continue
-                logged_val = str(m.get("logged_at") or "").strip() or now_fallback
+                try:
+                    clean_dish, clean_tot = _validate_meal_nutrients(
+                        m.get("dish_name"),
+                        m,
+                        validate_name=True,
+                        check_macro_atwater=True,
+                        raw_item=m,
+                    )
+                except FoodGuardrailRejected:
+                    skipped_invalid += 1
+                    continue
+
+                day_key = logged_val[:10]
+                if day_key not in day_usage_cache:
+                    c_cnt, c_kcal = _get_daily_meal_usage(cur, norm_uid, day_key)
+                    day_usage_cache[day_key] = [c_cnt, c_kcal]
+                d_cnt, d_kcal = day_usage_cache[day_key]
+                if d_cnt >= MAX_DAILY_MEALS_PER_USER or (d_kcal + clean_tot["energy_kcal"]) > MAX_DAILY_KCAL_PER_USER:
+                    skipped_invalid += 1
+                    continue
+
                 existing = cur.execute(
                     "SELECT id FROM meal_logs WHERE user_id = ? AND dish_name = ? AND logged_at = ?",
-                    (norm_uid, dish, logged_val),
+                    (norm_uid, clean_dish, logged_val),
                 ).fetchone()
                 if not existing:
                     port_mult = _safe_float(m.get("portion_multiplier"), 1.0)
-                    if port_mult <= 0:
+                    if port_mult < 0.1 or port_mult > 5.0:
                         port_mult = 1.0
                     cur.execute(
                         """
@@ -1779,48 +1992,67 @@ def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
                         """,
                         (
                             norm_uid,
-                            dish,
-                            _safe_float(m.get("energy_kcal"), 0.0),
-                            _safe_float(m.get("protein_g"), 0.0),
-                            _safe_float(m.get("fat_g"), 0.0),
-                            _safe_float(m.get("carb_g"), 0.0),
-                            _safe_float(m.get("fiber_g"), 0.0),
-                            _safe_float(m.get("sodium_mg"), 0.0),
+                            clean_dish,
+                            clean_tot["energy_kcal"],
+                            clean_tot["protein_g"],
+                            clean_tot["fat_g"],
+                            clean_tot["carb_g"],
+                            clean_tot["fiber_g"],
+                            clean_tot["sodium_mg"],
                             port_mult,
-                            str(m.get("photo_caption") or ""),
-                            str(m.get("meal_type") or "Makan Siang"),
+                            str(m.get("photo_caption") or "")[:160],
+                            str(m.get("meal_type") or "Makan Siang")[:40],
                             logged_val,
                         ),
                     )
+                    day_usage_cache[day_key][0] += 1
+                    day_usage_cache[day_key][1] += clean_tot["energy_kcal"]
                     imported_count += 1
 
             weight_count = 0
             for w in weight_logs:
                 if not isinstance(w, dict):
+                    skipped_invalid += 1
                     continue
-                rec_date = str(w.get("recorded_date") or "").strip()
-                w_kg = _safe_float(w.get("weight_kg"), 0.0)
-                if rec_date and w_kg > 0:
-                    cur.execute(
-                        """
-                        INSERT INTO weight_logs (user_id, weight_kg, recorded_date, note)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(user_id, recorded_date) DO NOTHING
-                        """,
-                        (norm_uid, w_kg, rec_date, str(w.get("note") or "")),
-                    )
-                    weight_count += 1
+                rec_date_raw = str(w.get("recorded_date") or "").strip()
+                try:
+                    rec_date = datetime.strptime(rec_date_raw[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+                    w_kg = round(float(w.get("weight_kg")), 1)
+                except (TypeError, ValueError):
+                    skipped_invalid += 1
+                    continue
+                if not math.isfinite(w_kg) or w_kg < 20.0 or w_kg > 300.0:
+                    skipped_invalid += 1
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO weight_logs (user_id, weight_kg, recorded_date, note)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id, recorded_date) DO NOTHING
+                    """,
+                    (norm_uid, w_kg, rec_date, str(w.get("note") or "")[:120]),
+                )
+                weight_count += 1
 
             custom_count = 0
             for cf in custom_foods:
                 if not isinstance(cf, dict):
+                    skipped_invalid += 1
                     continue
-                fname = str(cf.get("food_name") or "").strip()
-                if not fname:
+                try:
+                    clean_cf, clean_cf_tot = _validate_meal_nutrients(
+                        cf.get("food_name"),
+                        cf,
+                        validate_name=True,
+                        check_macro_atwater=True,
+                        raw_item=cf,
+                    )
+                except FoodGuardrailRejected:
+                    skipped_invalid += 1
                     continue
                 ex_cf = cur.execute(
                     "SELECT id FROM custom_foods WHERE user_id = ? AND LOWER(food_name) = LOWER(?) LIMIT 1",
-                    (norm_uid, fname),
+                    (norm_uid, clean_cf),
                 ).fetchone()
                 if not ex_cf:
                     cur.execute(
@@ -1830,19 +2062,22 @@ def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
                         """,
                         (
                             norm_uid,
-                            fname,
-                            str(cf.get("serving_size") or "1 porsi"),
-                            _safe_float(cf.get("energy_kcal"), 0.0),
-                            _safe_float(cf.get("protein_g"), 0.0),
-                            _safe_float(cf.get("fat_g"), 0.0),
-                            _safe_float(cf.get("carb_g"), 0.0),
+                            clean_cf,
+                            str(cf.get("serving_size") or "1 porsi")[:50],
+                            clean_cf_tot["energy_kcal"],
+                            clean_cf_tot["protein_g"],
+                            clean_cf_tot["fat_g"],
+                            clean_cf_tot["carb_g"],
                             now_fallback,
                         ),
                     )
                     custom_count += 1
 
             conn.commit()
-        return True, f"Berhasil memulihkan {imported_count} catatan makan, {weight_count} berat badan, & {custom_count} menu kustom!"
+        if imported_count == 0 and weight_count == 0 and custom_count == 0 and skipped_invalid > 0:
+            return False, "Pemulihan ditolak: seluruh entri cadangan tidak lolos validasi keamanan & kewajaran gizi."
+        skip_note = f" ({skipped_invalid} entri tidak valid dilewati)" if skipped_invalid > 0 else ""
+        return True, f"Berhasil memulihkan {imported_count} catatan makan, {weight_count} berat badan, & {custom_count} menu kustom!{skip_note}"
     except Exception as e:
         return False, f"Format file cadangan tidak valid: {str(e)}"
 

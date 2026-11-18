@@ -21,7 +21,7 @@ from datetime import datetime
 
 from gemini_extractor import analyze_food_text, analyze_food_image
 from nutrition_engine import calculate_dish_nutrition
-from food_guardrails import FoodGuardrailRejected, validate_extracted_dish_totals
+from food_guardrails import FoodGuardrailRejected, open_safe_image, validate_extracted_dish_totals
 from db_history import (
     get_or_create_user, log_meal, get_user_history_stats,
     get_user_scan_status, record_scan_usage, get_local_now,
@@ -186,9 +186,9 @@ async def whatsapp_webhook(request: Request):
             }
             
         try:
-            # Download gambar dari link WhatsApp gateway dengan validasi SSRF & batas ukuran
+            # Download gambar dari link WhatsApp gateway dengan validasi SSRF, ukuran byte, & batas piksel
             img_bytes = _download_image_bytes(image_url)
-            pil_img = Image.open(io.BytesIO(img_bytes))
+            pil_img = open_safe_image(io.BytesIO(img_bytes))
             
             ai_data = analyze_food_image(pil_img, caption=message_text, api_key=api_key)
             record_scan_usage(sender_clean)

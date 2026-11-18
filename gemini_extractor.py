@@ -13,9 +13,11 @@ from collections import OrderedDict
 from PIL import Image
 from food_guardrails import (
     FoodGuardrailRejected,
+    MAX_SAFE_IMAGE_PIXELS,
     MAX_SINGLE_DISH_GRAMS,
     MAX_SINGLE_DISH_KCAL,
     check_prompt_injection,
+    open_safe_image,
     validate_food_text_query,
     validate_photo_caption,
     validate_food_candidate,
@@ -210,9 +212,15 @@ def analyze_food_image(image_input, caption: str = "", api_key: str = None):
         raise ValueError("GEMINI_API_KEY belum disetel.")
 
     if isinstance(image_input, str):
-        img = Image.open(image_input)
+        img = open_safe_image(image_input)
     else:
         img = image_input
+        w, h = img.size
+        if w <= 0 or h <= 0 or (w * h) > MAX_SAFE_IMAGE_PIXELS:
+            raise FoodGuardrailRejected(
+                "non_food",
+                "Resolusi gambar melebihi batas aman (maks. 25 megapiksel).",
+            )
 
     # Optimalisasi token: Resize jika gambar terlalu besar (> 1024px)
     max_dim = 1024
