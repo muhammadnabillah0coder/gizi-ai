@@ -11,6 +11,7 @@ import difflib
 import threading
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db")
+_MODULE_MTIME = round(os.path.getmtime(__file__), 6) if os.path.exists(__file__) else 0.0
 _CATALOG_LOCK = threading.Lock()
 _FOOD_CATALOG_CACHE = None
 _FOOD_CATALOG_META = ("", 0.0)

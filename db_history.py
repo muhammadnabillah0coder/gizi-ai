@@ -27,6 +27,7 @@ except ImportError:
     _HAS_PG8000 = False
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db")
+_MODULE_MTIME = round(os.path.getmtime(__file__), 6) if os.path.exists(__file__) else 0.0
 
 # Mode Rilis Open Beta: QRIS ditutup sementara, teman terdaftar mendapat 5x scan foto AI/hari
 OPEN_BETA_MODE = True

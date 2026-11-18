@@ -268,6 +268,44 @@ class TestCloudAdapterAndV4(unittest.TestCase):
 
         db_history.close_all_pooled_connections()
 
+    def test_module_mtime_and_sync_recovers_stale_module(self):
+        import ast
+        import importlib
+        import types
+        from unittest.mock import patch
+
+        self.assertTrue(hasattr(db_history, "_MODULE_MTIME"))
+        self.assertTrue(hasattr(nutrition_engine_mod := sys.modules["nutrition_engine"], "_MODULE_MTIME"))
+        self.assertGreater(db_history._MODULE_MTIME, 0.0)
+        self.assertGreater(nutrition_engine_mod._MODULE_MTIME, 0.0)
+
+        app_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app.py"))
+        with open(app_path, "r", encoding="utf-8") as fh:
+            app_src = fh.read()
+        tree = ast.parse(app_src)
+        fn_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_sync_module_from_disk")
+        ns = {"os": os, "importlib": importlib}
+        exec(compile(ast.Module(body=[fn_node], type_ignores=[]), app_path, "exec"), ns)
+        sync_fn = ns["_sync_module_from_disk"]
+
+        # 1. Modul baru/segar dengan _MODULE_MTIME cocok -> tidak boleh reload ulang
+        with patch("importlib.reload") as mock_reload:
+            res = sync_fn(db_history)
+            self.assertIs(res, db_history)
+            mock_reload.assert_not_called()
+
+        # 2. Modul lama/stale tanpa _MODULE_MTIME -> wajib close pool + reload 1x
+        stale = types.ModuleType("_dummy_stale_mod")
+        stale.__file__ = db_history.__file__
+        closed = {"flag": False}
+        stale.close_all_pooled_connections = lambda: closed.__setitem__("flag", True)
+
+        with patch("importlib.reload", return_value=db_history) as mock_reload:
+            res2 = sync_fn(stale)
+            self.assertTrue(closed["flag"])
+            mock_reload.assert_called_once_with(stale)
+            self.assertIs(res2, db_history)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,9 +14,34 @@ import pandas as pd
 from datetime import datetime, timedelta
 import urllib.parse
 
+import importlib
 import sqlite3
 import nutrition_engine
 import db_history
+
+
+def _sync_module_from_disk(mod):
+    """Muat ulang modul sibling hanya jika file di disk berubah/lebih baru (aman saat hot-deploy Streamlit Cloud, 0ms reload di rerun biasa)."""
+    mod_file = getattr(mod, "__file__", None) or ""
+    if mod_file.endswith(".pyc") and os.path.exists(mod_file[:-1]):
+        mod_file = mod_file[:-1]
+    if not mod_file or not os.path.exists(mod_file):
+        return mod
+    disk_mtime = round(os.path.getmtime(mod_file), 6)
+    if getattr(mod, "_MODULE_MTIME", None) != disk_mtime:
+        close_pool = getattr(mod, "close_all_pooled_connections", None)
+        if callable(close_pool):
+            try:
+                close_pool()
+            except Exception:
+                pass
+        mod = importlib.reload(mod)
+        setattr(mod, "_MODULE_MTIME", disk_mtime)
+    return mod
+
+
+nutrition_engine = _sync_module_from_disk(nutrition_engine)
+db_history = _sync_module_from_disk(db_history)
 
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import (
@@ -95,7 +120,7 @@ st.set_page_config(
 
 
 @st.cache_resource(show_spinner=False)
-def _ensure_schema_ready():
+def _ensure_schema_ready(_mod_mtime: float):
     init_user_history_tables()
     return True
 
@@ -148,7 +173,7 @@ def _mark_db_mutated():
     st.session_state["db_mutation_ver"] = st.session_state.get("db_mutation_ver", 0) + 1
 
 
-_ensure_schema_ready()
+_ensure_schema_ready(getattr(db_history, "_MODULE_MTIME", 0.0))
 
 # Tangani Redirect Google OAuth Callback (?code=...)
 auth_code = st.query_params.get("code", "")
