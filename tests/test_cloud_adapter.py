@@ -181,6 +181,93 @@ class TestCloudAdapterAndV4(unittest.TestCase):
         slice_res = calculate_dish_nutrition([{"name": "Bingka Pisang", "weight_g": 75.0}], portion_multiplier=1.0)
         self.assertAlmostEqual(slice_res["totals"]["energy_kcal"], 204.8, delta=1.0)
 
+    def test_dashboard_bundle_parity(self):
+        today_dt = db_history.get_local_now(8).date()
+        today_str = today_dt.strftime("%Y-%m-%d")
+        yest_str = (today_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        db_history.log_meal(self.test_uid, "Nasi Goreng", {"energy_kcal": 420.0, "protein_g": 12.0, "fat_g": 14.0, "carb_g": 60.0, "fiber_g": 2.0}, meal_type="Sarapan", log_date=yest_str, tz_offset=8)
+        db_history.log_meal(self.test_uid, "Soto Ayam", {"energy_kcal": 310.0, "protein_g": 19.0, "fat_g": 9.0, "carb_g": 38.0, "fiber_g": 1.8}, meal_type="Makan Siang", log_date=today_str, tz_offset=8)
+        db_history.log_water_intake(self.test_uid, 2, tz_offset=8)
+        db_history.log_weight_entry(self.test_uid, 67.4, tz_offset=8, recorded_date=today_str)
+
+        bundle = db_history.get_dashboard_bundle(self.test_uid, target_date=today_str, tz_offset=8)
+        self.assertEqual(bundle["scan_status"], db_history.get_user_scan_status(self.test_uid, tz_offset=8))
+        self.assertEqual(bundle["stats"], db_history.get_user_history_stats(self.test_uid, target_date=today_str, tz_offset=8))
+        self.assertEqual(bundle["streak_days"], db_history.get_logging_streak(self.test_uid, tz_offset=8))
+        self.assertEqual(bundle["water_data"], db_history.get_water_intake(self.test_uid, tz_offset=8))
+        self.assertEqual(bundle["weight_history"], db_history.get_weight_history(self.test_uid, limit=30))
+        self.assertEqual(bundle["frequent_meals"], db_history.get_frequent_meals(self.test_uid, limit=6))
+
+    def test_auto_learn_false_and_catalog_cache_invalidation(self):
+        from unittest.mock import patch
+        import nutrition_engine
+
+        with patch("nutrition_engine.auto_learn_food") as mock_learn:
+            res = nutrition_engine.calculate_dish_nutrition(
+                [{
+                    "name": "Menu Misterius Interaktif Xyz",
+                    "weight_g": 100.0,
+                    "energy_kcal_per_100g": 180.0,
+                    "protein_g_per_100g": 6.0,
+                    "fat_g_per_100g": 5.0,
+                    "carb_g_per_100g": 26.0,
+                }],
+                portion_multiplier=0.5,
+                auto_learn=False,
+            )
+            mock_learn.assert_not_called()
+            self.assertEqual(res["totals"]["energy_kcal"], 90.0)
+
+        first_catalog = nutrition_engine._get_cached_food_catalog()
+        second_catalog = nutrition_engine._get_cached_food_catalog()
+        self.assertIs(first_catalog, second_catalog)
+
+        unique_food = f"Uji Katalog Cache {uuid.uuid4().hex[:6]}"
+        try:
+            db_history.publish_food_to_catalog(
+                food_name=unique_food,
+                category="Uji Unit",
+                kcal_100=123.0,
+                p_100=4.0,
+                f_100=3.0,
+                c_100=20.0,
+                fib_100=1.0,
+            )
+            matched = nutrition_engine.find_best_match(unique_food)
+            self.assertIsNotNone(matched)
+            self.assertEqual(matched["food_name"], unique_food)
+        finally:
+            conn = sqlite3.connect(db_history.DB_PATH)
+            conn.execute("DELETE FROM food_composition WHERE food_name = ?", (unique_food,))
+            conn.execute("DELETE FROM food_catalog_additions WHERE food_name = ?", (unique_food,))
+            conn.commit()
+            conn.close()
+            nutrition_engine.invalidate_food_catalog_cache()
+
+    def test_pg_pool_acquire_release_reuse(self):
+        from unittest.mock import MagicMock, patch
+
+        db_history.close_all_pooled_connections()
+        mock_raws = [MagicMock(), MagicMock()]
+        test_uri = "postgresql://user:pass@aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres"
+
+        with patch("db_history._open_pg_raw", side_effect=mock_raws) as mock_open:
+            k1, c1 = db_history._acquire_pg_connection(test_uri)
+            self.assertEqual(mock_open.call_count, 1)
+            db_history._release_pg_connection(k1, c1, healthy=True)
+
+            k2, c2 = db_history._acquire_pg_connection(test_uri)
+            self.assertIs(c2, c1, "Koneksi pool sehat wajib dipakai ulang tanpa handshake ulang")
+            self.assertEqual(mock_open.call_count, 1)
+
+            db_history._release_pg_connection(k2, c2, healthy=False)
+            _, c3 = db_history._acquire_pg_connection(test_uri)
+            self.assertIsNot(c3, c1)
+            self.assertEqual(mock_open.call_count, 2)
+
+        db_history.close_all_pooled_connections()
+
 
 if __name__ == "__main__":
     unittest.main()

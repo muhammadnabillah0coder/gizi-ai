@@ -12,6 +12,9 @@ import hashlib
 import secrets
 import urllib.parse
 import ssl
+import time
+import threading
+from collections import deque
 from decimal import Decimal
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -48,8 +51,13 @@ TABLES_WITH_ID = {
     "food_catalog_additions",
 }
 
+SCHEMA_VERSION = "v4.0"
 _INITIALIZED_BACKENDS: set[str] = set()
 _LAST_CLOUD_ERROR: str = ""
+_PG_POOL_LOCK = threading.Lock()
+_PG_POOL: dict[str, deque] = {}
+_PG_POOL_IDLE_TTL = 75.0
+_PG_POOL_MAX_PER_KEY = 4
 
 
 class _DictRow(dict):
@@ -109,28 +117,49 @@ def _inject_returning_id(pg_sql: str) -> tuple[str, bool]:
     return f"{stripped} RETURNING id", True
 
 
-class _UnifiedCursor:
-    """Wrapper kursor seragam untuk SQLite dan PostgreSQL (pg8000)."""
+def _is_transport_error(exc: Exception) -> bool:
+    if isinstance(exc, OSError):
+        return True
+    msg = f"{type(exc).__name__} {exc}".lower()
+    return any(tok in msg for tok in ("interfaceerror", "closed", "broken", "eof", "reset", "timeout", "connection"))
 
-    def __init__(self, raw_cur, backend: str):
+
+class _UnifiedCursor:
+    """Wrapper kursor seragam untuk SQLite dan PostgreSQL (pg8000) dengan auto-retry pool."""
+
+    def __init__(self, raw_cur, conn: "_UnifiedConnection"):
         self._raw = raw_cur
-        self.backend = backend
+        self._conn = conn
+        self.backend = conn.backend
         self.lastrowid = None
 
-    def execute(self, sql: str, params=()):
-        if self.backend == "sqlite":
-            res = self._raw.execute(sql, params)
-            self.lastrowid = getattr(self._raw, "lastrowid", None)
-            return self
-
-        pg_sql = _translate_qmark_to_pg(sql)
-        pg_sql, added_returning = _inject_returning_id(pg_sql)
+    def _exec_pg_once(self, pg_sql: str, added_returning: bool, params):
         self._raw.execute(pg_sql, tuple(params) if params is not None else ())
         if added_returning:
             row = self._raw.fetchone()
             self.lastrowid = row[0] if row else None
         else:
             self.lastrowid = getattr(self._raw, "lastrowid", None)
+
+    def execute(self, sql: str, params=()):
+        if self.backend == "sqlite":
+            self._raw.execute(sql, params)
+            self.lastrowid = getattr(self._raw, "lastrowid", None)
+            return self
+
+        pg_sql = _translate_qmark_to_pg(sql)
+        pg_sql, added_returning = _inject_returning_id(pg_sql)
+        try:
+            self._exec_pg_once(pg_sql, added_returning, params)
+        except Exception as exc:
+            if self._conn._from_pool and self._conn._queries_run == 0 and self._conn._uri and _is_transport_error(exc):
+                self._conn._refresh_raw_pg()
+                self._raw = self._conn._raw.cursor()
+                self._exec_pg_once(pg_sql, added_returning, params)
+            else:
+                self._conn._broken = True
+                raise
+        self._conn._queries_run += 1
         return self
 
     def _wrap_row(self, raw_row):
@@ -155,12 +184,26 @@ class _UnifiedCursor:
 class _UnifiedConnection:
     """Wrapper koneksi seragam dengan backend SQLite atau PostgreSQL."""
 
-    def __init__(self, raw_conn, backend: str):
+    def __init__(self, raw_conn, backend: str, uri: str = "", from_pool: bool = False):
         self._raw = raw_conn
         self.backend = backend
+        self._uri = uri
+        self._from_pool = from_pool
+        self._queries_run = 0
+        self._broken = False
+
+    def _refresh_raw_pg(self):
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+        self._raw = _open_pg_raw(self._uri)
+        self._from_pool = False
+        self._queries_run = 0
+        self._broken = False
 
     def cursor(self):
-        return _UnifiedCursor(self._raw.cursor(), self.backend)
+        return _UnifiedCursor(self._raw.cursor(), self)
 
     def commit(self):
         self._raw.commit()
@@ -169,7 +212,7 @@ class _UnifiedConnection:
         try:
             self._raw.rollback()
         except Exception:
-            pass
+            self._broken = True
 
     def close(self):
         try:
@@ -234,7 +277,7 @@ def parse_database_url(uri: str) -> dict:
     }
 
 
-def _open_pg_connection(uri: str) -> _UnifiedConnection:
+def _open_pg_raw(uri: str):
     if not _HAS_PG8000:
         raise RuntimeError("Driver pg8000 belum terpasang di lingkungan Python.")
     cfg = parse_database_url(uri)
@@ -245,7 +288,7 @@ def _open_pg_connection(uri: str) -> _UnifiedConnection:
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    raw = pg_dbapi.connect(
+    return pg_dbapi.connect(
         user=cfg["user"],
         password=cfg["password"],
         host=cfg["host"],
@@ -254,7 +297,54 @@ def _open_pg_connection(uri: str) -> _UnifiedConnection:
         ssl_context=ssl_ctx,
         timeout=10,
     )
-    return _UnifiedConnection(raw, "postgres")
+
+
+def _open_pg_connection(uri: str) -> _UnifiedConnection:
+    return _UnifiedConnection(_open_pg_raw(uri), "postgres", uri=uri, from_pool=False)
+
+
+def _acquire_pg_connection(uri: str) -> tuple[str, _UnifiedConnection]:
+    pool_key = hashlib.sha1(uri.encode("utf-8")).hexdigest()[:16]
+    now_mono = time.monotonic()
+    with _PG_POOL_LOCK:
+        bucket = _PG_POOL.get(pool_key)
+        while bucket:
+            conn, last_ts = bucket.pop()
+            if (now_mono - last_ts) <= _PG_POOL_IDLE_TTL and not conn._broken:
+                conn._from_pool = True
+                conn._queries_run = 0
+                return pool_key, conn
+            conn.close()
+    return pool_key, _open_pg_connection(uri)
+
+
+def _release_pg_connection(pool_key: str, conn: _UnifiedConnection, healthy: bool):
+    if not healthy or conn._broken:
+        conn.close()
+        return
+    try:
+        conn._raw.rollback()
+    except Exception:
+        conn.close()
+        return
+    conn._queries_run = 0
+    conn._from_pool = True
+    with _PG_POOL_LOCK:
+        bucket = _PG_POOL.setdefault(pool_key, deque())
+        if len(bucket) < _PG_POOL_MAX_PER_KEY:
+            bucket.append((conn, time.monotonic()))
+        else:
+            conn.close()
+
+
+def close_all_pooled_connections():
+    """Menutup seluruh koneksi idle di pool PostgreSQL (berguna saat shutdown/testing)."""
+    with _PG_POOL_LOCK:
+        for bucket in _PG_POOL.values():
+            while bucket:
+                c, _ = bucket.popleft()
+                c.close()
+        _PG_POOL.clear()
 
 
 def _open_sqlite_connection() -> _UnifiedConnection:
@@ -265,25 +355,35 @@ def _open_sqlite_connection() -> _UnifiedConnection:
 
 @contextmanager
 def _db_session():
-    """Membuka koneksi database (Supabase PostgreSQL bila aktif, fallback ke SQLite lokal)."""
+    """Membuka koneksi database dengan pool persisten PostgreSQL (fallback ke SQLite lokal)."""
     global _LAST_CLOUD_ERROR
     db_url = get_database_url()
     conn = None
+    pool_key = ""
     if db_url:
         try:
-            conn = _open_pg_connection(db_url)
+            pool_key, conn = _acquire_pg_connection(db_url)
             _LAST_CLOUD_ERROR = ""
         except Exception as exc:
             _LAST_CLOUD_ERROR = str(exc)
             conn = _open_sqlite_connection()
+            pool_key = ""
     else:
         _LAST_CLOUD_ERROR = ""
         conn = _open_sqlite_connection()
 
+    had_error = False
     try:
         yield conn, conn.cursor()
+    except Exception:
+        had_error = True
+        conn._broken = True
+        raise
     finally:
-        conn.close()
+        if conn.backend == "postgres" and pool_key:
+            _release_pg_connection(pool_key, conn, healthy=(not had_error and not conn._broken))
+        else:
+            conn.close()
 
 
 def get_storage_backend_info() -> dict:
@@ -543,8 +643,73 @@ def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
                 pass
 
 
+def _sync_cloud_catalog_to_sqlite(pg_cur: _UnifiedCursor, sq_cur=None, sq_conn=None):
+    """Menarik tambahan katalog kurasi Admin dari cloud ke tkpi_nutrition.db lokal."""
+    if not os.path.exists(DB_PATH):
+        return
+    own_sq = sq_conn is None
+    if own_sq:
+        sq_conn = sqlite3.connect(DB_PATH)
+        sq_conn.row_factory = sqlite3.Row
+        sq_cur = sq_conn.cursor()
+
+    try:
+        has_fc = sq_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='food_composition'").fetchone()
+        if not has_fc:
+            return
+        cloud_foods = pg_cur.execute("SELECT * FROM food_catalog_additions").fetchall()
+        if not cloud_foods:
+            return
+        for cf in cloud_foods:
+            ex = sq_cur.execute(
+                "SELECT id FROM food_composition WHERE LOWER(food_name) = LOWER(?) LIMIT 1",
+                (cf["food_name"],),
+            ).fetchone()
+            if ex:
+                sq_cur.execute(
+                    """
+                    UPDATE food_composition
+                    SET category=?, serving_unit=?, default_serving_weight=?, energy_kcal=?,
+                        protein_g=?, fat_g=?, carb_g=?, fiber_g=?, sodium_mg=?,
+                        barcode=COALESCE(?, barcode)
+                    WHERE id=?
+                    """,
+                    (
+                        cf["category"], cf["serving_unit"], float(cf["default_serving_weight"] or 100.0),
+                        float(cf["energy_kcal"]), float(cf["protein_g"] or 0.0), float(cf["fat_g"] or 0.0),
+                        float(cf["carb_g"] or 0.0), float(cf["fiber_g"] or 0.0), float(cf["sodium_mg"] or 0.0),
+                        cf["barcode"], ex["id"],
+                    ),
+                )
+            else:
+                sq_cur.execute(
+                    """
+                    INSERT INTO food_composition
+                    (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate,
+                     energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cf["food_code"], cf["food_name"], cf["category"], cf["serving_unit"],
+                        float(cf["default_serving_weight"] or 100.0), float(cf["bdd_rate"] or 100.0),
+                        float(cf["energy_kcal"]), float(cf["protein_g"] or 0.0), float(cf["fat_g"] or 0.0),
+                        float(cf["carb_g"] or 0.0), float(cf["fiber_g"] or 0.0), float(cf["sodium_mg"] or 0.0),
+                        cf["barcode"],
+                    ),
+                )
+        sq_conn.commit()
+        try:
+            from nutrition_engine import invalidate_food_catalog_cache
+            invalidate_food_catalog_cache()
+        except Exception:
+            pass
+    finally:
+        if own_sq:
+            sq_conn.close()
+
+
 def _sync_sqlite_seed_and_cloud_catalog(pg_conn: _UnifiedConnection, pg_cur: _UnifiedCursor):
-    """Sinkronisasi idempoten: migrasi akun awal ke Supabase & tarik food_catalog_additions ke SQLite lokal."""
+    """Sinkronisasi idempoten: migrasi akun awal ke Supabase (batch 2 query) & tarik katalog cloud."""
     if not os.path.exists(DB_PATH):
         return
 
@@ -553,114 +718,75 @@ def _sync_sqlite_seed_and_cloud_catalog(pg_conn: _UnifiedConnection, pg_cur: _Un
     sq_cur = sq.cursor()
 
     try:
-        # 1. Seed akun awal jika belum ada di PostgreSQL
+        # Cek cepat seluruh user_id & meal_logs yang sudah ada di cloud sekaligus (2 query, bukan per-user)
+        existing_uids = {str(r[0]).lower() for r in pg_cur.execute("SELECT user_id FROM users").fetchall() if r[0]}
+        cloud_meal_uids = {str(r[0]).lower() for r in pg_cur.execute("SELECT DISTINCT user_id FROM meal_logs").fetchall() if r[0]}
+
         local_users = sq_cur.execute("SELECT * FROM users").fetchall()
         for u in local_users:
             ud = dict(u)
-            pg_cur.execute(
-                """
-                INSERT INTO users
-                (user_id, display_name, password_hash, avatar_url, auth_provider, theme_preference,
-                 daily_calorie_target, gender, weight_kg, height_cm, age_years, subscription_tier,
-                 pro_until, daily_scans_count, last_scan_date, timezone_offset, focus_goal, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (user_id) DO NOTHING
-                """,
-                (
-                    ud.get("user_id"),
-                    ud.get("display_name"),
-                    ud.get("password_hash"),
-                    ud.get("avatar_url"),
-                    ud.get("auth_provider") or "local",
-                    ud.get("theme_preference") or "Apple Light",
-                    float(ud.get("daily_calorie_target") or 2000.0),
-                    ud.get("gender") or "Pria",
-                    float(ud.get("weight_kg") or 65.0),
-                    float(ud.get("height_cm") or 170.0),
-                    int(ud.get("age_years") or 25),
-                    ud.get("subscription_tier") or "beta",
-                    ud.get("pro_until"),
-                    int(ud.get("daily_scans_count") or 0),
-                    ud.get("last_scan_date"),
-                    int(ud.get("timezone_offset") if ud.get("timezone_offset") is not None else DEFAULT_TIMEZONE_OFFSET),
-                    ud.get("focus_goal") or "Diet Sehat",
-                    str(ud.get("created_at") or get_local_now().strftime("%Y-%m-%d %H:%M:%S")),
-                ),
-            )
-            # Jika user tersebut belum memiliki riwayat makan di cloud, salin log awal dari SQLite
             uid = ud.get("user_id")
-            if uid:
-                cnt_row = pg_cur.execute("SELECT COUNT(*) FROM meal_logs WHERE user_id = ?", (uid,)).fetchone()
-                if cnt_row and int(cnt_row[0]) == 0:
-                    for ml in sq_cur.execute("SELECT * FROM meal_logs WHERE user_id = ?", (uid,)).fetchall():
-                        md = dict(ml)
-                        pg_cur.execute(
-                            """
-                            INSERT INTO meal_logs
-                            (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg,
-                             portion_multiplier, photo_caption, meal_type, logged_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                uid,
-                                md.get("dish_name"),
-                                float(md.get("energy_kcal") or 0.0),
-                                float(md.get("protein_g") or 0.0),
-                                float(md.get("fat_g") or 0.0),
-                                float(md.get("carb_g") or 0.0),
-                                float(md.get("fiber_g") or 0.0),
-                                float(md.get("sodium_mg") or 0.0),
-                                float(md.get("portion_multiplier") or 1.0),
-                                md.get("photo_caption") or "",
-                                md.get("meal_type") or "Makan Siang",
-                                str(md.get("logged_at") or ""),
-                            ),
-                        )
+            if not uid:
+                continue
+            if uid.lower() not in existing_uids:
+                pg_cur.execute(
+                    """
+                    INSERT INTO users
+                    (user_id, display_name, password_hash, avatar_url, auth_provider, theme_preference,
+                     daily_calorie_target, gender, weight_kg, height_cm, age_years, subscription_tier,
+                     pro_until, daily_scans_count, last_scan_date, timezone_offset, focus_goal, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (
+                        uid,
+                        ud.get("display_name"),
+                        ud.get("password_hash"),
+                        ud.get("avatar_url"),
+                        ud.get("auth_provider") or "local",
+                        ud.get("theme_preference") or "Apple Light",
+                        float(ud.get("daily_calorie_target") or 2000.0),
+                        ud.get("gender") or "Pria",
+                        float(ud.get("weight_kg") or 65.0),
+                        float(ud.get("height_cm") or 170.0),
+                        int(ud.get("age_years") or 25),
+                        ud.get("subscription_tier") or "beta",
+                        ud.get("pro_until"),
+                        int(ud.get("daily_scans_count") or 0),
+                        ud.get("last_scan_date"),
+                        int(ud.get("timezone_offset") if ud.get("timezone_offset") is not None else DEFAULT_TIMEZONE_OFFSET),
+                        ud.get("focus_goal") or "Diet Sehat",
+                        str(ud.get("created_at") or get_local_now().strftime("%Y-%m-%d %H:%M:%S")),
+                    ),
+                )
+            if uid.lower() not in cloud_meal_uids:
+                for ml in sq_cur.execute("SELECT * FROM meal_logs WHERE user_id = ?", (uid,)).fetchall():
+                    md = dict(ml)
+                    pg_cur.execute(
+                        """
+                        INSERT INTO meal_logs
+                        (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg,
+                         portion_multiplier, photo_caption, meal_type, logged_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            uid,
+                            md.get("dish_name"),
+                            float(md.get("energy_kcal") or 0.0),
+                            float(md.get("protein_g") or 0.0),
+                            float(md.get("fat_g") or 0.0),
+                            float(md.get("carb_g") or 0.0),
+                            float(md.get("fiber_g") or 0.0),
+                            float(md.get("sodium_mg") or 0.0),
+                            float(md.get("portion_multiplier") or 1.0),
+                            md.get("photo_caption") or "",
+                            md.get("meal_type") or "Makan Siang",
+                            str(md.get("logged_at") or ""),
+                        ),
+                    )
 
         pg_conn.commit()
-
-        # 2. Tarik tambahan katalog makanan kurasi Admin dari cloud ke SQLite lokal
-        has_fc = sq_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='food_composition'").fetchone()
-        if has_fc:
-            cloud_foods = pg_cur.execute("SELECT * FROM food_catalog_additions").fetchall()
-            for cf in cloud_foods:
-                ex = sq_cur.execute(
-                    "SELECT id FROM food_composition WHERE LOWER(food_name) = LOWER(?) LIMIT 1",
-                    (cf["food_name"],),
-                ).fetchone()
-                if ex:
-                    sq_cur.execute(
-                        """
-                        UPDATE food_composition
-                        SET category=?, serving_unit=?, default_serving_weight=?, energy_kcal=?,
-                            protein_g=?, fat_g=?, carb_g=?, fiber_g=?, sodium_mg=?,
-                            barcode=COALESCE(?, barcode)
-                        WHERE id=?
-                        """,
-                        (
-                            cf["category"], cf["serving_unit"], float(cf["default_serving_weight"] or 100.0),
-                            float(cf["energy_kcal"]), float(cf["protein_g"] or 0.0), float(cf["fat_g"] or 0.0),
-                            float(cf["carb_g"] or 0.0), float(cf["fiber_g"] or 0.0), float(cf["sodium_mg"] or 0.0),
-                            cf["barcode"], ex["id"],
-                        ),
-                    )
-                else:
-                    sq_cur.execute(
-                        """
-                        INSERT INTO food_composition
-                        (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate,
-                         energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            cf["food_code"], cf["food_name"], cf["category"], cf["serving_unit"],
-                            float(cf["default_serving_weight"] or 100.0), float(cf["bdd_rate"] or 100.0),
-                            float(cf["energy_kcal"]), float(cf["protein_g"] or 0.0), float(cf["fat_g"] or 0.0),
-                            float(cf["carb_g"] or 0.0), float(cf["fiber_g"] or 0.0), float(cf["sodium_mg"] or 0.0),
-                            cf["barcode"],
-                        ),
-                    )
-            sq.commit()
+        _sync_cloud_catalog_to_sqlite(pg_cur, sq_cur=sq_cur, sq_conn=sq)
     except Exception:
         pg_conn.rollback()
     finally:
@@ -668,16 +794,34 @@ def _sync_sqlite_seed_and_cloud_catalog(pg_conn: _UnifiedConnection, pg_cur: _Un
 
 
 def init_user_history_tables(force: bool = False):
-    """Inisialisasi seluruh tabel pengguna & riwayat pada backend aktif (cukup sekali per proses/backend)."""
+    """Inisialisasi skema tabel secara cepat (melewati DDL jika SCHEMA_VERSION sudah terpasang)."""
     db_url = get_database_url()
     cache_key = f"pg::{hashlib.sha1(db_url.encode('utf-8')).hexdigest()[:12]}" if db_url else f"sqlite::{DB_PATH}"
     if not force and cache_key in _INITIALIZED_BACKENDS:
         return
 
     with _db_session() as (conn, cur):
+        if conn.backend == "postgres" and not force:
+            try:
+                sv_row = cur.execute("SELECT meta_value FROM app_meta WHERE meta_key = 'schema_version'").fetchone()
+                if sv_row and sv_row[0] == SCHEMA_VERSION:
+                    _sync_cloud_catalog_to_sqlite(cur)
+                    _INITIALIZED_BACKENDS.add(cache_key)
+                    return
+            except Exception:
+                conn.rollback()
+
         _create_tables_on_cursor(conn, cur)
         if conn.backend == "postgres":
             _sync_sqlite_seed_and_cloud_catalog(conn, cur)
+            cur.execute(
+                """
+                INSERT INTO app_meta (meta_key, meta_value) VALUES ('schema_version', ?)
+                ON CONFLICT (meta_key) DO UPDATE SET meta_value = excluded.meta_value
+                """,
+                (SCHEMA_VERSION,),
+            )
+            conn.commit()
             _INITIALIZED_BACKENDS.add(cache_key)
         else:
             _INITIALIZED_BACKENDS.add(f"sqlite::{DB_PATH}")
@@ -991,23 +1135,17 @@ def get_water_intake(user_id: str, tz_offset: int = DEFAULT_TIMEZONE_OFFSET):
     return {"glasses": 0, "target": 8, "ml": 0, "target_ml": 2000}
 
 
-def get_user_scan_status(user_id: str, tz_offset: int = None):
-    """
-    Memeriksa kuota scan foto harian user:
-    - Admin: Unlimited
-    - Open Beta (akun terdaftar): 5x scan foto/hari (3x makan berat + 2x jajan)
-    - Tamu (Demo): 3x scan foto/hari
-    """
-    with _db_session() as (conn, cur):
-        user = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-
-    effective_tz = tz_offset if tz_offset is not None else (user["timezone_offset"] if user and "timezone_offset" in user.keys() and user["timezone_offset"] is not None else DEFAULT_TIMEZONE_OFFSET)
+def _compute_scan_status_from_row(user_row, user_id: str, tz_offset: int = None) -> dict:
+    """Menghitung kuota scan harian secara murni dari baris tabel users yang sudah diambil."""
+    u_dict = dict(user_row) if user_row else None
+    effective_tz = tz_offset if tz_offset is not None else (
+        u_dict["timezone_offset"] if u_dict and u_dict.get("timezone_offset") is not None else DEFAULT_TIMEZONE_OFFSET
+    )
     local_now = get_local_now(effective_tz)
 
-    if not user:
+    if not u_dict:
         return {"tier": "demo", "scans_today": 0, "max_scans": GUEST_DAILY_SCAN_LIMIT, "can_scan": True, "is_pro": False, "is_beta": False, "days_left": 0}
 
-    u_dict = dict(user)
     is_admin = is_admin_user(user_id)
     is_guest = (user_id == "Tamu (Demo)")
     tier = u_dict.get("subscription_tier") or ("demo" if is_guest else "beta")
@@ -1056,6 +1194,18 @@ def get_user_scan_status(user_id: str, tz_offset: int = None):
         "is_beta": is_beta,
         "days_left": days_left
     }
+
+
+def get_user_scan_status(user_id: str, tz_offset: int = None):
+    """
+    Memeriksa kuota scan foto harian user:
+    - Admin: Unlimited
+    - Open Beta (akun terdaftar): 5x scan foto/hari (3x makan berat + 2x jajan)
+    - Tamu (Demo): 3x scan foto/hari
+    """
+    with _db_session() as (conn, cur):
+        user = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return _compute_scan_status_from_row(user, user_id, tz_offset=tz_offset)
 
 
 def record_scan_usage(user_id: str, tz_offset: int = None):
@@ -1341,13 +1491,8 @@ def delete_meal_log(log_id: int, user_id: str):
     return True
 
 
-def get_user_history_stats(user_id: str, target_date: str = None, tz_offset: int = DEFAULT_TIMEZONE_OFFSET):
-    """
-    Mengambil rekapan nutrisi berdasarkan tanggal lokal Indonesia pengguna:
-    1. Tanggal terpilih (target_date, default hari ini sesuai tz_offset)
-    2. 7 Hari Terakhir (Mingguan)
-    3. 30 Hari Terakhir (Bulanan)
-    """
+def _query_stats_and_streak(cur: _UnifiedCursor, user_id: str, target_date: str = None, tz_offset: int = DEFAULT_TIMEZONE_OFFSET) -> tuple[dict, int]:
+    """Menghitung rekapan harian, 7 hari, 30 hari, & streak harian dalam 2 query pada 1 koneksi aktif."""
     local_now = get_local_now(tz_offset)
     local_today = local_now.date()
     if not target_date:
@@ -1357,43 +1502,44 @@ def get_user_history_stats(user_id: str, target_date: str = None, tz_offset: int
     start_30d = (local_today - timedelta(days=29)).strftime("%Y-%m-%d")
     today_limit = local_today.strftime("%Y-%m-%d")
 
-    with _db_session() as (conn, cur):
-        date_meals = cur.execute(
-            """
-            SELECT * FROM meal_logs
-            WHERE user_id = ? AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) = ?
-            ORDER BY id DESC
-            """,
-            (user_id, target_date),
-        ).fetchall()
+    date_meals = cur.execute(
+        """
+        SELECT * FROM meal_logs
+        WHERE user_id = ? AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) = ?
+        ORDER BY id DESC
+        """,
+        (user_id, target_date),
+    ).fetchall()
 
-        weekly_rows = cur.execute(
-            """
-            SELECT SUBSTR(CAST(logged_at AS TEXT), 1, 10) AS day,
-                   SUM(energy_kcal) AS total_kcal,
-                   COUNT(*) AS meals_count
-            FROM meal_logs
-            WHERE user_id = ?
-              AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) >= ?
-              AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) <= ?
-            GROUP BY SUBSTR(CAST(logged_at AS TEXT), 1, 10)
-            ORDER BY day ASC
-            """,
-            (user_id, start_7d, today_limit),
-        ).fetchall()
+    daily_rows = cur.execute(
+        """
+        SELECT SUBSTR(CAST(logged_at AS TEXT), 1, 10) AS day,
+               SUM(energy_kcal) AS total_kcal,
+               COUNT(*) AS meals_count
+        FROM meal_logs
+        WHERE user_id = ? AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) <= ?
+        GROUP BY SUBSTR(CAST(logged_at AS TEXT), 1, 10)
+        ORDER BY day DESC
+        """,
+        (user_id, today_limit),
+    ).fetchall()
 
-        monthly_row = cur.execute(
-            """
-            SELECT SUM(energy_kcal) AS total_kcal,
-                   COUNT(DISTINCT SUBSTR(CAST(logged_at AS TEXT), 1, 10)) AS active_days,
-                   COUNT(*) AS total_meals
-            FROM meal_logs
-            WHERE user_id = ?
-              AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) >= ?
-              AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) <= ?
-            """,
-            (user_id, start_30d, today_limit),
-        ).fetchone()
+    daily_dicts = [dict(r) for r in daily_rows]
+    weekly_data = sorted([r for r in daily_dicts if str(r["day"]) >= start_7d], key=lambda x: str(x["day"]))
+    monthly_rows = [r for r in daily_dicts if str(r["day"]) >= start_30d]
+
+    logged_dates = set()
+    for r in daily_dicts:
+        if r.get("day"):
+            try:
+                logged_dates.add(datetime.strptime(str(r["day"])[:10], "%Y-%m-%d").date())
+            except ValueError:
+                pass
+    cursor_day = local_today if local_today in logged_dates else (local_today - timedelta(days=1))
+    streak_days = 0
+    while cursor_day in logged_dates:
+        streak_days += 1
+        cursor_day -= timedelta(days=1)
 
     meal_dicts = [dict(m) for m in date_meals]
     date_totals = {
@@ -1407,15 +1553,90 @@ def get_user_history_stats(user_id: str, target_date: str = None, tz_offset: int
         "target_date": target_date
     }
 
-    return {
+    stats = {
         "today_meals": meal_dicts,
         "today_totals": date_totals,
-        "weekly_data": [dict(r) for r in weekly_rows],
+        "weekly_data": weekly_data,
         "monthly_summary": {
-            "total_kcal": round(float(monthly_row["total_kcal"] or 0.0), 1),
-            "active_days": int(monthly_row["active_days"] or 0),
-            "total_meals": int(monthly_row["total_meals"] or 0)
+            "total_kcal": round(sum(float(r.get("total_kcal") or 0.0) for r in monthly_rows), 1),
+            "active_days": len(monthly_rows),
+            "total_meals": sum(int(r.get("meals_count") or 0) for r in monthly_rows)
         }
+    }
+    return stats, streak_days
+
+
+def get_user_history_stats(user_id: str, target_date: str = None, tz_offset: int = DEFAULT_TIMEZONE_OFFSET):
+    """Mengambil rekapan nutrisi harian, mingguan (7 hari), dan bulanan (30 hari)."""
+    with _db_session() as (conn, cur):
+        stats, _ = _query_stats_and_streak(cur, user_id, target_date=target_date, tz_offset=tz_offset)
+    return stats
+
+
+def get_dashboard_bundle(user_id: str, target_date: str = None, tz_offset: int = DEFAULT_TIMEZONE_OFFSET) -> dict:
+    """Mengambil seluruh data Dashboard dalam 1 koneksi tunggal untuk mempercepat loading Cloud DB."""
+    local_now = get_local_now(tz_offset)
+    today_str = local_now.strftime("%Y-%m-%d")
+
+    with _db_session() as (conn, cur):
+        user_row = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        scan_status = _compute_scan_status_from_row(user_row, user_id, tz_offset=tz_offset)
+        stats, streak_days = _query_stats_and_streak(cur, user_id, target_date=target_date, tz_offset=tz_offset)
+
+        w_row = cur.execute(
+            "SELECT glasses_count, target_glasses FROM water_logs WHERE user_id = ? AND log_date = ?",
+            (user_id, today_str),
+        ).fetchone()
+        water_data = (
+            {"glasses": int(w_row[0]), "target": int(w_row[1]), "ml": int(w_row[0]) * 250, "target_ml": int(w_row[1]) * 250}
+            if w_row else
+            {"glasses": 0, "target": 8, "ml": 0, "target_ml": 2000}
+        )
+
+        wt_rows = cur.execute(
+            "SELECT recorded_date, weight_kg, note FROM weight_logs WHERE user_id = ? ORDER BY recorded_date ASC LIMIT 30",
+            (user_id,),
+        ).fetchall()
+
+        fq_rows = cur.execute(
+            """
+            SELECT dish_name,
+                   AVG(energy_kcal / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_kcal,
+                   AVG(protein_g / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_p,
+                   AVG(fat_g / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_f,
+                   AVG(carb_g / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_c,
+                   AVG(fiber_g / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_fib,
+                   AVG(COALESCE(sodium_mg, 0.0) / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_sod,
+                   COUNT(*) AS freq,
+                   MAX(id) AS last_id
+            FROM meal_logs
+            WHERE user_id = ?
+            GROUP BY dish_name
+            ORDER BY freq DESC, last_id DESC
+            LIMIT 6
+            """,
+            (user_id,),
+        ).fetchall()
+
+    frequent_meals = [{
+        "dish_name": r["dish_name"],
+        "freq": int(r["freq"] or 1),
+        "energy_kcal": round(float(r["avg_kcal"] or 0.0), 1),
+        "protein_g": round(float(r["avg_p"] or 0.0), 1),
+        "fat_g": round(float(r["avg_f"] or 0.0), 1),
+        "carb_g": round(float(r["avg_c"] or 0.0), 1),
+        "fiber_g": round(float(r["avg_fib"] or 0.0), 1),
+        "sodium_mg": round(float(r["avg_sod"] or 0.0), 1),
+    } for r in fq_rows]
+
+    return {
+        "user_row": dict(user_row) if user_row else None,
+        "scan_status": scan_status,
+        "stats": stats,
+        "streak_days": streak_days,
+        "water_data": water_data,
+        "weight_history": [dict(r) for r in wt_rows],
+        "frequent_meals": frequent_meals,
     }
 
 
@@ -1611,6 +1832,11 @@ def publish_food_to_catalog(food_name: str, category: str, kcal_100: float, p_10
         )
     sq.commit()
     sq.close()
+    try:
+        from nutrition_engine import invalidate_food_catalog_cache
+        invalidate_food_catalog_cache()
+    except Exception:
+        pass
 
     # 2. Perbarui status draft & simpan ke katalog cloud permanen
     with _db_session() as (conn, cur):

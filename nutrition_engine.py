@@ -8,8 +8,12 @@ import sqlite3
 import os
 import re
 import difflib
+import threading
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db")
+_CATALOG_LOCK = threading.Lock()
+_FOOD_CATALOG_CACHE = None
+_FOOD_CATALOG_META = ("", 0.0)
 
 # Kamus bahan pokok Indonesia -> nama tepat di database TKPI Kemenkes
 BASE_INGREDIENT_SYNONYMS = {
@@ -100,6 +104,49 @@ def compute_macro_targets(target_kcal: float, focus_goal: str = "Diet Sehat") ->
     }
 
 
+def invalidate_food_catalog_cache():
+    """Menghapus cache RAM katalog TKPI saat ada pembaruan katalog."""
+    global _FOOD_CATALOG_CACHE, _FOOD_CATALOG_META
+    with _CATALOG_LOCK:
+        _FOOD_CATALOG_CACHE = None
+        _FOOD_CATALOG_META = ("", 0.0)
+
+
+def _get_cached_food_catalog():
+    """Memuat katalog TKPI ke memori sekali (otomatis refresh bila file DB berubah)."""
+    global _FOOD_CATALOG_CACHE, _FOOD_CATALOG_META
+    try:
+        cur_mtime = os.path.getmtime(DB_PATH)
+    except OSError:
+        cur_mtime = 0.0
+
+    with _CATALOG_LOCK:
+        if _FOOD_CATALOG_CACHE is not None and _FOOD_CATALOG_META == (DB_PATH, cur_mtime):
+            return _FOOD_CATALOG_CACHE
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        raw_rows = cur.execute("SELECT * FROM food_composition").fetchall()
+        conn.close()
+
+        indexed = []
+        for raw in raw_rows:
+            d = dict(raw)
+            fname_low = (d.get("food_name") or "").lower()
+            core_name = _strip_tkpi_parens(fname_low)
+            core_tokens = tuple(t for t in re.split(r"[\s,]+", core_name) if t)
+            indexed.append({
+                "row": d,
+                "fname_low": fname_low,
+                "core_name": core_name,
+                "core_tokens": core_tokens,
+            })
+
+        _FOOD_CATALOG_CACHE = indexed
+        _FOOD_CATALOG_META = (DB_PATH, cur_mtime)
+        return _FOOD_CATALOG_CACHE
+
+
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -115,10 +162,7 @@ def find_best_match(query_name: str):
     4. Core-name match tanpa teks kurung Inggris + penalti olahan jika tak diminta
     5. Strict fuzzy match (cutoff 0.85) agar tidak salah cocok antar bahan berbeda
     """
-    conn = get_db_connection()
-    cur = conn.cursor()
-    rows = cur.execute("SELECT * FROM food_composition").fetchall()
-    conn.close()
+    catalog = _get_cached_food_catalog()
 
     query_lower = " ".join((query_name or "").lower().strip().split())
     if not query_lower:
@@ -165,8 +209,9 @@ def find_best_match(query_name: str):
     # 1.5. Cek pencarian via Barcode jika input berupa angka (8-14 digit)
     clean_digits = "".join(filter(str.isdigit, query_name))
     if len(clean_digits) >= 8:
-        for row in rows:
-            if "barcode" in row.keys() and row["barcode"] and clean_digits in str(row["barcode"]):
+        for entry in catalog:
+            row = entry["row"]
+            if row.get("barcode") and clean_digits in str(row["barcode"]):
                 return dict(row)
         # Jika belum ada di database lokal, coba tarik real-time dari Open Food Facts API
         off_product = fetch_open_food_facts(clean_digits)
@@ -177,26 +222,23 @@ def find_best_match(query_name: str):
     syn_target = BASE_INGREDIENT_SYNONYMS.get(query_lower)
     if syn_target:
         syn_low = syn_target.lower()
-        for row in rows:
-            if row["food_name"].lower() == syn_low:
-                return dict(row)
+        for entry in catalog:
+            if entry["fname_low"] == syn_low:
+                return dict(entry["row"])
 
     # 3. Cek exact match langsung (penuh atau tanpa terjemahan dalam kurung)
-    for row in rows:
-        fname_low = row["food_name"].lower()
-        core_low = _strip_tkpi_parens(fname_low)
-        if query_lower == fname_low or query_lower == core_low:
-            return dict(row)
+    for entry in catalog:
+        if query_lower == entry["fname_low"] or query_lower == entry["core_name"]:
+            return dict(entry["row"])
 
     # 4. Word-boundary & substring scoring pada nama inti TKPI (bebas penalti teks Inggris)
     matching_substrings = []
     query_words = [w for w in re.split(r"[\s,]+", query_lower) if len(w) >= 3]
     query_wants_modifier = any(mod in query_words for mod in COOKING_MODIFIERS)
 
-    for row in rows:
-        name_lower = row["food_name"].lower()
-        core_name = _strip_tkpi_parens(name_lower)
-        core_tokens = [t for t in re.split(r"[\s,]+", core_name) if t]
+    for entry in catalog:
+        core_name = entry["core_name"]
+        core_tokens = entry["core_tokens"]
 
         base_score = 0.0
         if len(query_lower) >= 3 and re.search(rf"\b{re.escape(query_lower)}\b", core_name):
@@ -212,7 +254,7 @@ def find_best_match(query_name: str):
                 base_score *= 0.55
             elif not query_wants_modifier and ("segar" in core_tokens or "mentah" in core_tokens):
                 base_score *= 1.15
-            matching_substrings.append((base_score, dict(row)))
+            matching_substrings.append((base_score, dict(entry["row"])))
 
     if matching_substrings:
         matching_substrings.sort(key=lambda x: x[0], reverse=True)
@@ -221,10 +263,10 @@ def find_best_match(query_name: str):
     # 5. Fuzzy match ketat (cutoff 0.85) pada nama inti agar typo wajar terbantu tanpa false positive
     if len(query_lower) >= 4:
         core_to_row = {}
-        for row in rows:
-            ck = _strip_tkpi_parens(row["food_name"]).lower()
+        for entry in catalog:
+            ck = entry["core_name"]
             if ck not in core_to_row:
-                core_to_row[ck] = row
+                core_to_row[ck] = entry["row"]
         matches = difflib.get_close_matches(query_lower, list(core_to_row.keys()), n=1, cutoff=0.85)
         if matches:
             return dict(core_to_row[matches[0]])
@@ -462,10 +504,11 @@ def auto_learn_food(food_name: str, category: str, kcal_100: float, p_100: float
         print(f"[AutoLearn] Gagal auto-insert {clean_name}: {e}")
         return None
 
-def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.0):
+def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.0, auto_learn: bool = True):
     """
     Menerima daftar komponen dari AI. Jika item tidak ada di database lokal,
     gunakan estimasi nutrisi per 100g yang dikirimkan oleh AI.
+    Set auto_learn=False saat render interaktif slider/checkbox agar 0 penulisan DB berulang.
     """
     calculated_items = []
     totals = {
@@ -516,7 +559,7 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
             sod_100 = float(comp.get("sodium_mg_per_100g", 0.0))
             
             # Auto-Learning: Simpan otomatis ke antrean staging jika hasil dari ekstraksi AI
-            if kcal_100 > 0 and not is_override:
+            if kcal_100 > 0 and not is_override and auto_learn:
                 auto_learn_food(raw_name, "Pangan Olahan (Auto-Learn AI)", kcal_100, p_100, f_100, c_100, fib_100, sod_100)
             
             factor = weight / 100.0

@@ -14,11 +14,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 import urllib.parse
 
-import importlib
+import sqlite3
 import nutrition_engine
 import db_history
-importlib.reload(nutrition_engine)
-importlib.reload(db_history)
 
 from gemini_extractor import analyze_food_image, analyze_food_text
 from nutrition_engine import (
@@ -38,7 +36,7 @@ from db_history import (
     export_user_data_json, import_user_data_json,
     get_local_now, create_session_token, verify_session_token,
     update_user_preferences, log_weight_entry, get_weight_history, get_logging_streak,
-    get_storage_backend_info
+    get_storage_backend_info, get_dashboard_bundle
 )
 from google_auth import get_google_auth_url, exchange_code_for_user
 
@@ -88,14 +86,69 @@ PATCH_NOTES = [
     }
 ]
 
-init_user_history_tables()
-
 st.set_page_config(
     page_title="Nutrisi Cerdas - Pahami Pola Makanmu Berbasis TKPI Kemenkes",
     page_icon="🥗",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+
+@st.cache_resource(show_spinner=False)
+def _ensure_schema_ready():
+    init_user_history_tables()
+    return True
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_dashboard_bundle_cached(uid: str, target_date_str: str, tz_offset: int, mut_ver: int):
+    return get_dashboard_bundle(uid, target_date=target_date_str, tz_offset=tz_offset)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_pending_foods_cached(mut_ver: int):
+    return get_pending_foods(status="pending")
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _fetch_custom_foods_cached(uid: str, mut_ver: int):
+    return get_custom_foods(uid)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_tkpi_categories_and_count():
+    conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
+    cur = conn.cursor()
+    cats = [r[0] for r in cur.execute("SELECT DISTINCT category FROM food_composition WHERE category IS NOT NULL ORDER BY category").fetchall()]
+    total_cnt = cur.execute("SELECT COUNT(*) FROM food_composition").fetchone()[0]
+    conn.close()
+    return cats, total_cnt
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _search_tkpi_catalog_cached(query_str: str, sel_cat_str: str):
+    conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
+    cur = conn.cursor()
+    sql = "SELECT food_name, category, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode FROM food_composition WHERE 1=1"
+    params = []
+    if query_str:
+        sql += " AND (food_name LIKE ? OR barcode LIKE ?)"
+        params.append(f"%{query_str}%")
+        params.append(f"%{query_str}%")
+    if sel_cat_str != "Semua Kategori":
+        sql += " AND category = ?"
+        params.append(sel_cat_str)
+    sql += " ORDER BY food_name ASC LIMIT 50"
+    rows = cur.execute(sql, params).fetchall()
+    conn.close()
+    return [tuple(r) for r in rows]
+
+
+def _mark_db_mutated():
+    st.session_state["db_mutation_ver"] = st.session_state.get("db_mutation_ver", 0) + 1
+
+
+_ensure_schema_ready()
 
 # Tangani Redirect Google OAuth Callback (?code=...)
 auth_code = st.query_params.get("code", "")
@@ -112,6 +165,8 @@ if auth_code:
         name = user_info.get("name") or email.split("@")[0]
         u = get_or_create_user(email, display_name=name, auth_provider="google")
         st.session_state["user"] = u
+        st.session_state["nutrition_data"] = None
+        _mark_db_mutated()
         st.query_params.clear()
         st.query_params["u"] = u["user_id"]
         st.query_params["s"] = create_session_token(u["user_id"])
@@ -151,10 +206,34 @@ if "comp_toggle_nonce" not in st.session_state:
     st.session_state["comp_toggle_nonce"] = 0
 if "last_saved_item" not in st.session_state:
     st.session_state["last_saved_item"] = None
+if "db_mutation_ver" not in st.session_state:
+    st.session_state["db_mutation_ver"] = 0
 
-# Deteksi Tema Tersimpan Milik Pengguna
+# Deteksi Tema Tersimpan & Data Dashboard Ter-bundle (1 koneksi tunggal + cache antar slider rerun)
 current_user = st.session_state["user"]
 user_theme = current_user.get("theme_preference") or "System Default"
+is_google = current_user.get("auth_provider") == "google"
+is_admin = is_admin_user(current_user["user_id"])
+user_tz = int(current_user.get("timezone_offset") if current_user.get("timezone_offset") is not None else 8)
+user_focus = current_user.get("focus_goal") or "Diet Sehat"
+local_now = get_local_now(user_tz)
+if "selected_diary_date" not in st.session_state:
+    st.session_state["selected_diary_date"] = local_now.date()
+active_diary_date = st.session_state["selected_diary_date"]
+active_diary_date_str = active_diary_date.strftime("%Y-%m-%d")
+
+dash_bundle = _fetch_dashboard_bundle_cached(
+    current_user["user_id"],
+    active_diary_date_str,
+    user_tz,
+    st.session_state.get("db_mutation_ver", 0)
+)
+scan_status = dash_bundle["scan_status"]
+stats = dash_bundle["stats"]
+streak_days = dash_bundle["streak_days"]
+water_data = dash_bundle["water_data"]
+w_hist = dash_bundle["weight_history"]
+freq_meals = dash_bundle["frequent_meals"]
 
 # Generator CSS Tema 60-30-10 Anti-Tabrakan Warna (Mengunci Background, Card, Input, Dropdown, Popover, FileUploader, Camera, Alert, & Toast)
 def build_theme_css(bg_main: str, bg_sidebar: str, bg_card: str, bg_input: str, text_primary: str, text_muted: str, border_col: str, accent: str, accent_fg: str, tab_bg: str):
@@ -473,13 +552,7 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# Pre-fetch status user untuk sidebar & header
-current_user = st.session_state["user"]
-is_google = current_user.get("auth_provider") == "google"
-is_admin = is_admin_user(current_user["user_id"])
-user_tz = int(current_user.get("timezone_offset") if current_user.get("timezone_offset") is not None else 8)
-user_focus = current_user.get("focus_goal") or "Diet Sehat"
-scan_status = get_user_scan_status(current_user["user_id"], tz_offset=user_tz)
+# Konstanta pilihan porsi & waktu makan (scan_status sudah dihitung 1x di dash_bundle)
 
 TZ_OPTIONS = {
     7: "WIB (UTC+7 — Jawa/Sumatra/Kalbar)",
@@ -643,7 +716,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
             key=f"prev_mult_{context_key}_{nonce}"
         )
 
-        calc_res = calculate_dish_nutrition(active_components, portion_multiplier=p_mult)
+        calc_res = calculate_dish_nutrition(active_components, portion_multiplier=p_mult, auto_learn=False)
         t_tot = calc_res["totals"]
 
         ng = evaluate_nutri_grade(
@@ -696,6 +769,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                     st.session_state["nutrition_data"]["saved_log_id"] = res_log["id"]
                     st.session_state["nutrition_data"]["saved_meal_type"] = sel_meal_clean
                     st.session_state["nutrition_data"]["saved_multiplier"] = p_mult
+                    _mark_db_mutated()
                     st.toast(f"✅ {data.get('dish_name')} tersimpan ke {sel_meal_clean}!")
                     st.rerun()
             with col_act2:
@@ -718,6 +792,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                         st.session_state["last_saved_item"] = res_upd
                     st.session_state["nutrition_data"]["saved_meal_type"] = sel_meal_clean
                     st.session_state["nutrition_data"]["saved_multiplier"] = p_mult
+                    _mark_db_mutated()
                     st.toast(f"🔄 Catatan diperbarui ke {sel_meal_clean} ({t_tot['energy_kcal']} kkal)!")
                     st.rerun()
             with col_u2:
@@ -727,6 +802,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                     st.session_state["nutrition_data"].pop("saved_meal_type", None)
                     if st.session_state.get("last_saved_item") and st.session_state["last_saved_item"].get("id") == saved_id:
                         st.session_state["last_saved_item"] = None
+                    _mark_db_mutated()
                     st.toast("↩️ Simpanan dibatalkan. Kini kembali ke mode Preview.")
                     st.rerun()
             with col_u3:
@@ -789,6 +865,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                         res_upd = update_meal_log(saved_id, active_user["user_id"], dish_name=ed_name, totals=new_tot, multiplier=p_mult, meal_type=sel_meal_clean)
                         if res_upd:
                             st.session_state["last_saved_item"] = res_upd
+                        _mark_db_mutated()
                     st.toast("Nilai gizi pada kartu hasil berhasil diperbarui!")
                     st.rerun()
             with col_pub2:
@@ -800,6 +877,9 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                             fib_100=float(t_tot.get("fiber_g", 0.0)),
                             barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0
                         )
+                        _fetch_tkpi_categories_and_count.clear()
+                        _search_tkpi_catalog_cached.clear()
+                        _mark_db_mutated()
                         st.success(f"🎉 '{ed_name}' berhasil dipublikasikan secara resmi ke katalog utama!")
                 else:
                     if st.button("📥 Ajukan ke Antrean Kurasi Admin", type="primary", use_container_width=True, key=f"btn_stage_catalog_now_{context_key}_{nonce}"):
@@ -810,6 +890,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
                             barcode=ed_bc, serving_unit=ed_serv, serving_weight=100.0,
                             source_origin="Koreksi Pengguna", submitted_by=active_user["user_id"]
                         )
+                        _mark_db_mutated()
                         st.success("✅ Berhasil diajukan ke antrean kurasi Admin sebelum dipublikasikan!")
 
 # Sidebar: Akun Pribadi & Target Harian (Efisien, Bersih, & Kompak)
@@ -849,7 +930,9 @@ with st.sidebar:
         """, unsafe_allow_html=True)
         if st.button("🚪 Keluar Akun (Logout)", use_container_width=True, key="sb_btn_logout"):
             st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
+            st.session_state["nutrition_data"] = None
             st.query_params.clear()
+            _mark_db_mutated()
             st.toast("Anda telah berhasil keluar dari akun.")
             st.rerun()
 
@@ -860,6 +943,7 @@ with st.sidebar:
     if new_target != current_target:
         update_calorie_target(current_user["user_id"], float(new_target))
         st.session_state["user"]["daily_calorie_target"] = float(new_target)
+        _mark_db_mutated()
         st.toast("Target kalori diperbarui!")
         st.rerun()
 
@@ -906,6 +990,7 @@ with st.sidebar:
             recom_target = max(1200, min(3800, recom_target))
             update_calorie_target(current_user["user_id"], float(recom_target))
             st.session_state["user"]["daily_calorie_target"] = float(recom_target)
+            _mark_db_mutated()
             st.success(f"🎯 Target kalori berhasil diatur menjadi **{recom_target} kkal/hari**!")
             st.rerun()
 
@@ -921,6 +1006,7 @@ with st.sidebar:
             st.session_state["user"]["timezone_offset"] = sel_tz
             st.session_state["user"]["focus_goal"] = sel_focus
             st.session_state["selected_diary_date"] = get_local_now(sel_tz).date()
+            _mark_db_mutated()
             st.toast("Preferensi fokus & zona waktu disimpan!")
             st.rerun()
 
@@ -933,6 +1019,7 @@ with st.sidebar:
         if selected_theme != user_theme:
             update_user_theme(current_user["user_id"], selected_theme)
             st.session_state["user"]["theme_preference"] = selected_theme
+            _mark_db_mutated()
             st.toast(f"Tema diubah ke {selected_theme}!")
             st.rerun()
 
@@ -940,19 +1027,22 @@ with st.sidebar:
     if current_user["user_id"] != "Tamu (Demo)":
         with st.expander("📦 Cadangan Data Pribadi (Opsional)", expanded=False):
             st.caption("Unduh salinan riwayat makan & berat badan Anda kapan saja:")
-            json_bk = export_user_data_json(current_user["user_id"])
-            st.download_button(
-                "⬇️ Unduh Salinan Diary (.json)",
-                data=json_bk,
-                file_name=f"nutrisi_cerdas_{current_user['user_id']}_{get_local_now(user_tz).strftime('%Y%m%d')}.json",
-                mime="application/json",
-                use_container_width=True,
-                key="sb_btn_export_json"
-            )
+            if st.button("📦 Siapkan File Cadangan (.json)", use_container_width=True, key="sb_btn_prep_json"):
+                st.session_state["prepared_backup_json"] = export_user_data_json(current_user["user_id"])
+            if st.session_state.get("prepared_backup_json"):
+                st.download_button(
+                    "⬇️ Unduh Salinan Diary (.json)",
+                    data=st.session_state["prepared_backup_json"],
+                    file_name=f"nutrisi_cerdas_{current_user['user_id']}_{get_local_now(user_tz).strftime('%Y%m%d')}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    key="sb_btn_export_json"
+                )
             up_bk = st.file_uploader("Pulihkan dari file .json:", type=["json"], key="sb_up_restore_json")
             if up_bk and st.button("♻️ Pulihkan Sekarang", use_container_width=True, key="sb_btn_do_restore"):
                 ok_imp, msg_imp = import_user_data_json(current_user["user_id"], up_bk.getvalue().decode("utf-8"))
                 if ok_imp:
+                    _mark_db_mutated()
                     st.success(msg_imp)
                     st.rerun()
                 else:
@@ -984,11 +1074,6 @@ with st.sidebar:
                 st.markdown("---")
 
 # Header Brand Utama dengan Logo Menonjol & Kotak Login Akun Langsung di Halaman Utama
-current_user = st.session_state["user"]
-is_google = current_user.get("auth_provider") == "google"
-user_tz = int(current_user.get("timezone_offset") if current_user.get("timezone_offset") is not None else 8)
-user_focus = current_user.get("focus_goal") or "Diet Sehat"
-scan_status = get_user_scan_status(current_user["user_id"], tz_offset=user_tz)
 
 if st.session_state.get("auth_url_warning"):
     st.warning(
@@ -1055,7 +1140,9 @@ with col_head2:
                     st.markdown("---")
                     if st.button("🚪 Keluar dari Akun (Logout)", type="primary", use_container_width=True, key="btn_logout_top"):
                         st.session_state["user"] = get_or_create_user("Tamu (Demo)", display_name="Tamu Sehat", auth_provider="local")
+                        st.session_state["nutrition_data"] = None
                         st.query_params.clear()
+                        _mark_db_mutated()
                         st.toast("Anda telah berhasil keluar dari akun.")
                         st.rerun()
                     st.markdown("---")
@@ -1072,9 +1159,11 @@ with col_head2:
                         success, res = authenticate_user(in_uid, in_pin)
                         if success:
                             st.session_state["user"] = res
+                            st.session_state["nutrition_data"] = None
                             st.query_params["u"] = res["user_id"]
                             st.query_params["s"] = create_session_token(res["user_id"])
                             st.query_params["auth"] = "local"
+                            _mark_db_mutated()
                             st.toast(f"Selamat datang kembali, {res['display_name']}!")
                             st.rerun()
                         else:
@@ -1135,9 +1224,11 @@ with col_head2:
                             )
                             if success:
                                 st.session_state["user"] = res
+                                st.session_state["nutrition_data"] = None
                                 st.query_params["u"] = res["user_id"]
                                 st.query_params["s"] = create_session_token(res["user_id"])
                                 st.query_params["auth"] = "local"
+                                _mark_db_mutated()
                                 st.balloons()
                                 st.toast("🎉 Akun Open Beta berhasil dibuat! Akses 5x scan foto/hari aktif.")
                                 st.rerun()
@@ -1248,6 +1339,7 @@ if current_user["user_id"] == "Tamu (Demo)":
                             st.query_params["u"] = res["user_id"]
                             st.query_params["s"] = create_session_token(res["user_id"])
                             st.query_params["auth"] = "local"
+                            _mark_db_mutated()
                             st.balloons()
                             st.toast("🎉 Akun berhasil dibuat! Akses 5x scan foto/hari aktif untuk Anda.")
                             st.rerun()
@@ -1279,9 +1371,9 @@ if "selected_diary_date" not in st.session_state:
 active_diary_date = st.session_state["selected_diary_date"]
 active_diary_date_str = active_diary_date.strftime("%Y-%m-%d")
 
-# Ambil statistik riwayat & streak akun berdasarkan tanggal lokal yang dipilih
-stats = get_user_history_stats(st.session_state["user"]["user_id"], target_date=active_diary_date_str, tz_offset=user_tz)
-streak_days = get_logging_streak(st.session_state["user"]["user_id"], tz_offset=user_tz)
+# Ambil statistik riwayat & streak akun dari single-bundle dashboard cache (hemat query berulang)
+stats = dash_bundle["stats"]
+streak_days = dash_bundle["streak_days"]
 target_kcal = float(st.session_state["user"].get("daily_calorie_target") or 2000.0)
 today_kcal = stats["today_totals"]["energy_kcal"]
 pct_today_actual = round((today_kcal / target_kcal) * 100, 1) if target_kcal > 0 else 0.0
@@ -1475,8 +1567,8 @@ with tab_diary:
         with qc_col2:
             dash_btn_calc = st.button("🔍 Preview & Hitung", type="primary", use_container_width=True, key="btn_dash_quick")
 
-        # Inovasi 1: Sering Kamu Makan (Otomatis dari Riwayat Akunmu)
-        freq_meals = get_frequent_meals(st.session_state["user"]["user_id"], limit=6)
+        # Inovasi 1: Sering Kamu Makan (Otomatis dari Riwayat Akunmu di bundle cache)
+        freq_meals = dash_bundle.get("frequent_meals") or []
         if freq_meals:
             st.caption("⭐ **Sering Kamu Makan (1-Klik Preview Porsi 1.0x):**")
             fq_cols = st.columns(3)
@@ -1564,7 +1656,7 @@ with tab_diary:
             st.info(f"🍽️ Sedang ada Preview terbuka untuk **{st.session_state['nutrition_data'].get('dish_name')}** di tab **{st.session_state.get('preview_origin_tab', 'scanner').title()}**.")
 
     # Widget Pelacak Air Minum Harian & Pelacak Berat Badan
-    water_data = get_water_intake(st.session_state["user"]["user_id"], tz_offset=user_tz)
+    water_data = dash_bundle.get("water_data") or {"glasses": 0, "target": 8, "ml": 0}
     water_pct = min(1.0, water_data["glasses"] / max(1, water_data["target"]))
     
     c_track1, c_track2 = st.columns([1.15, 1], gap="medium")
@@ -1580,16 +1672,18 @@ with tab_diary:
                 with col_b1:
                     if st.button("➕", use_container_width=True, key="btn_add_water", help="Tambah 1 gelas air"):
                         log_water_intake(st.session_state["user"]["user_id"], 1, tz_offset=user_tz)
+                        _mark_db_mutated()
                         st.toast("💧 +1 Gelas air dicatat!")
                         st.rerun()
                 with col_b2:
                     if st.button("➖", use_container_width=True, key="btn_sub_water", help="Kurangi 1 gelas air"):
                         log_water_intake(st.session_state["user"]["user_id"], -1, tz_offset=user_tz)
+                        _mark_db_mutated()
                         st.rerun()
 
     with c_track2:
         with st.container(border=True):
-            w_hist = get_weight_history(st.session_state["user"]["user_id"], limit=30)
+            w_hist = dash_bundle.get("weight_history") or []
             latest_w = w_hist[-1]["weight_kg"] if w_hist else float(current_user.get("weight_kg") or 65.0)
             cw_1, cw_2 = st.columns([1.8, 1.1], vertical_alignment="bottom")
             with cw_1:
@@ -1598,6 +1692,7 @@ with tab_diary:
                 if st.button("💾 Catat BB", use_container_width=True, key="btn_save_weight"):
                     log_weight_entry(st.session_state["user"]["user_id"], in_w, tz_offset=user_tz, recorded_date=active_diary_date_str)
                     st.session_state["user"]["weight_kg"] = in_w
+                    _mark_db_mutated()
                     st.toast(f"⚖️ Berat badan {in_w:.1f} kg disimpan!")
                     st.rerun()
             if len(w_hist) >= 2:
@@ -1665,6 +1760,7 @@ with tab_diary:
         with c_dup2:
             if st.button(f"🧹 Rapikan Menu Kembar ({len(dup_ids)})", type="primary", use_container_width=True, key="btn_clean_dups"):
                 del_cnt = remove_duplicate_meals_for_date(st.session_state["user"]["user_id"], active_diary_date_str)
+                _mark_db_mutated()
                 st.toast(f"🧹 Berhasil merapikan {del_cnt} catatan kembar!")
                 st.rerun()
 
@@ -1781,11 +1877,13 @@ with tab_diary:
                                 res_sc = scale_meal_log_portion(m["id"], st.session_state["user"]["user_id"], ed_mult, new_meal_type=ed_mt)
                                 if res_sc:
                                     st.session_state["last_saved_item"] = res_sc
+                                _mark_db_mutated()
                                 st.toast(f"✅ {m['dish_name']} diperbarui ({ed_mt}, {ed_mult}x)!")
                                 st.rerun()
                     with col_row4:
                         if st.button("🗑️", key=f"del_{m['id']}", help="Hapus menu ini", use_container_width=True):
                             delete_meal_log(m["id"], st.session_state["user"]["user_id"])
+                            _mark_db_mutated()
                             st.toast("Catatan makanan berhasil dihapus.")
                             st.rerun()
     else:
@@ -1801,6 +1899,7 @@ with tab_diary:
         if st.button("📋 Salin Daftar Menu dari Kemarin", use_container_width=True, key="btn_copy_yesterday_empty"):
             cnt_cp = copy_meals_from_date(st.session_state["user"]["user_id"], yest_for_copy, active_diary_date_str, tz_offset=user_tz)
             if cnt_cp > 0:
+                _mark_db_mutated()
                 st.toast(f"📋 Berhasil menyalin {cnt_cp} menu dari kemarin ({yest_for_copy})!")
                 st.rerun()
             else:
@@ -1854,6 +1953,7 @@ with tab_scanner:
                                 res = analyze_food_image(im, caption=p_caption, api_key=api_key)
                                 res["user_caption"] = p_caption or "Foto Piring"
                                 record_scan_usage(current_user["user_id"], tz_offset=user_tz)
+                                _mark_db_mutated()
                                 _open_food_preview(res, origin_tab="scanner")
                                 st.toast("🔍 Foto berhasil dianalisis! Cek porsi & pilih waktu makan di bawah sebelum Simpan.")
                                 st.rerun()
@@ -2039,13 +2139,14 @@ with tab_scanner:
                             submitted_by=current_user["user_id"]
                         )
                         st.success(f"Berhasil dicatat ke sesi {m_meal_clean}!")
+                        _mark_db_mutated()
                         st.rerun()
                     else:
                         st.warning("Mohon isi nama makanan terlebih dahulu.")
                         
             with col_m2:
                 st.markdown("##### 📚 Koleksi Makanan Tersimpan")
-                saved_custom = get_custom_foods(st.session_state["user"]["user_id"])
+                saved_custom = _fetch_custom_foods_cached(st.session_state["user"]["user_id"], st.session_state.get("db_mutation_ver", 0))
                 if saved_custom:
                     for c_item in saved_custom:
                         with st.container(border=True):
@@ -2065,11 +2166,13 @@ with tab_scanner:
                                         tz_offset=user_tz
                                     )
                                     st.session_state["last_saved_item"] = res_log
+                                    _mark_db_mutated()
                                     st.toast(f"Berhasil mencatat {c_item['food_name']}!")
                                     st.rerun()
                             with col_cbtn2:
                                 if st.button("🗑️", key=f"del_c_{c_item['id']}"):
                                     delete_custom_food(c_item["id"], st.session_state["user"]["user_id"])
+                                    _mark_db_mutated()
                                     st.rerun()
                 else:
                     st.info("Makanan manual yang Anda simpan akan muncul di sini untuk dicatat ulang dengan 1 klik.")
@@ -2094,6 +2197,7 @@ with tab_scanner:
                 with mr_c3:
                     if st.button("🗑️", key=f"mini_del_{mr['id']}", help="Hapus dari hari ini"):
                         delete_meal_log(mr["id"], st.session_state["user"]["user_id"])
+                        _mark_db_mutated()
                         st.toast("Catatan dihapus.")
                         st.rerun()
         else:
@@ -2106,7 +2210,7 @@ with tab_sources:
 
     # 🛡️ PANEL KURASI & EDIT SEBELUM PUBLIKASI (Khusus Admin — Menghindari Update Mendadak)
     if is_admin:
-        pending_list = get_pending_foods(status="pending")
+        pending_list = _fetch_pending_foods_cached("pending", st.session_state.get("db_mutation_ver", 0))
         with st.expander(f"🛡️ **Panel Kurasi & Edit Data Gizi Sebelum Publikasi ({len(pending_list)} Draft Menunggu - Admin Only)**", expanded=bool(len(pending_list) > 0)):
             st.caption("Setiap data baru dari **Open Food Facts API**, **AI Auto-Learn**, maupun **Usulan Pengguna** masuk ke ruang tinjauan (Staging) ini terlebih dahulu agar Anda dapat mengedit dan memverifikasi angkanya sebelum resmi dipublikasikan ke database utama.")
             if pending_list:
@@ -2136,10 +2240,14 @@ with tab_sources:
                                     serving_weight=float(p_item.get("default_serving_weight") or 100.0),
                                     pending_id=p_item["id"]
                                 )
+                                _fetch_tkpi_categories_and_count.clear()
+                                _search_tkpi_catalog_cached.clear()
+                                _mark_db_mutated()
                                 st.toast(f"✅ {p_name} resmi dipublikasikan ke katalog utama!")
                                 st.rerun()
                             if st.button("🗑️ Tolak Draft", use_container_width=True, key=f"btn_rej_{p_item['id']}"):
                                 reject_pending_food(p_item["id"])
+                                _mark_db_mutated()
                                 st.toast("Draft dihapus dari antrean.")
                                 st.rerun()
             else:
@@ -2167,6 +2275,9 @@ with tab_sources:
                             kcal_100=new_f_kcal, p_100=new_f_p, f_100=new_f_f, c_100=new_f_c,
                             fib_100=new_f_fib, barcode=new_f_bc.strip()
                         )
+                        _fetch_tkpi_categories_and_count.clear()
+                        _search_tkpi_catalog_cached.clear()
+                        _mark_db_mutated()
                         st.success(f"✅ '{new_f_name}' berhasil disimpan dan dipublikasikan ke katalog utama!")
                         st.rerun()
                     else:
@@ -2212,31 +2323,11 @@ with tab_sources:
     col_q1, col_q2 = st.columns([2, 1])
     with col_q1:
         search_query = st.text_input("Ketik nama makanan atau nomor barcode:", placeholder="Contoh: ayam, nasi, telur, ultra milk, indomie, fitbar", key="kb_search")
+    cats, total_db_count = _fetch_tkpi_categories_and_count()
     with col_q2:
-        import sqlite3
-        conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cats = [r[0] for r in cur.execute("SELECT DISTINCT category FROM food_composition WHERE category IS NOT NULL ORDER BY category").fetchall()]
         sel_cat = st.selectbox("Filter Kategori:", ["Semua Kategori"] + cats, key="kb_cat")
-        conn.close()
 
-    conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
-    cur = conn.cursor()
-    total_db_count = cur.execute("SELECT COUNT(*) FROM food_composition").fetchone()[0]
-    sql = "SELECT food_name, category, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode FROM food_composition WHERE 1=1"
-    params = []
-    if search_query.strip():
-        sql += " AND (food_name LIKE ? OR barcode LIKE ?)"
-        params.append(f"%{search_query.strip()}%")
-        params.append(f"%{search_query.strip()}%")
-    if sel_cat != "Semua Kategori":
-        sql += " AND category = ?"
-        params.append(sel_cat)
-    sql += " ORDER BY food_name ASC LIMIT 50"
-
-    results = cur.execute(sql, params).fetchall()
-    conn.close()
+    results = _search_tkpi_catalog_cached(search_query.strip(), sel_cat)
 
     if results:
         table_kb = []
