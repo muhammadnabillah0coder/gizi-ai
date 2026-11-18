@@ -40,6 +40,11 @@ class TestCloudAdapterAndV4(unittest.TestCase):
         self.assertEqual(cfg["password"], "p@ss#word")
         self.assertEqual(cfg["database"], "postgres")
         self.assertTrue(cfg["use_ssl"])
+        self.assertFalse(cfg["ssl_verify"])
+
+        cfg_strict = db_history.parse_database_url(f"{uri}?sslmode=verify-full")
+        self.assertTrue(cfg_strict["use_ssl"])
+        self.assertTrue(cfg_strict["ssl_verify"])
 
         with self.assertRaises(ValueError):
             db_history.parse_database_url("mysql://user:pass@localhost/db")

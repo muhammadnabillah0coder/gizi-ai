@@ -212,7 +212,16 @@ def parse_database_url(uri: str) -> dict:
     query_params = urllib.parse.parse_qs(parsed.query)
     sslmode = (query_params.get("sslmode", [""])[0] or "").lower()
     is_local_host = parsed.hostname in {"localhost", "127.0.0.1"}
+    is_supabase_host = parsed.hostname.endswith(".supabase.com") or parsed.hostname.endswith(".supabase.co")
     use_ssl = False if (sslmode == "disable" or (is_local_host and sslmode != "require")) else True
+
+    if sslmode in {"verify-ca", "verify-full"}:
+        ssl_verify = True
+    elif sslmode in {"no-verify", "require"} or (not sslmode and is_supabase_host):
+        # Standar libpq sslmode=require / pooler Supabase memakai TLS tanpa verifikasi CA internal
+        ssl_verify = False
+    else:
+        ssl_verify = True
 
     return {
         "user": urllib.parse.unquote(parsed.username or "postgres"),
@@ -221,7 +230,7 @@ def parse_database_url(uri: str) -> dict:
         "port": int(parsed.port or 5432),
         "database": (parsed.path or "/postgres").lstrip("/") or "postgres",
         "use_ssl": use_ssl,
-        "ssl_verify": sslmode != "no-verify",
+        "ssl_verify": ssl_verify,
     }
 
 
