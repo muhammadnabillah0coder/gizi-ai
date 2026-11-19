@@ -82,12 +82,20 @@ from db_history import (
 )
 from google_auth import get_google_auth_url, exchange_code_for_user, verify_oauth_state
 
-APP_VERSION = "v4.1.1-beta"
+APP_VERSION = "v4.1.2-beta"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v4.1.1-beta (Terbaru)",
+        "version": "v4.1.2-beta (Terbaru)",
+        "date": "19 Nov 2026",
+        "highlights": [
+            "🤖 Upgrade Engine Gemini ke `gemini-3.5-flash-lite`: Mengatasi error 404 model lama (`gemini-2.5-flash-lite`) untuk kunci API baru.",
+            "🔄 Auto-Failover Model Otomatis: Jika model utama mengembalikan 404/usang atau 503 sementara, sistem langsung beralih otomatis ke `gemini-3.1-flash-lite` dan `gemini-flash-lite-latest`."
+        ]
+    },
+    {
+        "version": "v4.1.1-beta",
         "date": "18 Nov 2026",
         "highlights": [
             "🔒 Hardening Keamanan Lengkap (Bug Hunter Pass 2): Enforcement kuota AI Vision pada scanner label kemasan, anti-CSRF OAuth `state`, & token URL sesi bergulir 30 hari.",

@@ -223,7 +223,7 @@ class TestCloudAdapterAndV4(unittest.TestCase):
         second_catalog = nutrition_engine._get_cached_food_catalog()
         self.assertIs(first_catalog, second_catalog)
 
-        unique_food = f"Uji Katalog Cache {uuid.uuid4().hex[:6]}"
+        unique_food = f"Uji Katalog Cache U{uuid.uuid4().hex[:6]}"
         try:
             db_history.publish_food_to_catalog(
                 food_name=unique_food,

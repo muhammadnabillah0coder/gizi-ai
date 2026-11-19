@@ -193,12 +193,41 @@ class TestAuthAndUI(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GEMINI_MODEL", None)
             model_name = gemini_extractor._get_gemini_model_name()
-            self.assertEqual(model_name, "gemini-2.5-flash-lite")
+            self.assertEqual(model_name, "gemini-3.5-flash-lite")
+
+        with patch.dict(os.environ, {"GEMINI_MODEL": "gemini-2.5-flash-lite"}, clear=False):
+            candidates = gemini_extractor._get_candidate_models()
+            self.assertEqual(candidates[0], "gemini-2.5-flash-lite")
+            self.assertIn("gemini-3.5-flash-lite", candidates)
+            self.assertIn("gemini-3.1-flash-lite", candidates)
 
         parsed = gemini_extractor._parse_json_payload('[{"dish_name": "Soto Ayam", "components": []}]')
         self.assertIsInstance(parsed, dict)
         self.assertEqual(parsed["dish_name"], "Soto Ayam")
         self.assertFalse(parsed["is_shared_platter"])
+
+    def test_gemini_auto_failover_on_404_deprecated_model(self):
+        deprecated_model = MagicMock()
+        deprecated_model.generate_content.side_effect = RuntimeError(
+            "404 This model models/gemini-2.5-flash-lite is no longer available to new users."
+        )
+        healthy_resp = MagicMock()
+        healthy_resp.text = '{"dish_name": "Daging Masak Asam", "confidence": "high", "components": [{"name": "Daging sapi", "weight_g": 120, "energy_kcal_per_100g": 201}], "health_tip": "Seimbangkan dengan sayuran hijau."}'
+        healthy_model = MagicMock()
+        healthy_model.generate_content.return_value = healthy_resp
+
+        with patch.dict(os.environ, {"GEMINI_MODEL": "gemini-2.5-flash-lite"}, clear=False):
+            with patch.object(
+                gemini_extractor,
+                "get_gemini_client",
+                side_effect=[("legacy", deprecated_model), ("legacy", healthy_model)],
+            ) as mock_get:
+                res = gemini_extractor.analyze_food_text("Daging masak asam", api_key="dummy", use_cache=False)
+
+        self.assertEqual(res["dish_name"], "Daging Masak Asam")
+        self.assertEqual(deprecated_model.generate_content.call_count, 1)
+        self.assertEqual(healthy_model.generate_content.call_count, 1)
+        self.assertEqual(mock_get.call_args_list[1].kwargs["model_name"], "gemini-3.5-flash-lite")
 
     def test_whatsapp_webhook_fail_closed_and_ssrf_guard(self):
         import asyncio

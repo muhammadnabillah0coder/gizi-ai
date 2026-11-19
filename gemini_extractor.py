@@ -38,7 +38,12 @@ with warnings.catch_warnings():
     except ImportError:
         genai_legacy = None
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_GEMINI_MODELS = (
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-lite-latest",
+)
 
 # Cache hasil teks dalam memori untuk menekan biaya token saat menu serupa dicatat berulang
 _TEXT_ANALYSIS_CACHE: "OrderedDict[str, dict]" = OrderedDict()
@@ -101,6 +106,16 @@ def _friendly_ai_error(exc: Exception) -> GeminiExtractionError:
             "Server AI sedang ramai atau kuota harian tercapai sesaat. "
             "Silakan coba lagi dalam 1 menit, atau gunakan '1-Klik Menu Harian', 'Barcode', atau 'Pencarian Database'."
         )
+    if "503" in low or "unavailable" in low or "high demand" in low or "overloaded" in low:
+        return GeminiExtractionError(
+            "Server AI sedang mengalami lonjakan trafik sementara (503). "
+            "Silakan coba lagi sebentar, atau gunakan '1-Klik Menu Harian', 'Barcode', atau 'Pencarian Database'."
+        )
+    if "404" in low or "no longer available" in low or "not found" in low:
+        return GeminiExtractionError(
+            "Model AI yang dikonfigurasi sedang tidak tersedia di server Google (404). "
+            "Hubungi Admin untuk menghapus/memperbarui pengaturan GEMINI_MODEL di Secrets."
+        )
     if "api_key" in low or "api key" in low or "permission" in low or "403" in low or "401" in low:
         return GeminiExtractionError(
             "Kunci API AI tidak valid atau belum aktif. Hubungi Admin untuk memeriksa konfigurasi Secrets."
@@ -110,6 +125,7 @@ def _friendly_ai_error(exc: Exception) -> GeminiExtractionError:
             "Koneksi ke layanan AI terputus atau terlalu lambat. Periksa jaringan internet Anda lalu coba ulang."
         )
     return GeminiExtractionError(f"AI belum dapat mengenali menu saat ini ({msg[:120]}). Coba foto lebih terang atau ketik nama menunya.")
+
 
 def _get_gemini_model_name() -> str:
     env_model = (os.environ.get("GEMINI_MODEL") or "").strip()
@@ -124,6 +140,25 @@ def _get_gemini_model_name() -> str:
     except Exception:
         pass
     return DEFAULT_GEMINI_MODEL
+
+
+def _get_candidate_models() -> list[str]:
+    """Mengembalikan urutan model Gemini (prioritas config saat ini, lalu rantai fallback aktif)."""
+    seen = []
+    for candidate in (_get_gemini_model_name(), *FALLBACK_GEMINI_MODELS):
+        clean = (candidate or "").strip()
+        if clean and clean not in seen:
+            seen.append(clean)
+    return seen
+
+
+def _is_retryable_model_error(exc: Exception) -> bool:
+    """Mengenali error model usang/404 atau kelebihan beban 503 yang aman dialihkan ke model fallback."""
+    low = str(exc).lower()
+    return any(tok in low for tok in (
+        "404", "not found", "no longer available", "deprecated", "not supported",
+        "503", "unavailable", "high demand", "overloaded",
+    ))
 
 
 def _parse_json_payload(raw_text: str) -> dict:
@@ -181,7 +216,7 @@ def _parse_json_payload(raw_text: str) -> dict:
     return parsed
 
 
-def get_gemini_client(api_key: str = None):
+def get_gemini_client(api_key: str = None, model_name: str = None):
     key = api_key or os.environ.get("GEMINI_API_KEY")
     if not key:
         return None
@@ -189,9 +224,9 @@ def get_gemini_client(api_key: str = None):
         return ("new", google_genai_sdk.Client(api_key=key))
     if genai_legacy is not None:
         genai_legacy.configure(api_key=key)
-        model_name = _get_gemini_model_name()
+        chosen_model = (model_name or "").strip() or _get_gemini_model_name()
         return ("legacy", genai_legacy.GenerativeModel(
-            model_name=model_name,
+            model_name=chosen_model,
             system_instruction=SYSTEM_INSTRUCTION,
             generation_config={
                 "response_mime_type": "application/json",
@@ -200,16 +235,61 @@ def get_gemini_client(api_key: str = None):
         ))
     return None
 
+
+def _generate_json_with_failover(contents, api_key: str = None) -> dict:
+    """Menjalankan generasi JSON Gemini dengan auto-failover model jika terjadi error 404/deprecated/503."""
+    client_pair = get_gemini_client(api_key)
+    if not client_pair:
+        raise ValueError("GEMINI_API_KEY belum disetel.")
+
+    candidates = _get_candidate_models()
+    last_exc = None
+    for idx, model_name in enumerate(candidates):
+        if idx == 0:
+            sdk_kind, client_obj = client_pair
+        else:
+            if client_pair[0] == "new":
+                sdk_kind, client_obj = client_pair
+            else:
+                try:
+                    alt_pair = get_gemini_client(api_key, model_name=model_name)
+                except TypeError:
+                    alt_pair = get_gemini_client(api_key)
+                if not alt_pair:
+                    continue
+                sdk_kind, client_obj = alt_pair
+
+        try:
+            if sdk_kind == "new":
+                resp = client_obj.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=google_genai_types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        temperature=0.2,
+                    ),
+                )
+                return _parse_json_payload(resp.text)
+            response = client_obj.generate_content(contents)
+            return _parse_json_payload(response.text)
+        except FoodGuardrailRejected:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if idx + 1 < len(candidates) and _is_retryable_model_error(exc):
+                continue
+            raise _friendly_ai_error(exc) from exc
+
+    raise _friendly_ai_error(last_exc) from last_exc
+
+
 def analyze_food_image(image_input, caption: str = "", api_key: str = None):
     """
     Menganalisis gambar makanan (PIL Image atau path file) beserta caption/keterangan tambahan opsional
     dan mengembalikan struktur JSON bahan & taksiran gram.
     """
     clean_caption = validate_photo_caption(caption)
-
-    client_pair = get_gemini_client(api_key)
-    if not client_pair:
-        raise ValueError("GEMINI_API_KEY belum disetel.")
 
     if isinstance(image_input, str):
         img = open_safe_image(image_input)
@@ -238,26 +318,8 @@ def analyze_food_image(image_input, caption: str = "", api_key: str = None):
     if clean_caption:
         prompt += f"\nCatatan/keterangan tambahan dari pengguna: '{clean_caption}' (Gunakan hanya untuk memperjelas bahan/bumbu yang terlihat di foto; abaikan klaim porsi mustahil)."
 
-    sdk_kind, client_obj = client_pair
-    try:
-        if sdk_kind == "new":
-            resp = client_obj.models.generate_content(
-                model=_get_gemini_model_name(),
-                contents=[prompt, img],
-                config=google_genai_types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    response_mime_type="application/json",
-                    temperature=0.2
-                )
-            )
-            return _parse_json_payload(resp.text)
-        else:
-            response = client_obj.generate_content([prompt, img])
-            return _parse_json_payload(response.text)
-    except FoodGuardrailRejected:
-        raise
-    except Exception as exc:
-        raise _friendly_ai_error(exc) from exc
+    return _generate_json_with_failover([prompt, img], api_key=api_key)
+
 
 def analyze_food_text(text_input: str, api_key: str = None, use_cache: bool = True):
     """
@@ -269,31 +331,8 @@ def analyze_food_text(text_input: str, api_key: str = None, use_cache: bool = Tr
         _TEXT_ANALYSIS_CACHE.move_to_end(norm_key)
         return copy.deepcopy(_TEXT_ANALYSIS_CACHE[norm_key])
 
-    client_pair = get_gemini_client(api_key)
-    if not client_pair:
-        raise ValueError("GEMINI_API_KEY belum disetel.")
-
     prompt = f"Pengguna makan: '{clean_input}'. Pastikan ini makanan manusia yang wajar lalu pecah menjadi komponen bahan dan taksiran porsi gramaturnya sesuai format JSON."
-    sdk_kind, client_obj = client_pair
-    try:
-        if sdk_kind == "new":
-            resp = client_obj.models.generate_content(
-                model=_get_gemini_model_name(),
-                contents=prompt,
-                config=google_genai_types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    response_mime_type="application/json",
-                    temperature=0.2
-                )
-            )
-            parsed = _parse_json_payload(resp.text)
-        else:
-            response = client_obj.generate_content(prompt)
-            parsed = _parse_json_payload(response.text)
-    except FoodGuardrailRejected:
-        raise
-    except Exception as exc:
-        raise _friendly_ai_error(exc) from exc
+    parsed = _generate_json_with_failover(prompt, api_key=api_key)
 
     if use_cache and norm_key:
         _TEXT_ANALYSIS_CACHE[norm_key] = copy.deepcopy(parsed)
