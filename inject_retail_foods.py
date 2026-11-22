@@ -31,6 +31,7 @@ RETAIL_PRODUCTS = [
     ("RET_OREO_REG", "Oreo Sandwich Cookies Vanilla (3 keping / 28.5g)", "Produk Kemasan / Biskuit & Snack", "3 keping (28.5g)", 28.5, 100.0, 140.0, 1.0, 6.0, 20.0, 1.0, 115.0),
     ("RET_SILVERQUEEN", "SilverQueen Cokelat Susu Mete 58g", "Produk Kemasan / Konfeksioneri", "1 batang (58g)", 58.0, 100.0, 310.0, 6.0, 19.0, 31.0, 2.0, 55.0),
     ("RET_KITKAT_2F", "KitKat Cokelat 2 Fingers 17g", "Produk Kemasan / Konfeksioneri", "1 bungkus (17g)", 17.0, 100.0, 90.0, 1.0, 5.0, 11.0, 0.5, 15.0),
+    ("RET_NUTELLA", "Nutella Hazelnut Spread 15g", "Produk Kemasan / Konfeksioneri", "1 sdm (15g)", 15.0, 100.0, 80.0, 1.0, 4.6, 8.6, 0.5, 6.0),
 
     # Minuman Kemasan Ritel (Teh, Kopi, Isotonik)
     ("RET_TEH_BOTOL", "Teh Botol Sosro Original 350ml", "Produk Kemasan / Minuman Ritel", "1 botol (350ml)", 350.0, 100.0, 130.0, 0.0, 0.0, 33.0, 0.0, 20.0),
@@ -70,26 +71,50 @@ RETAIL_PRODUCTS = [
 def inject_retail_products():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    
+
     count_new = 0
+    count_updated = 0
     for prod in RETAIL_PRODUCTS:
         code, name, cat, unit, def_w, bdd, kcal, p, f, c, fib, sod = prod
-        # Periksa apakah sudah ada
-        cur.execute("SELECT id FROM food_composition WHERE LOWER(food_name) = LOWER(?)", (name,))
-        if not cur.fetchone():
-            cur.execute("""
-                INSERT INTO food_composition 
-                (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, prod)
+        # Database food_composition selalu menyimpan nilai nutrisi per 100g / 100ml
+        scale = 100.0 / float(def_w or 100.0)
+        kcal_100 = round(float(kcal) * scale, 1)
+        p_100 = round(float(p) * scale, 1)
+        f_100 = round(float(f) * scale, 1)
+        c_100 = round(float(c) * scale, 1)
+        fib_100 = round(float(fib) * scale, 1)
+        sod_100 = round(float(sod) * scale, 1)
+
+        cur.execute("SELECT id FROM food_composition WHERE food_code = ?", (code,))
+        exists = cur.fetchone() is not None
+        cur.execute("""
+            INSERT INTO food_composition
+            (food_code, food_name, category, serving_unit, default_serving_weight, bdd_rate, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(food_code) DO UPDATE SET
+                food_name = excluded.food_name,
+                category = excluded.category,
+                serving_unit = excluded.serving_unit,
+                default_serving_weight = excluded.default_serving_weight,
+                bdd_rate = excluded.bdd_rate,
+                energy_kcal = excluded.energy_kcal,
+                protein_g = excluded.protein_g,
+                fat_g = excluded.fat_g,
+                carb_g = excluded.carb_g,
+                fiber_g = excluded.fiber_g,
+                sodium_mg = excluded.sodium_mg
+        """, (code, name, cat, unit, float(def_w), float(bdd), kcal_100, p_100, f_100, c_100, fib_100, sod_100))
+        if exists:
+            count_updated += 1
+        else:
             count_new += 1
-            
+
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM food_composition")
     total = cur.fetchone()[0]
     conn.close()
-    
-    print(f"Berhasil menambahkan {count_new} produk kemasan baru.")
+
+    print(f"Berhasil menambahkan {count_new} produk kemasan baru dan menormalisasi {count_updated} produk ritel ke basis per 100g/100ml.")
     print(f"Total database pangan sekarang: {total} entri.")
 
 if __name__ == "__main__":

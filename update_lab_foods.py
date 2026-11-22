@@ -33,6 +33,8 @@ ADDITIONAL_LAB_FOODS = [
     ("CUR_AYAM_PENYET", "Ayam penyet + sambal", "Lauk Hewani", "1 porsi", 90.0, 70.0, 265.0, 24.0, 17.5, 3.0, 0.8, 410.0),
     ("CUR_AYAM_GEPREK", "Ayam geprek krispi sambal bawang", "Lauk Hewani", "1 porsi", 100.0, 80.0, 295.0, 21.0, 19.0, 10.5, 0.6, 450.0),
     ("CUR_AYAM_KECAP", "Ayam masak kecap", "Lauk Hewani", "1 potong", 85.0, 70.0, 210.0, 22.0, 9.0, 9.5, 0.2, 380.0),
+    ("CUR_DAGING_AYAM_TANPA_KULIT", "Daging ayam panggang tanpa kulit", "Lauk Hewani", "100g matang", 100.0, 100.0, 175.0, 27.0, 6.0, 0.5, 0.0, 180.0),
+    ("CUR_KULIT_AYAM_PANGGANG", "Kulit ayam panggang / bakar", "Lauk Hewani", "50g", 50.0, 100.0, 340.0, 20.0, 28.0, 0.5, 0.0, 210.0),
     ("CUR_BEBEK_GORENG", "Bebek goreng", "Lauk Hewani", "1 potong", 90.0, 65.0, 310.0, 22.0, 24.5, 0.0, 0.0, 310.0),
     ("CUR_ATI_AMPELA_GORENG", "Ati ampela ayam goreng", "Lauk Hewani", "1 pasang", 60.0, 100.0, 225.0, 26.0, 12.0, 2.5, 0.0, 190.0),
 

@@ -28,7 +28,8 @@ BARCODE_MAPPING = {
     "8992745123456": "Yakult Minuman Fermentasi 65ml",
     "8998009010214": "Roma Biskuit Kelapa (3 keping / ~27g)",
     "8998009010450": "Roma Malkist Crackers Abon (2 keping / 25g)",
-    "7622210014523": "Oreo Sandwich Cookies Vanilla (3 keping / 28.5g)",
+    "7622210449283": "Oreo Sandwich Cookies Vanilla (3 keping / 28.5g)",
+    "3017620422003": "Nutella Hazelnut Spread 15g",
     "8991001100124": "SilverQueen Cokelat Susu Mete 58g",
     "8992761001016": "Chitato Sapi Panggang 68g (1/2 bungkus / 34g)",
     "8992741987654": "Kacang Kulit Garuda Garing (1 porsi bersih / 30g)"

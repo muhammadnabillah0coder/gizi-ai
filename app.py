@@ -82,12 +82,21 @@ from db_history import (
 )
 from google_auth import get_google_auth_url, exchange_code_for_user, verify_oauth_state
 
-APP_VERSION = "v4.1.2-beta"
+APP_VERSION = "v4.1.3-beta"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v4.1.2-beta (Terbaru)",
+        "version": "v4.1.3-beta (Terbaru)",
+        "date": "22 Nov 2026",
+        "highlights": [
+            "📦 Normalisasi Produk Ritel Per-100g: 44 produk ritel + Nutella kini tersimpan seragam berbasis 100g/100ml sehingga hasil scan barcode sesuai tepat dengan label gizi kemasan BPOM.",
+            "🧪 Audit Fisika TKPI & Barcode Sampel: 18 baris data mentah Panganku/TKPI diperbaiki (bebas anomali Atwater, P+F+C > 100g, dan serat > karbohidrat); tombol sampel Ultra Milk, Indomie, Nutella, & Oreo aktif 100% lokal.",
+            "⚖️ Sinkronisasi Berat Porsi & Tab Database: Piring Cepat, Menu Populer, dan pencatat cepat Database kini memakai berat saji asli (gram) bukan 100g statis."
+        ]
+    },
+    {
+        "version": "v4.1.2-beta",
         "date": "19 Nov 2026",
         "highlights": [
             "🤖 Upgrade Engine Gemini ke `gemini-3.5-flash-lite`: Mengatasi error 404 model lama (`gemini-2.5-flash-lite`) untuk kunci API baru.",
@@ -189,7 +198,7 @@ def _fetch_tkpi_categories_and_count():
 def _search_tkpi_catalog_cached(query_str: str, sel_cat_str: str):
     conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "tkpi_nutrition.db"))
     cur = conn.cursor()
-    sql = "SELECT food_name, category, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode FROM food_composition WHERE 1=1"
+    sql = "SELECT food_name, category, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, barcode, serving_unit, default_serving_weight FROM food_composition WHERE 1=1"
     params = []
     if query_str:
         sql += " AND (food_name LIKE ? OR barcode LIKE ?)"
@@ -1844,32 +1853,33 @@ with tab_diary:
         # Inovasi 2: Piring Cepat Populer Indonesia (Preview Cepat Tanpa Ketik)
         st.caption("🔥 **Menu Harian Populer (1-Klik Preview Tanpa Ketik):**")
         QUICK_PLATES = [
-            ("🍛 Nasi + Telur Dadar", "Nasi Putih + Telur Dadar", {"energy_kcal": 315.0, "protein_g": 11.5, "fat_g": 12.0, "carb_g": 40.0, "fiber_g": 1.0, "sodium_mg": 240.0}),
-            ("🍗 Nasi + Ayam Bakar", "Nasi Putih + Ayam Bakar Dada", {"energy_kcal": 385.0, "protein_g": 32.0, "fat_g": 8.5, "carb_g": 43.0, "fiber_g": 1.2, "sodium_mg": 380.0}),
-            ("🍜 Bakso Kuah Komplit", "Semangkuk Bakso Sapi Kuah", {"energy_kcal": 340.0, "protein_g": 18.5, "fat_g": 11.0, "carb_g": 41.0, "fiber_g": 2.0, "sodium_mg": 680.0}),
-            ("🥗 Gado-Gado Telur", "Gado-Gado Lontong + Telur Rebus", {"energy_kcal": 410.0, "protein_g": 16.0, "fat_g": 18.0, "carb_g": 46.0, "fiber_g": 5.5, "sodium_mg": 420.0}),
-            ("☕ Kopi Susu Aren", "Es Kopi Susu Gula Aren", {"energy_kcal": 175.0, "protein_g": 4.2, "fat_g": 5.5, "carb_g": 27.0, "fiber_g": 0.0, "sodium_mg": 65.0}),
-            ("🥚 2 Telur Rebus", "2 Butir Telur Ayam Rebus", {"energy_kcal": 154.0, "protein_g": 12.6, "fat_g": 10.6, "carb_g": 1.1, "fiber_g": 0.0, "sodium_mg": 140.0}),
+            ("🍛 Nasi + Telur Dadar", "Nasi Putih + Telur Dadar", 220.0, {"energy_kcal": 315.0, "protein_g": 11.5, "fat_g": 12.0, "carb_g": 40.0, "fiber_g": 1.0, "sodium_mg": 240.0}),
+            ("🍗 Nasi + Ayam Bakar", "Nasi Putih + Ayam Bakar Dada", 240.0, {"energy_kcal": 385.0, "protein_g": 32.0, "fat_g": 8.5, "carb_g": 43.0, "fiber_g": 1.2, "sodium_mg": 380.0}),
+            ("🍜 Bakso Kuah Komplit", "Semangkuk Bakso Sapi Kuah", 350.0, {"energy_kcal": 340.0, "protein_g": 18.5, "fat_g": 11.0, "carb_g": 41.0, "fiber_g": 2.0, "sodium_mg": 680.0}),
+            ("🥗 Gado-Gado Telur", "Gado-Gado Lontong + Telur Rebus", 300.0, {"energy_kcal": 410.0, "protein_g": 16.0, "fat_g": 18.0, "carb_g": 46.0, "fiber_g": 5.5, "sodium_mg": 420.0}),
+            ("☕ Kopi Susu Aren", "Es Kopi Susu Gula Aren", 250.0, {"energy_kcal": 175.0, "protein_g": 4.2, "fat_g": 5.5, "carb_g": 27.0, "fiber_g": 0.0, "sodium_mg": 65.0}),
+            ("🥚 2 Telur Rebus", "2 Butir Telur Ayam Rebus", 110.0, {"energy_kcal": 154.0, "protein_g": 12.6, "fat_g": 10.6, "carb_g": 1.1, "fiber_g": 0.0, "sodium_mg": 140.0}),
         ]
         qp_cols = st.columns(3)
-        for idx_qp, (qp_label, qp_name, qp_tot) in enumerate(QUICK_PLATES):
+        for idx_qp, (qp_label, qp_name, qp_w, qp_tot) in enumerate(QUICK_PLATES):
             with qp_cols[idx_qp % 3]:
                 if st.button(qp_label, use_container_width=True, key=f"dash_qp_{idx_qp}"):
+                    scale_qp = 100.0 / float(qp_w)
                     _open_food_preview({
                         "dish_name": qp_name,
                         "confidence": "high",
                         "portion_category": "1 porsi standar",
-                        "serving_reference": "1 porsi standar URT",
+                        "serving_reference": f"1 porsi standar (~{qp_w:.0f}g)",
                         "user_caption": "Piring Cepat 1-Klik",
                         "components": [{
                             "name": qp_name,
-                            "weight_g": 100.0,
-                            "energy_kcal_per_100g": qp_tot["energy_kcal"],
-                            "protein_g_per_100g": qp_tot["protein_g"],
-                            "fat_g_per_100g": qp_tot["fat_g"],
-                            "carb_g_per_100g": qp_tot["carb_g"],
-                            "fiber_g_per_100g": qp_tot["fiber_g"],
-                            "sodium_mg_per_100g": qp_tot["sodium_mg"],
+                            "weight_g": float(qp_w),
+                            "energy_kcal_per_100g": round(qp_tot["energy_kcal"] * scale_qp, 4),
+                            "protein_g_per_100g": round(qp_tot["protein_g"] * scale_qp, 4),
+                            "fat_g_per_100g": round(qp_tot["fat_g"] * scale_qp, 4),
+                            "carb_g_per_100g": round(qp_tot["carb_g"] * scale_qp, 4),
+                            "fiber_g_per_100g": round(qp_tot["fiber_g"] * scale_qp, 4),
+                            "sodium_mg_per_100g": round(qp_tot["sodium_mg"] * scale_qp, 4),
                             "custom_override": True,
                             "source_label": "Standar Menu Populer"
                         }],
@@ -2229,6 +2239,7 @@ with tab_scanner:
         for idx_pm, (pm_btn, pm_title, pm_w, pm_k, pm_p, pm_f, pm_c, pm_fib) in enumerate(PRESET_MENUS):
             with pm_cols[idx_pm % 3]:
                 if st.button(pm_btn, use_container_width=True, key=f"pm_fast_{idx_pm}"):
+                    scale_pm = 100.0 / float(pm_w)
                     _open_food_preview({
                         "dish_name": pm_title,
                         "confidence": "high",
@@ -2237,13 +2248,13 @@ with tab_scanner:
                         "source_origin": "Standar Lab TKPI Kemenkes RI",
                         "components": [{
                             "name": pm_title,
-                            "weight_g": 100.0,
-                            "energy_kcal_per_100g": pm_k,
-                            "protein_g_per_100g": pm_p,
-                            "fat_g_per_100g": pm_f,
-                            "carb_g_per_100g": pm_c,
-                            "fiber_g_per_100g": pm_fib,
-                            "sodium_mg_per_100g": 320.0,
+                            "weight_g": float(pm_w),
+                            "energy_kcal_per_100g": round(pm_k * scale_pm, 4),
+                            "protein_g_per_100g": round(pm_p * scale_pm, 4),
+                            "fat_g_per_100g": round(pm_f * scale_pm, 4),
+                            "carb_g_per_100g": round(pm_c * scale_pm, 4),
+                            "fiber_g_per_100g": round(pm_fib * scale_pm, 4),
+                            "sodium_mg_per_100g": round(320.0 * scale_pm, 4),
                             "custom_override": True,
                             "source_label": "Standar Lab TKPI Kemenkes RI"
                         }],
@@ -2583,9 +2594,11 @@ with tab_sources:
     if results:
         table_kb = []
         for r in results:
+            takaran_str = f"{r[9] or '100g'} ({float(r[10] or 100.0):.0f}g)" if r[9] else f"{float(r[10] or 100.0):.0f}g"
             table_kb.append({
                 "Nama Pangan": r[0],
                 "Kategori": r[1] or "-",
+                "Takaran Saji": takaran_str,
                 "Energi (kkal/100g)": r[2],
                 "Protein (g)": r[3],
                 "Lemak (g)": r[4],
@@ -2609,7 +2622,15 @@ with tab_sources:
                     key="db_pick_idx"
                 )
             with db_c2:
-                pick_grams = st.number_input("Berat (gram):", min_value=5.0, max_value=1000.0, value=100.0, step=10.0, key="db_pick_grams")
+                default_pick_w = float(max(5.0, min(1000.0, float(results[pick_idx][10] or 100.0))))
+                pick_grams = st.number_input(
+                    "Berat (gram):",
+                    min_value=5.0,
+                    max_value=1000.0,
+                    value=default_pick_w,
+                    step=5.0,
+                    key=f"db_pick_grams_{pick_idx}_{results[pick_idx][0]}",
+                )
             with db_c3:
                 if st.button("➕ Preview & Catat", type="primary", use_container_width=True, key="btn_db_to_preview"):
                     chosen = results[pick_idx]
@@ -2617,7 +2638,7 @@ with tab_sources:
                         "dish_name": chosen[0],
                         "confidence": "high",
                         "portion_category": f"{pick_grams:.0f}g dari database TKPI",
-                        "serving_reference": f"{pick_grams:.0f} gram (basis data lab per 100g)",
+                        "serving_reference": f"{chosen[9] or '100g'} (~{pick_grams:.0f}g)",
                         "user_caption": f"Database Lab ({pick_grams:.0f}g)",
                         "components": [{
                             "name": chosen[0],
