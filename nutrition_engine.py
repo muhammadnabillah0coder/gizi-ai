@@ -406,47 +406,47 @@ def evaluate_nutri_grade(kcal_100: float, p_100: float, f_100: float, c_100: flo
     """
     score = 100
     badges = []
-    
+
     # Penalti Kalori, Lemak, & Natrium
     if kcal_100 > 350:
         score -= 25
-        badges.append(("🔴 Padat Kalori", "#ef4444"))
+        badges.append(("Padat kalori", "#b91c1c"))
     elif kcal_100 > 220:
         score -= 10
-        badges.append(("🟡 Kalori Sedang", "#f59e0b"))
+        badges.append(("Kalori sedang", "#b45309"))
     else:
-        badges.append(("🟢 Rendah-Sedang Kalori", "#10b981"))
-        
+        badges.append(("Rendah-sedang kalori", "#15803d"))
+
     if f_100 > 20.0:
         score -= 25
-        badges.append(("🔴 Tinggi Lemak (>20g)", "#ef4444"))
+        badges.append(("Tinggi lemak (>20g)", "#b91c1c"))
     elif f_100 <= 5.0:
         score += 5
-        badges.append(("🟢 Rendah Lemak", "#10b981"))
-        
+        badges.append(("Rendah lemak", "#15803d"))
+
     if sod_100 > 400.0:
         score -= 20
-        badges.append(("🔴 Tinggi Natrium/Garam", "#ef4444"))
-        
+        badges.append(("Tinggi natrium", "#b91c1c"))
+
     # Bonus Protein & Serat
     if p_100 >= 12.0:
         score += 15
-        badges.append(("🟢 Tinggi Protein", "#10b981"))
+        badges.append(("Tinggi protein", "#15803d"))
     elif p_100 >= 6.0:
         score += 5
-        
+
     if fib_100 >= 3.0:
         score += 10
-        badges.append(("🟢 Kaya Serat Pangan", "#10b981"))
-        
+        badges.append(("Kaya serat pangan", "#15803d"))
+
     if score >= 85:
-        return {"grade": "A", "color": "#10b981", "label": "Sangat Sehat & Padat Gizi", "badges": badges}
+        return {"grade": "A", "color": "#15803d", "label": "Sangat sehat & padat gizi", "badges": badges}
     elif score >= 70:
-        return {"grade": "B", "color": "#0284c7", "label": "Pilihan Baik & Seimbang", "badges": badges}
+        return {"grade": "B", "color": "#0369a1", "label": "Pilihan baik & seimbang", "badges": badges}
     elif score >= 50:
-        return {"grade": "C", "color": "#f59e0b", "label": "Konsumsi Secukupnya", "badges": badges}
+        return {"grade": "C", "color": "#b45309", "label": "Konsumsi secukupnya", "badges": badges}
     else:
-        return {"grade": "D", "color": "#ef4444", "label": "Batasi Porsi (Tinggi Kalori/Lemak/Garam)", "badges": badges}
+        return {"grade": "D", "color": "#b91c1c", "label": "Batasi porsi (tinggi kalori, lemak, atau natrium)", "badges": badges}
 
 
 def auto_learn_food(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float, sodium_100: float = 0.0, barcode: str = None, serving_unit: str = "porsi/buah", serving_weight: float = 100.0, auto_publish: bool = False):
