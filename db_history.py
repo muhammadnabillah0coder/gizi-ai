@@ -64,8 +64,33 @@ TABLES_WITH_ID = {
     "food_catalog_additions",
 }
 
-SCHEMA_VERSION = "v4.0"
+SCHEMA_VERSION = "v4.2"
+GUEST_PREFIX = "guest_"
 _INITIALIZED_BACKENDS: set[str] = set()
+
+
+def is_guest_user_id(user_id: str) -> bool:
+    """Mengembalikan True bila user_id adalah sesi tamu anonim (baik legacy Tamu (Demo) maupun guest_<hex>)."""
+    raw = str(user_id or "").strip().lower()
+    return (not raw) or (raw == "tamu (demo)") or raw.startswith(GUEST_PREFIX)
+
+
+def create_guest_session_id() -> str:
+    """Membuat ID sesi tamu terisolasi per browser agar catatan antar pengunjung tidak bercampur."""
+    return f"{GUEST_PREFIX}{secrets.token_hex(6)}"
+
+
+def compute_water_target_glasses(weight_kg: float = 65.0, focus_goal: str = "Diet Sehat") -> int:
+    """Menghitung target air minum harian adaptif (~33 ml/kg BB + bonus Ibu Hamil, min 8 gelas / 2000ml)."""
+    try:
+        w = float(weight_kg or 65.0)
+    except (TypeError, ValueError):
+        w = 65.0
+    if not math.isfinite(w) or w <= 0:
+        w = 65.0
+    bonus_ml = 350.0 if "hamil" in str(focus_goal or "").lower() else 0.0
+    ml = (w * 33.0) + bonus_ml
+    return max(8, min(14, int(round(ml / 250.0))))
 _LAST_CLOUD_ERROR: str = ""
 _PG_POOL_LOCK = threading.Lock()
 _PG_POOL: dict[str, deque] = {}
@@ -379,6 +404,11 @@ def _db_session():
             _LAST_CLOUD_ERROR = ""
         except Exception as exc:
             _LAST_CLOUD_ERROR = str(exc)
+            try:
+                from alert_manager import send_alert_to_phone
+                send_alert_to_phone(f"Fallback SQLite: {exc}", context="Supabase DB Connection")
+            except Exception:
+                pass
             conn = _open_sqlite_connection()
             pool_key = ""
     else:
@@ -481,7 +511,7 @@ def _get_session_secret_key() -> bytes:
 def create_session_token(user_id: str, ttl_seconds: int = SESSION_TOKEN_TTL_SECONDS) -> str:
     """Membuat token HMAC bertanda tangan dengan masa kedaluwarsa (default 30 hari)."""
     clean_id = (user_id or "").strip().lower()
-    if not clean_id or clean_id == "tamu (demo)":
+    if is_guest_user_id(clean_id):
         return ""
     exp_ts = int(time.time()) + int(ttl_seconds)
     key = _get_session_secret_key()
@@ -494,7 +524,7 @@ def verify_session_token(user_id: str, token: str) -> bool:
     """Memvalidasi integritas & masa berlaku token HMAC URL secara constant-time."""
     clean_id = (user_id or "").strip().lower()
     tok_str = str(token or "").strip()
-    if not clean_id or not tok_str or clean_id == "tamu (demo)" or "." not in tok_str:
+    if is_guest_user_id(clean_id) or not tok_str or "." not in tok_str:
         return False
     exp_str, sig_str = tok_str.split(".", 1)
     if not exp_str.isdigit() or not sig_str:
@@ -561,6 +591,7 @@ def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
             carb_g {real_t} NOT NULL,
             fiber_g {real_t} NOT NULL,
             sodium_mg {real_t} DEFAULT 0.0,
+            sugar_g {real_t} DEFAULT 0.0,
             portion_multiplier {real_t} DEFAULT 1.0,
             photo_caption TEXT,
             meal_type TEXT DEFAULT 'Makan Siang',
@@ -666,6 +697,9 @@ def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
         ("users", "focus_goal", "TEXT DEFAULT 'Diet Sehat'"),
         ("meal_logs", "meal_type", "TEXT DEFAULT 'Makan Siang'"),
         ("meal_logs", "sodium_mg", f"{real_t} DEFAULT 0.0"),
+        ("meal_logs", "sugar_g", f"{real_t} DEFAULT 0.0"),
+        ("pending_foods", "sugar_g", f"{real_t} DEFAULT 0.0"),
+        ("food_catalog_additions", "sugar_g", f"{real_t} DEFAULT 0.0"),
     ]
     for table, col_name, col_def in alter_columns:
         if is_pg:
@@ -861,6 +895,10 @@ def init_user_history_tables(force: bool = False):
             _INITIALIZED_BACKENDS.add(cache_key)
         else:
             _INITIALIZED_BACKENDS.add(f"sqlite::{DB_PATH}")
+    try:
+        cleanup_stale_guest_users(max_age_days=7)
+    except Exception:
+        pass
 
 
 def hash_password(password: str, salt_hex: str = None) -> str:
@@ -907,7 +945,7 @@ def is_admin_user(user_id: str) -> bool:
 def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str = "Pria", bb: float = 65.0, tb: float = 170.0, age: int = 25, target_kcal: float = 2000.0, focus_goal: str = "Diet Sehat", timezone_offset: int = DEFAULT_TIMEZONE_OFFSET):
     """Mendaftarkan akun baru dengan verifikasi PIN/Password aman PBKDF2 dan profil tubuh pribadi."""
     clean_id = (user_id or "").strip().lower()
-    if not clean_id or clean_id == "tamu (demo)":
+    if is_guest_user_id(clean_id):
         return False, "ID Pengguna / Email tidak valid atau kosong."
     if not pin_or_pass or len(pin_or_pass.strip()) < 4:
         return False, "PIN / Password minimal 4 karakter agar akun Anda aman."
@@ -971,7 +1009,7 @@ def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str
 def authenticate_user(user_id: str, pin_or_pass: str):
     """Memverifikasi login pengguna dengan ID dan PIN/Password (otomatis upgrade hash lama ke PBKDF2)."""
     clean_id = (user_id or "").strip().lower()
-    if not clean_id or clean_id == "tamu (demo)":
+    if is_guest_user_id(clean_id):
         return False, "Ketikkan ID Pengguna / Email Anda."
     if not (pin_or_pass or "").strip():
         return False, "PIN / Password wajib diisi."
@@ -1008,22 +1046,23 @@ def _normalize_user_id(user_id: str) -> str:
 def get_or_create_user(user_id: str, display_name: str = "", auth_provider: str = "local"):
     """Mengambil data user atau membuat profil baru secara case-insensitive agar akun tidak terduplikasi."""
     norm_id = _normalize_user_id(user_id)
-    is_guest = (norm_id == "Tamu (Demo)")
+    is_guest = is_guest_user_id(norm_id)
     with _db_session() as (conn, cur):
         is_admin = is_admin_user(norm_id)
-        initial_tier = "pro" if is_admin else ("beta" if (OPEN_BETA_MODE and not is_guest) else "free")
+        initial_tier = "pro" if is_admin else ("beta" if (OPEN_BETA_MODE and not is_guest) else "demo")
         initial_expiry = "2099-12-31 23:59:59" if is_admin else None
         now_str = get_local_now(DEFAULT_TIMEZONE_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
 
         row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (norm_id.lower(),)).fetchone()
         if not row:
-            name = display_name or (norm_id if is_guest else norm_id.split("@")[0].capitalize())
+            name = display_name or ("Tamu" if is_guest else norm_id.split("@")[0].capitalize())
+            eff_provider = "guest" if (is_guest and norm_id.startswith(GUEST_PREFIX)) else auth_provider
             cur.execute(
                 """
                 INSERT INTO users (user_id, display_name, auth_provider, daily_calorie_target, subscription_tier, pro_until, timezone_offset, focus_goal, created_at)
                 VALUES (?, ?, ?, 2000.0, ?, ?, ?, 'Diet Sehat', ?)
                 """,
-                (norm_id, name, auth_provider, initial_tier, initial_expiry, DEFAULT_TIMEZONE_OFFSET, now_str),
+                (norm_id, name, eff_provider, initial_tier, initial_expiry, DEFAULT_TIMEZONE_OFFSET, now_str),
             )
             conn.commit()
             row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (norm_id.lower(),)).fetchone()
@@ -1033,6 +1072,78 @@ def get_or_create_user(user_id: str, display_name: str = "", auth_provider: str 
             row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (norm_id.lower(),)).fetchone()
 
         return dict(row)
+
+
+def migrate_guest_data_to_user(guest_uid: str, target_uid: str) -> dict:
+    """Memindahkan catatan makan, air, berat badan, & makanan kustom dari sesi tamu terisolasi (guest_*) ke akun baru."""
+    g_id = (guest_uid or "").strip().lower()
+    t_id = _normalize_user_id(target_uid)
+    moved = {"meals": 0, "water": 0, "weights": 0, "custom": 0}
+    if not g_id.startswith(GUEST_PREFIX) or is_guest_user_id(t_id) or g_id == t_id:
+        return moved
+
+    with _db_session() as (conn, cur):
+        meals = cur.execute("SELECT id FROM meal_logs WHERE user_id = ?", (g_id,)).fetchall()
+        if meals:
+            cur.execute("UPDATE meal_logs SET user_id = ? WHERE user_id = ?", (t_id, g_id))
+            moved["meals"] = len(meals)
+
+        water_rows = cur.execute("SELECT log_date, glasses_count, target_glasses, updated_at FROM water_logs WHERE user_id = ?", (g_id,)).fetchall()
+        for wr in water_rows:
+            ex_w = cur.execute("SELECT glasses_count FROM water_logs WHERE user_id = ? AND log_date = ?", (t_id, wr["log_date"])).fetchone()
+            if ex_w:
+                merged_g = max(0, int(ex_w[0] or 0) + int(wr["glasses_count"] or 0))
+                cur.execute(
+                    "UPDATE water_logs SET glasses_count = ?, updated_at = ? WHERE user_id = ? AND log_date = ?",
+                    (merged_g, wr["updated_at"], t_id, wr["log_date"]),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO water_logs (user_id, log_date, glasses_count, target_glasses, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (t_id, wr["log_date"], int(wr["glasses_count"] or 0), int(wr["target_glasses"] or 8), wr["updated_at"]),
+                )
+            moved["water"] += 1
+        cur.execute("DELETE FROM water_logs WHERE user_id = ?", (g_id,))
+
+        wt_rows = cur.execute("SELECT recorded_date, weight_kg, note, created_at FROM weight_logs WHERE user_id = ?", (g_id,)).fetchall()
+        for wtr in wt_rows:
+            cur.execute(
+                """
+                INSERT INTO weight_logs (user_id, weight_kg, recorded_date, note, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, recorded_date) DO NOTHING
+                """,
+                (t_id, wtr["weight_kg"], wtr["recorded_date"], wtr["note"] or "", wtr["created_at"]),
+            )
+            moved["weights"] += 1
+        cur.execute("DELETE FROM weight_logs WHERE user_id = ?", (g_id,))
+
+        cf_rows = cur.execute("SELECT id FROM custom_foods WHERE user_id = ?", (g_id,)).fetchall()
+        if cf_rows:
+            cur.execute("UPDATE custom_foods SET user_id = ? WHERE user_id = ?", (t_id, g_id))
+            moved["custom"] = len(cf_rows)
+
+        cur.execute("DELETE FROM users WHERE user_id = ?", (g_id,))
+        conn.commit()
+    return moved
+
+
+def cleanup_stale_guest_users(max_age_days: int = 7) -> int:
+    """Menghapus sesi tamu terisolasi (guest_*) yang sudah lebih lama dari max_age_days agar DB tetap ramping."""
+    cutoff_str = (get_local_now(DEFAULT_TIMEZONE_OFFSET) - timedelta(days=max_age_days)).strftime("%Y-%m-%d %H:%M:%S")
+    with _db_session() as (conn, cur):
+        stale_rows = cur.execute(
+            "SELECT user_id FROM users WHERE user_id LIKE ? AND COALESCE(created_at, '') < ?",
+            (f"{GUEST_PREFIX}%", cutoff_str),
+        ).fetchall()
+        if not stale_rows:
+            return 0
+        for sr in stale_rows:
+            gid = sr["user_id"]
+            for tbl in ("meal_logs", "water_logs", "weight_logs", "custom_foods", "users"):
+                cur.execute(f"DELETE FROM {tbl} WHERE user_id = ?", (gid,))
+        conn.commit()
+    return len(stale_rows)
 
 
 def add_custom_food(user_id: str, food_name: str, serving_size: str, kcal: float, protein: float, fat: float, carb: float):
@@ -1098,6 +1209,83 @@ def update_user_preferences(user_id: str, timezone_offset: int = None, focus_goa
             cur.execute("UPDATE users SET focus_goal = ? WHERE user_id = ?", (focus_goal.strip(), user_id))
         conn.commit()
     return True
+
+
+def update_user_body_profile(
+    user_id: str,
+    display_name: str = None,
+    gender: str = None,
+    weight_kg: float = None,
+    height_cm: float = None,
+    age_years: int = None,
+    daily_calorie_target: float = None,
+) -> tuple[bool, dict | str]:
+    """Memperbarui profil tubuh & nama tampilan pengguna secara aman dengan validasi batas & XSS."""
+    norm_id = _normalize_user_id(user_id)
+    updates = []
+    params = []
+
+    if display_name is not None:
+        ok_name, clean_or_err = validate_display_name(display_name)
+        if not ok_name:
+            return False, clean_or_err
+        updates.append("display_name = ?")
+        params.append(clean_or_err)
+    if gender is not None and gender in {"Pria", "Wanita"}:
+        updates.append("gender = ?")
+        params.append(gender)
+    if weight_kg is not None:
+        w = max(20.0, min(250.0, round(float(weight_kg), 1)))
+        updates.append("weight_kg = ?")
+        params.append(w)
+    if height_cm is not None:
+        h = max(80.0, min(230.0, round(float(height_cm), 1)))
+        updates.append("height_cm = ?")
+        params.append(h)
+    if age_years is not None:
+        a = max(5, min(110, int(age_years)))
+        updates.append("age_years = ?")
+        params.append(a)
+    if daily_calorie_target is not None:
+        k = max(800.0, min(5000.0, round(float(daily_calorie_target), 1)))
+        updates.append("daily_calorie_target = ?")
+        params.append(k)
+
+    if not updates:
+        return False, "Tidak ada perubahan profil untuk disimpan."
+
+    with _db_session() as (conn, cur):
+        params.append(norm_id)
+        cur.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", tuple(params))
+        conn.commit()
+        row = cur.execute("SELECT * FROM users WHERE user_id = ?", (norm_id,)).fetchone()
+    if not row:
+        return False, "Akun pengguna tidak ditemukan."
+    return True, dict(row)
+
+
+def change_user_password(user_id: str, current_pin: str, new_pin: str) -> tuple[bool, str]:
+    """Mengganti PIN/Password akun lokal (atau menetapkan PIN awal untuk akun Google/WA)."""
+    clean_id = (user_id or "").strip().lower()
+    if is_guest_user_id(clean_id):
+        return False, "Akun tamu tidak memiliki PIN. Buat akun terlebih dahulu."
+    clean_new = (new_pin or "").strip()
+    if len(clean_new) < 4:
+        return False, "PIN atau password baru minimal 4 karakter."
+
+    with _db_session() as (conn, cur):
+        row = cur.execute("SELECT id, password_hash FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_id,)).fetchone()
+        if not row:
+            return False, "Akun tidak ditemukan."
+        saved_hash = row["password_hash"]
+        if saved_hash:
+            valid, _ = _verify_password(current_pin, saved_hash)
+            if not valid:
+                return False, "PIN / Password saat ini tidak cocok."
+        new_hash = hash_password(clean_new)
+        cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, row["id"]))
+        conn.commit()
+    return True, "PIN / Password berhasil diperbarui."
 
 
 def log_weight_entry(user_id: str, weight_kg: float, note: str = "", tz_offset: int = DEFAULT_TIMEZONE_OFFSET, recorded_date: str = None):
@@ -1178,30 +1366,45 @@ def get_logging_streak(user_id: str, tz_offset: int = DEFAULT_TIMEZONE_OFFSET) -
 
 
 def log_water_intake(user_id: str, delta_glasses: int = 1, tz_offset: int = DEFAULT_TIMEZONE_OFFSET):
-    """Menambah atau mengurangi asupan air minum hari ini (+1 atau -1 gelas)."""
+    """Menambah atau mengurangi asupan air minum hari ini (+1 atau -1 gelas) dengan target adaptif."""
     local_now = get_local_now(tz_offset)
     today_str = local_now.strftime("%Y-%m-%d")
     now_str = local_now.strftime("%Y-%m-%d %H:%M:%S")
     with _db_session() as (conn, cur):
+        u_row = cur.execute("SELECT weight_kg, focus_goal FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        rec_target = compute_water_target_glasses(
+            u_row["weight_kg"] if u_row else 65.0,
+            u_row["focus_goal"] if u_row else "Diet Sehat",
+        )
         row = cur.execute("SELECT glasses_count FROM water_logs WHERE user_id = ? AND log_date = ?", (user_id, today_str)).fetchone()
         if row:
             new_count = max(0, int(row[0]) + delta_glasses)
-            cur.execute("UPDATE water_logs SET glasses_count = ?, updated_at = ? WHERE user_id = ? AND log_date = ?", (new_count, now_str, user_id, today_str))
+            cur.execute(
+                "UPDATE water_logs SET glasses_count = ?, target_glasses = ?, updated_at = ? WHERE user_id = ? AND log_date = ?",
+                (new_count, rec_target, now_str, user_id, today_str),
+            )
         else:
             new_count = max(0, delta_glasses)
-            cur.execute("INSERT INTO water_logs (user_id, log_date, glasses_count, target_glasses, updated_at) VALUES (?, ?, ?, 8, ?)", (user_id, today_str, new_count, now_str))
+            cur.execute(
+                "INSERT INTO water_logs (user_id, log_date, glasses_count, target_glasses, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, today_str, new_count, rec_target, now_str),
+            )
         conn.commit()
     return new_count
 
 
 def get_water_intake(user_id: str, tz_offset: int = DEFAULT_TIMEZONE_OFFSET):
-    """Mengambil progres air minum hari ini."""
+    """Mengambil progres air minum hari ini dengan target adaptif berat badan & fokus klinis."""
     today_str = get_local_now(tz_offset).strftime("%Y-%m-%d")
     with _db_session() as (conn, cur):
+        u_row = cur.execute("SELECT weight_kg, focus_goal FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        rec_target = compute_water_target_glasses(
+            u_row["weight_kg"] if u_row else 65.0,
+            u_row["focus_goal"] if u_row else "Diet Sehat",
+        )
         row = cur.execute("SELECT glasses_count, target_glasses FROM water_logs WHERE user_id = ? AND log_date = ?", (user_id, today_str)).fetchone()
-    if row:
-        return {"glasses": int(row[0]), "target": int(row[1]), "ml": int(row[0]) * 250, "target_ml": int(row[1]) * 250}
-    return {"glasses": 0, "target": 8, "ml": 0, "target_ml": 2000}
+    glasses = int(row[0]) if row else 0
+    return {"glasses": glasses, "target": rec_target, "ml": glasses * 250, "target_ml": rec_target * 250}
 
 
 def _compute_scan_status_from_row(user_row, user_id: str, tz_offset: int = None) -> dict:
@@ -1216,7 +1419,7 @@ def _compute_scan_status_from_row(user_row, user_id: str, tz_offset: int = None)
         return {"tier": "demo", "scans_today": 0, "max_scans": GUEST_DAILY_SCAN_LIMIT, "can_scan": True, "is_pro": False, "is_beta": False, "days_left": 0}
 
     is_admin = is_admin_user(user_id)
-    is_guest = (user_id == "Tamu (Demo)")
+    is_guest = is_guest_user_id(user_id)
     tier = u_dict.get("subscription_tier") or ("demo" if is_guest else "beta")
     pro_until_str = u_dict.get("pro_until")
 
@@ -1314,7 +1517,7 @@ def _validate_meal_nutrients(
         raise FoodGuardrailRejected("non_food", "Nama makanan tidak boleh kosong.")
 
     src = raw_item if raw_item is not None else (totals or {})
-    for k in ("energy_kcal", "protein_g", "fat_g", "carb_g", "fiber_g", "sodium_mg"):
+    for k in ("energy_kcal", "protein_g", "fat_g", "carb_g", "fiber_g", "sodium_mg", "sugar_g"):
         v_raw = src.get(k)
         if v_raw not in (None, ""):
             try:
@@ -1330,14 +1533,15 @@ def _validate_meal_nutrients(
     carb = _safe_float(src.get("carb_g"), 0.0)
     fib = _safe_float(src.get("fiber_g"), 0.0)
     sod = _safe_float(src.get("sodium_mg"), 0.0)
+    sug = _safe_float(src.get("sugar_g"), 0.0)
 
     if kcal < 0 or kcal > (MAX_SINGLE_DISH_KCAL * 1.5):
         raise FoodGuardrailRejected(
             "implausible_portion",
             f"Kalori satu catatan ({kcal:,.1f} kkal) melebihi batas wajar per sajian.",
         )
-    if prot > 250.0 or fat > 250.0 or carb > 600.0 or fib > 150.0 or sod > 25000.0:
-        raise FoodGuardrailRejected("invalid_nutrition", "Nilai makronutrien/serat/natrium melebihi batas wajar sajian.")
+    if prot > 250.0 or fat > 250.0 or carb > 600.0 or fib > 150.0 or sod > 25000.0 or sug > 300.0:
+        raise FoodGuardrailRejected("invalid_nutrition", "Nilai makronutrien/serat/natrium/gula melebihi batas wajar sajian.")
 
     if check_macro_atwater:
         has_macros = any(src.get(k) not in (None, "") for k in ("protein_g", "fat_g", "carb_g"))
@@ -1362,6 +1566,7 @@ def _validate_meal_nutrients(
         "carb_g": round(carb, 1),
         "fiber_g": round(fib, 1),
         "sodium_mg": round(sod, 1),
+        "sugar_g": round(sug, 1),
     }
 
 
@@ -1420,8 +1625,8 @@ def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0
         cur.execute(
             """
             INSERT INTO meal_logs
-            (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, portion_multiplier, photo_caption, meal_type, logged_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, sugar_g, portion_multiplier, photo_caption, meal_type, logged_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -1432,6 +1637,7 @@ def log_meal(user_id: str, dish_name: str, totals: dict, multiplier: float = 1.0
                 clean_tot["carb_g"],
                 clean_tot["fiber_g"],
                 clean_tot["sodium_mg"],
+                clean_tot["sugar_g"],
                 mult_val,
                 caption,
                 meal_type,
@@ -1472,6 +1678,7 @@ def update_meal_log(log_id: int, user_id: str, dish_name: str = None, totals: di
             "carb_g": cur_row["carb_g"],
             "fiber_g": cur_row["fiber_g"],
             "sodium_mg": cur_row.get("sodium_mg") or 0.0,
+            "sugar_g": cur_row.get("sugar_g") or 0.0,
         }
         new_dish, clean_tot = _validate_meal_nutrients(
             raw_dish,
@@ -1492,7 +1699,7 @@ def update_meal_log(log_id: int, user_id: str, dish_name: str = None, totals: di
             """
             UPDATE meal_logs
             SET dish_name = ?, energy_kcal = ?, protein_g = ?, fat_g = ?, carb_g = ?, fiber_g = ?,
-                sodium_mg = ?, portion_multiplier = ?, photo_caption = ?, meal_type = ?
+                sodium_mg = ?, sugar_g = ?, portion_multiplier = ?, photo_caption = ?, meal_type = ?
             WHERE id = ? AND user_id = ?
             """,
             (
@@ -1503,6 +1710,7 @@ def update_meal_log(log_id: int, user_id: str, dish_name: str = None, totals: di
                 clean_tot["carb_g"],
                 clean_tot["fiber_g"],
                 clean_tot["sodium_mg"],
+                clean_tot["sugar_g"],
                 new_mult,
                 new_cap,
                 new_meal_type,
@@ -1548,6 +1756,7 @@ def scale_meal_log_portion(log_id: int, user_id: str, new_multiplier: float, new
         "carb_g": round(max(0.0, float(cur_row["carb_g"])) * ratio, 1),
         "fiber_g": round(max(0.0, float(cur_row["fiber_g"])) * ratio, 1),
         "sodium_mg": round(max(0.0, float(cur_row.get("sodium_mg") or 0.0)) * ratio, 1),
+        "sugar_g": round(max(0.0, float(cur_row.get("sugar_g") or 0.0)) * ratio, 1),
     }
     return update_meal_log(
         log_id=log_id,
@@ -1605,7 +1814,8 @@ def get_frequent_meals(user_id: str, limit: int = 6) -> list:
                    AVG(fat_g / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_f,
                    AVG(carb_g / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_c,
                    AVG(fiber_g / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_fib,
-                   AVG(COALESCE(sodium_mg, 0.0) / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_sod,
+                    AVG(COALESCE(sodium_mg, 0.0) / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_sod,
+                   AVG(COALESCE(sugar_g, 0.0) / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_sug,
                    COUNT(*) AS freq,
                    MAX(id) AS last_id
             FROM meal_logs
@@ -1628,6 +1838,7 @@ def get_frequent_meals(user_id: str, limit: int = 6) -> list:
             "carb_g": round(float(r["avg_c"] or 0.0), 1),
             "fiber_g": round(float(r["avg_fib"] or 0.0), 1),
             "sodium_mg": round(float(r["avg_sod"] or 0.0), 1),
+            "sugar_g": round(float(r["avg_sug"] or 0.0), 1),
         })
     return results
 
@@ -1683,8 +1894,8 @@ def copy_meals_from_date(user_id: str, source_date: str, target_date: str, tz_of
             cur.execute(
                 """
                 INSERT INTO meal_logs
-                (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, portion_multiplier, photo_caption, meal_type, logged_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, sugar_g, portion_multiplier, photo_caption, meal_type, logged_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -1695,6 +1906,7 @@ def copy_meals_from_date(user_id: str, source_date: str, target_date: str, tz_of
                     clean_tot["carb_g"],
                     clean_tot["fiber_g"],
                     clean_tot["sodium_mg"],
+                    clean_tot["sugar_g"],
                     min(5.0, max(0.1, float(d.get("portion_multiplier") or 1.0))),
                     d.get("photo_caption") or f"Disalin dari {source_date}",
                     d.get("meal_type") or "Makan Siang",
@@ -1739,6 +1951,7 @@ def _query_stats_and_streak(cur: _UnifiedCursor, user_id: str, target_date: str 
         """
         SELECT SUBSTR(CAST(logged_at AS TEXT), 1, 10) AS day,
                SUM(energy_kcal) AS total_kcal,
+               SUM(protein_g) AS total_protein,
                COUNT(*) AS meals_count
         FROM meal_logs
         WHERE user_id = ? AND SUBSTR(CAST(logged_at AS TEXT), 1, 10) <= ?
@@ -1773,6 +1986,7 @@ def _query_stats_and_streak(cur: _UnifiedCursor, user_id: str, target_date: str 
         "carb_g": round(sum(float(m["carb_g"]) for m in meal_dicts), 1),
         "fiber_g": round(sum(float(m["fiber_g"]) for m in meal_dicts), 1),
         "sodium_mg": round(sum(float(m.get("sodium_mg") or 0.0) for m in meal_dicts), 1),
+        "sugar_g": round(sum(float(m.get("sugar_g") or 0.0) for m in meal_dicts), 1),
         "count": len(meal_dicts),
         "target_date": target_date
     }
@@ -1811,11 +2025,17 @@ def get_dashboard_bundle(user_id: str, target_date: str = None, tz_offset: int =
             "SELECT glasses_count, target_glasses FROM water_logs WHERE user_id = ? AND log_date = ?",
             (user_id, today_str),
         ).fetchone()
-        water_data = (
-            {"glasses": int(w_row[0]), "target": int(w_row[1]), "ml": int(w_row[0]) * 250, "target_ml": int(w_row[1]) * 250}
-            if w_row else
-            {"glasses": 0, "target": 8, "ml": 0, "target_ml": 2000}
+        rec_water_target = compute_water_target_glasses(
+            user_row["weight_kg"] if user_row else 65.0,
+            user_row["focus_goal"] if user_row else "Diet Sehat",
         )
+        w_glasses = int(w_row[0]) if w_row else 0
+        water_data = {
+            "glasses": w_glasses,
+            "target": rec_water_target,
+            "ml": w_glasses * 250,
+            "target_ml": rec_water_target * 250,
+        }
 
         wt_rows = cur.execute(
             "SELECT recorded_date, weight_kg, note FROM weight_logs WHERE user_id = ? ORDER BY recorded_date ASC LIMIT 30",
@@ -1831,6 +2051,7 @@ def get_dashboard_bundle(user_id: str, target_date: str = None, tz_offset: int =
                    AVG(carb_g / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_c,
                    AVG(fiber_g / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_fib,
                    AVG(COALESCE(sodium_mg, 0.0) / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_sod,
+                   AVG(COALESCE(sugar_g, 0.0) / CASE WHEN COALESCE(portion_multiplier, 1.0) > 0 THEN COALESCE(portion_multiplier, 1.0) ELSE 1.0 END) AS avg_sug,
                    COUNT(*) AS freq,
                    MAX(id) AS last_id
             FROM meal_logs
@@ -1851,6 +2072,7 @@ def get_dashboard_bundle(user_id: str, target_date: str = None, tz_offset: int =
         "carb_g": round(float(r["avg_c"] or 0.0), 1),
         "fiber_g": round(float(r["avg_fib"] or 0.0), 1),
         "sodium_mg": round(float(r["avg_sod"] or 0.0), 1),
+        "sugar_g": round(float(r["avg_sug"] or 0.0), 1),
     } for r in fq_rows]
 
     return {
@@ -1873,7 +2095,7 @@ def export_user_data_json(user_id: str) -> str:
             (user_id,),
         ).fetchone()
         meal_rows = cur.execute(
-            "SELECT dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, portion_multiplier, photo_caption, meal_type, logged_at FROM meal_logs WHERE user_id = ? ORDER BY id ASC",
+            "SELECT dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, sugar_g, portion_multiplier, photo_caption, meal_type, logged_at FROM meal_logs WHERE user_id = ? ORDER BY id ASC",
             (user_id,),
         ).fetchall()
         custom_rows = cur.execute(
@@ -1987,8 +2209,8 @@ def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
                     cur.execute(
                         """
                         INSERT INTO meal_logs
-                        (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, portion_multiplier, photo_caption, meal_type, logged_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (user_id, dish_name, energy_kcal, protein_g, fat_g, carb_g, fiber_g, sodium_mg, sugar_g, portion_multiplier, photo_caption, meal_type, logged_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             norm_uid,
@@ -1999,6 +2221,7 @@ def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
                             clean_tot["carb_g"],
                             clean_tot["fiber_g"],
                             clean_tot["sodium_mg"],
+                            clean_tot["sugar_g"],
                             port_mult,
                             str(m.get("photo_caption") or "")[:160],
                             str(m.get("meal_type") or "Makan Siang")[:40],
@@ -2084,7 +2307,7 @@ def import_user_data_json(user_id: str, json_str: str) -> tuple[bool, str]:
 
 def stage_pending_food(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float = 0.0, sod_100: float = 0.0, barcode: str = "", serving_unit: str = "1 porsi (100g)", serving_weight: float = 100.0, source_origin: str = "Open Food Facts", submitted_by: str = "system"):
     """Menyimpan data pangan baru yang lolos guardrail ke tabel antrean (pending_foods) agar dapat ditinjau sebelum publikasi."""
-    if not submitted_by or str(submitted_by).strip().lower() == "tamu (demo)":
+    if not submitted_by or is_guest_user_id(submitted_by):
         return None
     try:
         clean_name = validate_food_candidate(

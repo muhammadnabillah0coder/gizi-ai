@@ -1,25 +1,23 @@
-# Nutrisi Cerdas: Precision Food & Lab Nutrition Intelligence
+# Nutrisi Cerdas (`v4.2.0`): Precision Food & Lab Nutrition Intelligence
 
-Aplikasi web estimasi nutrisi pangan, kalkulator makronutrien deterministik, dan diary pola makan cerdas berbasis rujukan baku laboratorium **Tabel Komposisi Pangan Indonesia (TKPI) Kemenkes RI** serta **USDA FoodData Central**.
+Aplikasi web pelacak kalori, makronutrien, dan Rambu GGL Kemenkes RI (Gula, Garam/Natrium, Lemak) berbasis **1.304 data laboratorium TKPI Kemenkes RI**, **45 produk kemasan ritel BPOM ber-barcode EAN-13**, serta **Open Food Facts / USDA**.
 
-Dibangun dengan arsitektur **Bottom-Up Engineering (7-Layer Production Maturity Roadmap)** untuk menjamin akurasi klinis, performa serverless yang efisien, dan zero-hallucination.
+Dibangun dengan arsitektur **Bottom-Up Engineering (7-Layer Production Maturity Roadmap)**, dual-backend **Supabase PostgreSQL + SQLite**, pertahanan 4-lapis *Food Guardrails*, dan antarmuka **Unslop 60/30/10**.
 
 ---
 
-## 🏛️ Arsitektur Orisinal Nutrisi Cerdas (The 4-Pillar Architecture)
+## Arsitektur Inti
 
-Berbeda dengan aplikasi generik yang sekadar melempar prompt bebas ke LLM dan menghasilkan angka kalori halusinasi, **Nutrisi Cerdas** memisahkan secara tegas antara *Computer Vision* dan *Clinical Verification Math*:
-
-```
+```text
                [ Input Pengguna ]
            /           |          \
-   [ Kamera HP ]   [ Teks Bebas ]   [ Barcode EAN-13 ]
+   [ Kamera HP ]   [ Teks Bebas ]   [ Barcode EAN-13 / Foto Label ]
          |             |                   |
          v             v                   |
   +--------------------------+             |
   |  Gemini Vision & Parser  |             |
-  | (Hanya Uraikan Komponen  |             |
-  |   & Taksiran Gram URT)   |             |
+  |   (google-genai SDK +    |             |
+  |    4-Layer Guardrails)   |             |
   +--------------------------+             |
                |                           |
                +-------------+-------------+
@@ -27,81 +25,49 @@ Berbeda dengan aplikasi generik yang sekadar melempar prompt bebas ke LLM dan me
                              v
            +-----------------------------------+
            |    Clinical Verification Core     |
-           |   (0-Token Math Deterministic)    |
-           |  - TKPI Kemenkes RI (1.300+ item) |
-           |  - Database Pangan Ritel BPOM     |
-           |  - USDA FoodData Central          |
+           |   (0-Token Deterministic Math)    |
+           |  - TKPI Kemenkes RI (1.304 item)  |
+           |  - 45 Produk Ritel BPOM (EAN-13)  |
+           |  - Nutri-Grade & Rambu GGL        |
            +-----------------------------------+
                              |
                              v
            +-----------------------------------+
-           |    Apple-Grade Health Analytics   |
-           |  - Activity Ring Kalori & Makro   |
-           |  - Daily Water Tracker (2000ml)   |
-           |  - Multi-User History (SQLite)    |
+           |  Quiet Craft Analytics (Unslop)   |
+           |  - Cincin Kalori SVG Terkalibrasi |
+           |  - Grafik 7 Hari (Kalori/Protein) |
+           |  - Hidrasi Adaptif & Tren BB      |
            +-----------------------------------+
 ```
 
-### 1. Zero-Token Deterministic Math Calculation
-AI generatif (Gemini Vision) dilarang menghitung kalori dari nol. AI hanya bertugas mengekstrak identitas makanan dan estimasi gramatur porsi Rumah Tangga (URT). Angka kalori, protein, lemak, karbohidrat, dan serat 100% dihitung secara deterministik menggunakan data uji lab resmi per 100g BDD (Bagian Dapat Dimakan).
+---
 
-### 2. Dual Verification Input (Vision + Barcode Scanner)
-Mendukung input visual makanan tradisional/rumahan sekaligus verifikasi barcode EAN-13 produk ritel kemasan Indonesia yang sudah terdaftar di pangkalan data ritel.
+## 7 Lapisan Kesiapan Produksi (`v4.2.0`)
 
-### 3. Adaptive URT Portion Sliders
-Pengguna tidak perlu menimbang makanan dengan timbangan digital. UI menyediakan slider adaptif instan (0.7x Porsi Sedikit, 1.0x Normal, 1.3x Kenyang, 1.5x Jumbo) yang menghitung ulang nilai gizi secara lokal tanpa konsumsi token API tambahan.
-
-### 4. Apple Health Activity Ring UI
-Visualisasi ring 3 dimensi untuk target kalori harian (BMR/TDEE personal), status defisit/surplus, makronutrien seimbang, dan hidrasi air minum harian.
+- [x] **Layer 1 · Entry Point Terpadu:** [app.py](app.py) dengan antarmuka tenang *Unslop 60/30/10*, sesi tamu terisolasi (`guest_*`) + auto-migrasi ke akun baru, edit profil & ganti PIN, serta dukungan Login Google OAuth.
+- [x] **Layer 2 · Engineering Rules:** [AGENTS.md](AGENTS.md) mengatur batas AI, *guardrails* pangan, higienitas seed DB, dan disiplin UI.
+- [x] **Layer 3 · Automated Testing & CI:** Suite `tests/` (unit test nutrisi, auth, dual-backend, *food guardrails*, security hardening, `AppTest` UI smoke, dan v4.2 regression) berjalan otomatis di GitHub Actions [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+- [x] **Layer 4 · Dual-Backend Database:** Permanen via **Supabase PostgreSQL (`pg8000` SSL pool)** dengan fallback otomatis ke SQLite [tkpi_nutrition.db](tkpi_nutrition.db) (seed Git dibersihkan lewat [sanitize_seed_db.py](sanitize_seed_db.py)).
+- [x] **Layer 5 · Security & Secrets:** PBKDF2-SHA256 bersalt, sesi URL HMAC TTL 30 hari, anti-CSRF OAuth `state`, sanitasi CSV/HTML, dan pemisahan kredensial di [`.env.example`](.env.example).
+- [x] **Layer 6 · Cloud-Native Deployment:** Live di Streamlit Community Cloud serta [Dockerfile](Dockerfile) non-root dengan XSRF aktif & `HEALTHCHECK` untuk Google Cloud Run.
+- [x] **Layer 7 · Active Monitoring:** [alert_manager.py](alert_manager.py) terhubung ke error kritis DB Cloud & Gemini API dengan dukungan `st.secrets`, redaksi token, dan *cooldown* 10 menit anti-spam.
 
 ---
 
-## 📋 7 Lapisan Kesiapan Produksi (Production Maturity Checklist)
+## Cara Menjalankan Secara Lokal
 
-- [x] **Layer 1: Satu File (Entry Point):** Antarmuka utama terintegrasi [`app.py`](app.py) yang responsif untuk mobile dan desktop.
-- [x] **Layer 2: Rules File (AI Guidelines):** Pedoman teknis [`AGENTS.md`](AGENTS.md) untuk menjaga batas cakupan AI dan mencegah halusinasi klinis.
-- [x] **Layer 3: Automated Test:** Unit test [`tests/test_nutrition.py`](tests/test_nutrition.py) untuk memastikan formula perhitungan matematika akurat 100%.
-- [x] **Layer 4: Database Persistence:** Basis data SQLite [`tkpi_nutrition.db`](tkpi_nutrition.db) berisi 1.300+ data uji lab TKPI Kemenkes RI dan produk ritel.
-- [x] **Layer 5: Environment Variables:** Proteksi kredensial rahasia menggunakan [`.env.example`](.env.example) dan [`.gitignore`](.gitignore).
-- [x] **Layer 6: Cloud-Native Deployment:** Siap di-deploy dengan container [Dockerfile](Dockerfile) ke **Google Cloud Run** maupun Streamlit Community Cloud.
-- [x] **Layer 7: Monitoring & Alerting ke HP:** Modul [`alert_manager.py`](alert_manager.py) untuk mengirim notifikasi instan ke Telegram jika terjadi error server.
-
----
-
-## 🚀 Cara Menjalankan Secara Lokal
-
-1. **Install Dependensi:**
+1. **Pasang Dependensi:**
    ```bash
    pip install -r requirements.txt
    ```
-
-2. **Setup File Kredensial (.env):**
-   Salin `.env.example` menjadi `.env` lalu masukkan API Key Google Gemini:
-   ```env
-   GEMINI_API_KEY=AIzaSy...
-   ```
-
-3. **Jalankan Unit Test:**
+2. **Konfigurasi Kredensial (`.env`):**
+   Salin `.env.example` menjadi `.env`, lalu isi `GEMINI_API_KEY` (dan opsional `DATABASE_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
+3. **Verifikasi Kebersihan Seed DB & Jalankan Test:**
    ```bash
-   python tests/test_nutrition.py
+   python sanitize_seed_db.py --check
+   python -m unittest discover -s tests -v
    ```
-
 4. **Jalankan Aplikasi:**
    ```bash
    streamlit run app.py
    ```
-   Aplikasi akan terbuka di browser pada alamat `http://localhost:8501`.
-
----
-
-## ☁️ Deploy ke Google Cloud Run
-
-Proyek ini telah dilengkapi dengan `Dockerfile` dan `.dockerignore` siap pakai untuk Google Cloud Run:
-
-```bash
-gcloud run deploy nutrisi-cerdas \
-  --source . \
-  --region asia-southeast2 \
-  --allow-unauthenticated \
-  --set-env-vars GEMINI_API_KEY="API_KEY_ANDA"
-```

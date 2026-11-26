@@ -90,9 +90,11 @@ Keluaran WAJIB berupa JSON murni dengan format schema berikut tanpa narasi tamba
       "protein_g_per_100g": 2.4,
       "fat_g_per_100g": 0.2,
       "carb_g_per_100g": 28.6,
-      "fiber_g_per_100g": 0.4
+      "fiber_g_per_100g": 0.4,
+      "sugar_g_per_100g": 0.0
     }
   ],
+  "detected_barcode": "",
   "health_tip": "1 kalimat saran sehat singkat"
 }
 """
@@ -281,9 +283,43 @@ def _generate_json_with_failover(contents, api_key: str = None) -> dict:
             last_exc = exc
             if idx + 1 < len(candidates) and _is_retryable_model_error(exc):
                 continue
+            low_err = str(exc).lower()
+            if any(tok in low_err for tok in ("401", "403", "api_key", "api key", "404", "no longer available")):
+                try:
+                    from alert_manager import send_alert_to_phone
+                    send_alert_to_phone(f"Model={model_name} | {exc}", context="Gemini API Critical Failure")
+                except Exception:
+                    pass
             raise _friendly_ai_error(exc) from exc
 
     raise _friendly_ai_error(last_exc) from last_exc
+
+
+def analyze_barcode_or_label_image(image_input, api_key: str = None) -> dict:
+    """
+    Membaca nomor barcode EAN-13/UPC pada foto kemasan bila terlihat jelas, sekaligus
+    mengekstrak tabel Informasi Nilai Gizi (termasuk gula / sugar_g_per_100g) dalam 1 kali panggilan.
+    """
+    if isinstance(image_input, str):
+        img = open_safe_image(image_input)
+    else:
+        img = image_input
+        w, h = img.size
+        if w <= 0 or h <= 0 or (w * h) > MAX_SAFE_IMAGE_PIXELS:
+            raise FoodGuardrailRejected("non_food", "Resolusi gambar melebihi batas aman (maks. 25 megapiksel).")
+
+    max_dim = 1280
+    if max(img.size) > max_dim:
+        img = img.copy()
+        img.thumbnail((max_dim, max_dim))
+
+    prompt = (
+        "Amati foto kemasan produk makanan/minuman atau kode batang (barcode) ini. "
+        "1) Jika terlihat deretan angka barcode EAN-13/UPC (8-14 digit), tuliskan persis digit angkanya saja di field 'detected_barcode' (tanpa spasi/strip). "
+        "2) Jika terlihat tabel Informasi Nilai Gizi atau nama produk kemasan, konversikan nilai per 100g/100ml termasuk 'sugar_g_per_100g' dan 'weight_g' sesuai takaran saji 1 kemasan. "
+        "3) Jika foto BUKAN produk pangan/minuman atau hewan/benda terlarang, WAJIB set is_edible_food=false."
+    )
+    return _generate_json_with_failover([prompt, img], api_key=api_key)
 
 
 def analyze_food_image(image_input, caption: str = "", api_key: str = None):

@@ -109,13 +109,13 @@ def compute_macro_targets(target_kcal: float, focus_goal: str = "Diet Sehat") ->
     kcal = max(800.0, float(target_kcal or 2000.0))
     focus_low = (focus_goal or "Diet Sehat").lower()
     if "hamil" in focus_low:
-        p_pct, f_pct, c_pct, fib_g, sod_mg = 0.22, 0.28, 0.50, 28.0, 2000.0
+        p_pct, f_pct, c_pct, fib_g, sod_mg, sug_g = 0.22, 0.28, 0.50, 28.0, 2000.0, 50.0
     elif "diabetes" in focus_low or "gula" in focus_low:
-        p_pct, f_pct, c_pct, fib_g, sod_mg = 0.22, 0.33, 0.45, 30.0, 2000.0
+        p_pct, f_pct, c_pct, fib_g, sod_mg, sug_g = 0.22, 0.33, 0.45, 30.0, 2000.0, 25.0
     elif "hipertensi" in focus_low or "natrium" in focus_low:
-        p_pct, f_pct, c_pct, fib_g, sod_mg = 0.20, 0.28, 0.52, 28.0, 1500.0
+        p_pct, f_pct, c_pct, fib_g, sod_mg, sug_g = 0.20, 0.28, 0.52, 28.0, 1500.0, 50.0
     else:
-        p_pct, f_pct, c_pct, fib_g, sod_mg = 0.22, 0.28, 0.50, 25.0, 2000.0
+        p_pct, f_pct, c_pct, fib_g, sod_mg, sug_g = 0.22, 0.28, 0.50, 25.0, 2000.0, 50.0
 
     return {
         "protein_g": round((kcal * p_pct) / 4.0, 1),
@@ -123,6 +123,7 @@ def compute_macro_targets(target_kcal: float, focus_goal: str = "Diet Sehat") ->
         "carb_g": round((kcal * c_pct) / 4.0, 1),
         "fiber_g": fib_g,
         "sodium_mg": sod_mg,
+        "sugar_g": sug_g,
     }
 
 
@@ -233,9 +234,11 @@ def find_best_match(query_name: str):
     # 1.5. Cek pencarian via Barcode hanya jika input murni kode numerik produk (8-18 digit)
     barcode_candidate = (query_name or "").strip().replace("-", "").replace(" ", "")
     if barcode_candidate.isdigit() and 8 <= len(barcode_candidate) <= 18:
+        cand_trim = barcode_candidate.lstrip("0")
         for entry in catalog:
             row = entry["row"]
-            if row.get("barcode") and barcode_candidate in str(row["barcode"]):
+            row_bc = str(row.get("barcode") or "").strip()
+            if row_bc and (barcode_candidate in row_bc or (cand_trim and row_bc.lstrip("0") == cand_trim)):
                 return dict(row)
         # Jika belum ada di database lokal, coba tarik real-time dari Open Food Facts API
         off_product = fetch_open_food_facts(barcode_candidate)
@@ -347,6 +350,7 @@ def fetch_open_food_facts(barcode: str):
             f_100 = round(float(nutr.get("fat_100g") or nutr.get("fat") or 0.0), 1)
             c_100 = round(float(nutr.get("carbohydrates_100g") or nutr.get("carbohydrates") or 0.0), 1)
             fib_100 = round(float(nutr.get("fiber_100g") or nutr.get("fiber") or 0.0), 1)
+            sug_100 = round(float(nutr.get("sugars_100g") or nutr.get("sugars") or 0.0), 1)
             
             # Natrium di Open Food Facts umumnya dalam gram per 100g
             raw_sod = float(nutr.get("sodium_100g") or 0.0)
@@ -392,6 +396,7 @@ def fetch_open_food_facts(barcode: str):
                 "carb_g": c_100,
                 "fiber_g": fib_100,
                 "sodium_mg": sod_100,
+                "sugar_g": sug_100,
                 "barcode": clean_bc,
                 "source_origin": "Open Food Facts API (Draft - Siap Diedit & Dipublikasi)"
             }
@@ -399,15 +404,15 @@ def fetch_open_food_facts(barcode: str):
         return None
 
 
-def evaluate_nutri_grade(kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float = 0.0, sod_100: float = 0.0):
+def evaluate_nutri_grade(kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float = 0.0, sod_100: float = 0.0, sugar_100: float = 0.0):
     """
     Menghitung Skor Nutri-Grade (A / B / C / D) dan Rambu Peringatan GGL Kemenkes RI
-    berdasarkan kepadatan nutrisi per 100g/porsi.
+    (Gula, Garam/Natrium, Lemak) berdasarkan kepadatan nutrisi per sajian/100g.
     """
     score = 100
     badges = []
 
-    # Penalti Kalori, Lemak, & Natrium
+    # Penalti Kalori, Lemak, Natrium, & Gula (GGL Permenkes No. 30/2013)
     if kcal_100 > 350:
         score -= 25
         badges.append(("Padat kalori", "#b91c1c"))
@@ -428,6 +433,13 @@ def evaluate_nutri_grade(kcal_100: float, p_100: float, f_100: float, c_100: flo
         score -= 20
         badges.append(("Tinggi natrium", "#b91c1c"))
 
+    if sugar_100 > 15.0:
+        score -= 20
+        badges.append(("Tinggi gula (>15g)", "#b91c1c"))
+    elif sugar_100 > 8.0:
+        score -= 8
+        badges.append(("Gula sedang", "#b45309"))
+
     # Bonus Protein & Serat
     if p_100 >= 12.0:
         score += 15
@@ -446,7 +458,7 @@ def evaluate_nutri_grade(kcal_100: float, p_100: float, f_100: float, c_100: flo
     elif score >= 50:
         return {"grade": "C", "color": "#b45309", "label": "Konsumsi secukupnya", "badges": badges}
     else:
-        return {"grade": "D", "color": "#b91c1c", "label": "Batasi porsi (tinggi kalori, lemak, atau natrium)", "badges": badges}
+        return {"grade": "D", "color": "#b91c1c", "label": "Batasi porsi (tinggi kalori, gula, lemak, atau natrium)", "badges": badges}
 
 
 def auto_learn_food(food_name: str, category: str, kcal_100: float, p_100: float, f_100: float, c_100: float, fib_100: float, sodium_100: float = 0.0, barcode: str = None, serving_unit: str = "porsi/buah", serving_weight: float = 100.0, auto_publish: bool = False):
@@ -545,6 +557,7 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
         "carb_g": 0.0,
         "fiber_g": 0.0,
         "sodium_mg": 0.0,
+        "sugar_g": 0.0,
         "total_weight_g": 0.0
     }
     
@@ -564,6 +577,9 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
             carb = round(_safe_float(match.get("carb_g"), 0.0) * factor, 1)
             fiber = round(_safe_float(match.get("fiber_g"), 0.0) * factor, 1)
             sodium = round(_safe_float(match.get("sodium_mg"), 0.0) * factor, 1)
+            db_sug = _safe_float(match.get("sugar_g"), 0.0)
+            ai_sug = _safe_float(comp.get("sugar_g_per_100g"), 0.0)
+            sugar = round((db_sug if db_sug > 0 else ai_sug) * factor, 1)
             
             item_res = {
                 "input_name": raw_name,
@@ -575,7 +591,8 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
                 "fat_g": fat,
                 "carb_g": carb,
                 "fiber_g": fiber,
-                "sodium_mg": sodium
+                "sodium_mg": sodium,
+                "sugar_g": sugar,
             }
         else:
             # Gunakan data nutrisi per 100g yang diekstrak langsung oleh AI atau koreksi manual user
@@ -585,6 +602,7 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
             c_100 = _safe_float(comp.get("carb_g_per_100g"), 0.0)
             fib_100 = _safe_float(comp.get("fiber_g_per_100g"), 0.0)
             sod_100 = _safe_float(comp.get("sodium_mg_per_100g"), 0.0)
+            sug_100 = _safe_float(comp.get("sugar_g_per_100g"), 0.0)
             
             # Auto-Learning: Simpan otomatis ke antrean staging jika hasil dari ekstraksi AI
             if kcal_100 > 0 and not is_override and auto_learn:
@@ -601,7 +619,8 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
                 "fat_g": round(f_100 * factor, 1),
                 "carb_g": round(c_100 * factor, 1),
                 "fiber_g": round(fib_100 * factor, 1),
-                "sodium_mg": round(sod_100 * factor, 1)
+                "sodium_mg": round(sod_100 * factor, 1),
+                "sugar_g": round(sug_100 * factor, 1),
             }
             
         calculated_items.append(item_res)
@@ -612,6 +631,7 @@ def calculate_dish_nutrition(ai_components: list, portion_multiplier: float = 1.
         totals["carb_g"] += item_res["carb_g"]
         totals["fiber_g"] += item_res["fiber_g"]
         totals["sodium_mg"] += item_res["sodium_mg"]
+        totals["sugar_g"] += item_res["sugar_g"]
         
     for k in totals:
         totals[k] = round(totals[k], 1)

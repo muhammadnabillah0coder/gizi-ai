@@ -1,0 +1,37 @@
+name: Nutrisi Cerdas CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check (py_compile)
+        run: |
+          python -m py_compile app.py db_history.py nutrition_engine.py gemini_extractor.py food_guardrails.py google_auth.py alert_manager.py whatsapp_bot.py sanitize_seed_db.py inject_retail_foods.py map_barcodes.py
+
+      - name: Audit seed tkpi_nutrition.db hygiene (zero user data or secrets)
+        run: |
+          python sanitize_seed_db.py --check
+
+      - name: Run unit, guardrail, security, and AppTest suites
+        run: |
+          python -m unittest discover -s tests -v
