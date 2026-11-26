@@ -21,6 +21,7 @@ import gemini_extractor
 import google_auth
 import nutrition_engine
 import db_history
+import session_cookie
 
 
 def _sync_module_from_disk(mod):
@@ -48,6 +49,7 @@ gemini_extractor = _sync_module_from_disk(gemini_extractor)
 google_auth = _sync_module_from_disk(google_auth)
 nutrition_engine = _sync_module_from_disk(nutrition_engine)
 db_history = _sync_module_from_disk(db_history)
+session_cookie = _sync_module_from_disk(session_cookie)
 
 from food_guardrails import (
     FoodGuardrailRejected,
@@ -60,7 +62,16 @@ from food_guardrails import (
     validate_food_candidate,
     validate_food_text_query,
 )
-from gemini_extractor import analyze_food_image, analyze_food_text, analyze_barcode_or_label_image
+from gemini_extractor import analyze_food_image, analyze_food_text, analyze_barcode_or_label_image, ask_nutrition_coach
+from session_cookie import (
+    COOKIE_UID,
+    COOKIE_SIG,
+    COOKIE_AUTH,
+    read_browser_cookies,
+    extract_valid_guest_cookie,
+    build_cookie_bridge_payload,
+    mount_session_cookie_bridge,
+)
 from nutrition_engine import (
     calculate_dish_nutrition, fetch_open_food_facts, evaluate_nutri_grade,
     compute_macro_targets, find_best_match
@@ -87,12 +98,21 @@ from google_auth import (
     get_credentials as get_google_oauth_credentials
 )
 
-APP_VERSION = "v4.2.0"
+APP_VERSION = "v4.3.0"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v4.2.0 (Terbaru)",
+        "version": "v4.3.0 (Terbaru)",
+        "date": "26 Nov 2026",
+        "highlights": [
+            "Auto-login 30 hari tersimpan otomatis di tiap HP via Browser Cookie + cadangan localStorage native (tanpa simpan PIN polos, sekali login langsung masuk akun pribadi saat membuka web lagi).",
+            "Tab baru Tanya Gizi AI: konsultan gizi interaktif kontekstual yang membaca langsung sisa kalori, makro, gula, natrium, air minum, dan fokus klinis Anda hari ini.",
+            "Rilis publik penuh: menghapus seluruh label Mode Demo dan Open Beta, memperjelas paket gratis permanen untuk penggunaan harian."
+        ]
+    },
+    {
+        "version": "v4.2.0",
         "date": "26 Nov 2026",
         "highlights": [
             "Isolasi sesi tamu per-browser dengan migrasi otomatis catatan makan/air/BB ke akun baru, tombol Masuk dengan Google otomatis, edit profil tubuh, ganti PIN, dan tautan masuk cepat 30 hari.",
@@ -577,19 +597,20 @@ def _reset_ephemeral_user_state():
     st.session_state.pop("prepared_backup_json", None)
     st.session_state.pop("selected_diary_date", None)
     st.session_state.pop("scanner_guardrail_notice", None)
+    st.session_state.pop("coach_messages", None)
 
 
-def _get_or_init_guest_user() -> dict:
-    """Mengembalikan akun sesi tamu terisolasi per-browser (guest_<hex>) agar pengunjung tidak saling mencampur data."""
+def _get_or_init_guest_user(preferred_guest_id: str = "") -> dict:
+    """Mengembalikan akun sesi tamu terisolasi per-browser (guest_<hex>) yang tahan refresh lewat cookie."""
     gid = st.session_state.get("guest_session_id")
     if not gid or not is_guest_user_id(gid):
-        gid = create_guest_session_id()
+        gid = preferred_guest_id if (preferred_guest_id and preferred_guest_id.startswith("guest_")) else create_guest_session_id()
         st.session_state["guest_session_id"] = gid
     return get_or_create_user(gid, display_name="Tamu", auth_provider="guest")
 
 
 def _activate_authenticated_user(user_dict: dict, auth_provider: str = "local", toast_prefix: str = ""):
-    """Mengaktifkan sesi akun terdaftar, memigrasikan catatan sesi tamu sebelumnya, dan menulis token URL 30 hari."""
+    """Mengaktifkan sesi akun terdaftar, memigrasikan catatan sesi tamu sebelumnya, dan menyimpan cookie HP 30 hari."""
     prev_user = st.session_state.get("user") or {}
     prev_uid = str(prev_user.get("user_id") or "")
     migrated = {"meals": 0, "water": 0, "weights": 0, "custom": 0}
@@ -598,18 +619,32 @@ def _activate_authenticated_user(user_dict: dict, auth_provider: str = "local", 
             migrated = migrate_guest_data_to_user(prev_uid, user_dict["user_id"])
         except Exception:
             pass
+    tok = create_session_token(user_dict["user_id"])
     st.session_state["user"] = user_dict
+    st.session_state["active_session_token"] = tok
+    st.session_state["block_ls_restore"] = False
+    st.session_state["pending_cookie_clear"] = False
     _reset_ephemeral_user_state()
     st.query_params.clear()
-    st.query_params["u"] = user_dict["user_id"]
-    st.query_params["s"] = create_session_token(user_dict["user_id"])
-    st.query_params["auth"] = auth_provider
     _mark_db_mutated()
-    mig_note = f" ({migrated['meals']} catatan sesi tamu dipindahkan)" if migrated.get("meals", 0) > 0 else ""
+    mig_note = f" ({migrated['meals']} catatan sebelumnya dipindahkan)" if migrated.get("meals", 0) > 0 else ""
     if toast_prefix:
         st.toast(f"{toast_prefix}{mig_note}")
     elif mig_note:
-        st.toast(f"Akun aktif{mig_note}")
+        st.toast(f"Akun aktif dan tersimpan di perangkat ini{mig_note}")
+
+
+def _logout_to_guest():
+    """Keluar dari akun aktif, hapus cookie + localStorage perangkat, dan buka sesi tamu baru yang bersih."""
+    st.session_state["guest_session_id"] = create_guest_session_id()
+    st.session_state["user"] = _get_or_init_guest_user()
+    st.session_state.pop("active_session_token", None)
+    st.session_state["pending_cookie_clear"] = True
+    st.session_state["block_ls_restore"] = True
+    _reset_ephemeral_user_state()
+    st.query_params.clear()
+    _mark_db_mutated()
+    st.toast("Anda telah keluar dari akun di perangkat ini")
 
 
 def _render_google_signin_link(label: str = "Masuk dengan Google") -> bool:
@@ -664,30 +699,64 @@ if auth_code:
             st.error(f"Gagal memverifikasi login Google: {err_details}")
             st.caption("Pastikan Redirect URI di Google Cloud Console adalah `https://nutrisi-cerdas.streamlit.app` dan status OAuth Consent Screen sudah In Production")
 
-# Inisialisasi Sesi Akun Pengguna dengan Verifikasi Token HMAC TTL 30 Hari + Isolasi Sesi Tamu
+# Inisialisasi Sesi Akun Pengguna: Prioritas URL (?u=&s=) -> Cookie HP (30 hari) -> Cookie Tamu (7 hari) -> Tamu Baru
+browser_cookies = read_browser_cookies()
 saved_user_param = st.query_params.get("u", "")
 saved_sig_param = st.query_params.get("s", "")
 saved_auth_param = st.query_params.get("auth", "local")
 
+cookie_uid = str(browser_cookies.get(COOKIE_UID) or "").strip().lower()
+cookie_sig = str(browser_cookies.get(COOKIE_SIG) or "").strip()
+cookie_auth = str(browser_cookies.get(COOKIE_AUTH) or "local").strip().lower()
+cookie_guest = extract_valid_guest_cookie(browser_cookies)
+
 if "user" not in st.session_state:
-    safe_auth_param = saved_auth_param if saved_auth_param in {"local", "google"} else "local"
+    safe_url_auth = saved_auth_param if saved_auth_param in {"local", "google"} else "local"
+    safe_ck_auth = cookie_auth if cookie_auth in {"local", "google"} else "local"
     if saved_user_param and verify_session_token(saved_user_param, saved_sig_param):
-        st.session_state["user"] = get_or_create_user(saved_user_param.strip().lower(), auth_provider=safe_auth_param)
+        st.session_state["user"] = get_or_create_user(saved_user_param.strip().lower(), auth_provider=safe_url_auth)
+        st.session_state["active_session_token"] = saved_sig_param
+    elif cookie_uid and verify_session_token(cookie_uid, cookie_sig):
+        st.session_state["user"] = get_or_create_user(cookie_uid, auth_provider=safe_ck_auth)
+        st.session_state["active_session_token"] = (
+            create_session_token(cookie_uid) if session_token_needs_refresh(cookie_sig) else cookie_sig
+        )
     else:
         if saved_user_param and not is_guest_user_id(saved_user_param):
             st.session_state["auth_url_warning"] = saved_user_param.strip()
             st.query_params.clear()
-        st.session_state["user"] = _get_or_init_guest_user()
+        st.session_state["user"] = _get_or_init_guest_user(preferred_guest_id=cookie_guest)
 else:
     active_uid = st.session_state["user"]["user_id"]
-    active_auth = st.session_state["user"].get("auth_provider", "local")
     if not is_guest_user_id(active_uid):
-        same_user_param = saved_user_param.strip().lower() == active_uid.lower()
-        tok_valid = same_user_param and verify_session_token(active_uid, saved_sig_param)
-        if not tok_valid or session_token_needs_refresh(saved_sig_param):
-            st.query_params["u"] = active_uid
-            st.query_params["s"] = create_session_token(active_uid)
-            st.query_params["auth"] = active_auth
+        cur_tok = st.session_state.get("active_session_token") or saved_sig_param or cookie_sig
+        if not verify_session_token(active_uid, cur_tok) or session_token_needs_refresh(cur_tok):
+            cur_tok = create_session_token(active_uid)
+        st.session_state["active_session_token"] = cur_tok
+
+# Sinkronisasi Cookie & localStorage Native Per-HP (berjalan same-origin 0px, aman untuk iOS Safari & Android Chrome)
+_bridge_user = st.session_state["user"]
+_bridge_is_guest = is_guest_user_id(_bridge_user["user_id"])
+_should_clear_cookie = bool(st.session_state.pop("pending_cookie_clear", False))
+_bridge_payload = build_cookie_bridge_payload(
+    clear=_should_clear_cookie,
+    is_guest=_bridge_is_guest,
+    user_id=_bridge_user["user_id"],
+    session_token=st.session_state.get("active_session_token") or "",
+    auth_provider=_bridge_user.get("auth_provider", "local"),
+    try_restore=(not _should_clear_cookie and not st.session_state.get("block_ls_restore", False)),
+)
+_restored_sess = mount_session_cookie_bridge(_bridge_payload)
+if _bridge_is_guest and not _should_clear_cookie and not st.session_state.get("block_ls_restore", False) and _restored_sess:
+    r_uid, r_sig, r_auth = _restored_sess
+    if verify_session_token(r_uid, r_sig):
+        u_restored = get_or_create_user(r_uid, auth_provider=r_auth)
+        st.session_state["user"] = u_restored
+        st.session_state["active_session_token"] = (
+            create_session_token(r_uid) if session_token_needs_refresh(r_sig) else r_sig
+        )
+        _mark_db_mutated()
+        st.rerun()
 
 if "nutrition_data" not in st.session_state:
     st.session_state["nutrition_data"] = None
@@ -1624,7 +1693,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
 
 # Sidebar: Akun Pribadi & Target Harian (Tenang, Terstruktur, Skala 4px)
 with st.sidebar:
-    ver_meta_sb = f'<span class="nc-mono" style="font-size:0.72rem; color:var(--text-muted);">{APP_VERSION} · {APP_CREATOR}</span>' if is_admin else '<span style="font-size:0.75rem; color:var(--text-muted);">Open Beta</span>'
+    ver_meta_sb = f'<span class="nc-mono" style="font-size:0.72rem; color:var(--text-muted);">{APP_VERSION} · {APP_CREATOR}</span>' if is_admin else '<span style="font-size:0.75rem; color:var(--text-muted);">Pelacak Gizi TKPI</span>'
     st.markdown(
         f'<div style="display:flex; align-items:center; gap:12px; padding-bottom:16px; margin-bottom:16px; border-bottom:1px solid var(--border-col);">'
         f'{_brand_mark_svg(32)}'
@@ -1638,15 +1707,15 @@ with st.sidebar:
     if is_guest:
         st.markdown(
             '<div style="background:var(--bg-card); border:1px solid var(--border-col); border-radius:10px; padding:12px; margin-bottom:16px;">'
-            '<div style="display:flex; align-items:center; gap:8px; font-size:0.8125rem; font-weight:500; color:var(--warning);">'
-            '<span class="nc-meta-dot" style="background:var(--warning);"></span>Akses tamu (sesi sementara)</div>'
+            '<div style="display:flex; align-items:center; gap:8px; font-size:0.8125rem; font-weight:500; color:var(--accent);">'
+            '<span class="nc-meta-dot" style="background:var(--accent);"></span>Belum masuk akun</div>'
             '<div style="font-size:0.8125rem; color:var(--text-secondary); margin-top:6px; line-height:1.45;">'
-            'Catatan di sesi ini terisolasi dan otomatis berpindah saat Anda masuk atau mendaftar akun pribadi.'
+            'Masuk atau daftar sekali saja; sesi tersimpan otomatis di perangkat ini selama 30 hari.'
             '</div></div>',
             unsafe_allow_html=True,
         )
     else:
-        role_meta = "Admin · Tanpa batas" if is_admin else f"Akun aktif · {scan_status['scans_today']}/{scan_status['max_scans']} scan foto"
+        role_meta = "Admin · Tanpa batas" if is_admin else f"Tersimpan di HP ini · {scan_status['scans_today']}/{scan_status['max_scans']} scan"
         st.markdown(
             f'<div style="background:var(--bg-card); border:1px solid var(--border-col); border-radius:10px; padding:12px; margin-bottom:12px;">'
             f'<div style="font-weight:500; font-size:0.9rem; color:var(--text-primary);">{sanitize_html_text(current_user["display_name"])}</div>'
@@ -1655,12 +1724,7 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
         if st.button("Keluar akun", icon=":material/logout:", width="stretch", key="sb_btn_logout"):
-            st.session_state["guest_session_id"] = create_guest_session_id()
-            st.session_state["user"] = _get_or_init_guest_user()
-            _reset_ephemeral_user_state()
-            st.query_params.clear()
-            _mark_db_mutated()
-            st.toast("Anda telah keluar dari akun")
+            _logout_to_guest()
             st.rerun()
 
     st.markdown('<div style="font-size:0.8125rem; font-weight:500; color:var(--text-secondary); margin:16px 0 8px 0;">Target kalori harian</div>', unsafe_allow_html=True)
@@ -1892,12 +1956,7 @@ with col_head2:
                 st.markdown(f"**{current_user['display_name']}**")
                 st.caption(f"ID: `{current_user['user_id']}` · Fokus: `{user_focus}`")
                 if st.button("Keluar dari akun", type="primary", width="stretch", key="btn_logout_top"):
-                    st.session_state["guest_session_id"] = create_guest_session_id()
-                    st.session_state["user"] = _get_or_init_guest_user()
-                    _reset_ephemeral_user_state()
-                    st.query_params.clear()
-                    _mark_db_mutated()
-                    st.toast("Anda telah keluar dari akun")
+                    _logout_to_guest()
                     st.rerun()
                 st.markdown("---")
                 st.caption("Ganti akun lain")
@@ -1980,42 +2039,43 @@ with col_head2:
                             st.error(res)
 
     with c_acc2:
-        with st.popover("Info Akses", width="stretch"):
-            st.markdown("##### Fasilitas akun pribadi")
-            st.caption("Gratis tanpa pembayaran untuk pemantauan gizi harian")
+        with st.popover("Paket Gratis", width="stretch"):
+            st.markdown("##### Gratis permanen untuk harian")
+            st.caption("Tanpa biaya langganan wajib, berbasis 1.304 data lab TKPI Kemenkes RI")
 
             if is_admin:
                 st.success("Status: Admin (tanpa batas)")
             elif is_guest:
-                st.info(f"Akses tamu: {scan_status['scans_today']}/{scan_status['max_scans']} scan foto hari ini")
+                st.info(f"Akses tanpa akun: {scan_status['scans_today']}/{scan_status['max_scans']} scan foto hari ini")
                 st.markdown(
-                    "Masuk atau daftar akun (gratis) untuk:\n"
-                    "- Menyimpan riwayat makan & grafik BB lintas perangkat\n"
-                    "- 5 scan foto makanan per hari\n"
+                    "Masuk atau daftar akun gratis (10 detik, otomatis tersimpan di HP ini) untuk:\n"
+                    "- Login otomatis 30 hari di perangkat Anda\n"
+                    "- 5 scan foto makanan + 10 konsultasi Tanya Gizi AI per hari\n"
                     "- 5 fokus klinis (Diet, Ibu Hamil, Diabetes, Hipertensi)\n"
-                    "- Catat teks, barcode, dan menu cepat tanpa batas"
+                    "- Catat teks, 45 barcode ritel, dan 1.304 database TKPI tanpa batas"
                 )
             else:
                 sisa_scan = max(0, scan_status["max_scans"] - scan_status["scans_today"])
                 st.success(f"Sisa scan foto hari ini: {sisa_scan}/{scan_status['max_scans']}")
                 st.markdown(
-                    "Fasilitas akun aktif:\n"
-                    "- 5 scan foto makanan per hari\n"
-                    "- Catat teks, menu cepat, dan barcode tanpa batas\n"
-                    "- Grafik berat badan, streak harian, dan fokus klinis"
+                    "Fasilitas akun Anda (Gratis Permanen):\n"
+                    "- Login tersimpan otomatis di perangkat ini selama 30 hari\n"
+                    "- 5 scan foto makanan & 10 sesi Tanya Gizi AI per hari\n"
+                    "- Catat teks, menu cepat, barcode, dan 1.304 data TKPI tanpa batas\n"
+                    "- Grafik berat badan, Rambu GGL, streak harian, dan fokus klinis"
                 )
 
-# Banner Ringkas untuk Pengunjung Tamu (Langsung Masuk atau Daftar Cepat 3 Langkah + Auto-Migrasi)
+# Kartu Sambutan Singkat bagi Pengunjung yang Belum Login (Sekali Daftar -> Otomatis Tersimpan di HP 30 Hari)
 if is_guest:
     with st.container(border=True):
         c_hero_txt, c_hero_act1, c_hero_act2 = st.columns([2.2, 0.85, 0.95], vertical_alignment="center")
         with c_hero_txt:
             st.markdown(
                 '<div style="font-size:1.0rem; font-weight:600; color:var(--text-primary); margin-bottom:4px;">'
-                'Aktifkan akun pribadi agar keluar dari akses tamu</div>'
+                'Simpan riwayat otomatis di HP Anda</div>'
                 '<div style="font-size:0.875rem; color:var(--text-secondary); line-height:1.5;">'
-                'Masuk dengan akun lama atau daftar dalam 10 detik (cukup ID, nama, dan PIN 4 digit). '
-                'Catatan makan sesi ini otomatis ikut pindah ke akun Anda.'
+                'Masuk atau buat akun gratis sekali saja (cukup ID, nama, dan PIN 4 digit). '
+                'Sesi tersimpan otomatis lewat cookie perangkat selama 30 hari dan catatan Anda saat ini ikut tersimpan.'
                 '</div>',
                 unsafe_allow_html=True,
             )
@@ -2108,9 +2168,10 @@ if not api_key:
         pass
 
 # Navigasi Utama (Bersih Tanpa Emoji, Ringkas 1 Baris di HP)
-tab_diary, tab_scanner, tab_sources, tab_guide = st.tabs([
+tab_diary, tab_scanner, tab_coach, tab_sources, tab_guide = st.tabs([
     "Hari Ini",
     "Catat",
+    "Tanya Gizi",
     "Database",
     "Bantuan"
 ])
@@ -3005,7 +3066,154 @@ with tab_scanner:
         else:
             st.caption("Belum ada makanan yang disimpan pada tanggal ini. Setelah analisis, klik Simpan ke buku harian.")
 
-# ================= TAB 3: SUMBER DATA & ENSIKLOPEDIA NUTRISI =================
+# ================= TAB 3: TANYA GIZI AI (KONSULTAN KONTEKSTUAL BERBASIS DATA HARIAN) =================
+with tab_coach:
+    st.markdown('<div style="font-size:1.35rem; font-weight:600; margin-bottom:4px; color:var(--text-primary);">Tanya Gizi AI</div>', unsafe_allow_html=True)
+    st.caption("Konsultan gizi kontekstual yang langsung membaca sisa kalori, makro, gula, natrium, dan fokus klinis Anda hari ini")
+
+    coach_rem_kcal = max(0.0, target_kcal - today_kcal)
+    coach_p_gap = max(0.0, macro_targets["protein_g"] - stats["today_totals"]["protein_g"])
+    coach_sug = stats["today_totals"].get("sugar_g", 0.0)
+    coach_sod = stats["today_totals"].get("sodium_mg", 0.0)
+    coach_water = dash_bundle.get("water_data") or {"glasses": 0, "target": 8}
+
+    st.markdown(
+        f'<div class="nc-card" style="padding:14px 16px; margin-bottom:16px;">'
+        f'  <div class="nc-label" style="margin-bottom:6px;">Konteks harian aktif · {sanitize_html_text(user_focus)}</div>'
+        f'  <div class="nc-mono" style="display:flex; gap:16px; flex-wrap:wrap; font-size:0.82rem; color:var(--text-primary);">'
+        f'    <span>Sisa budget {coach_rem_kcal:,.0f} kkal</span>'
+        f'    <span>Kurang protein {coach_p_gap:.1f}g</span>'
+        f'    <span>Gula {coach_sug:.1f}/{macro_targets["sugar_g"]:.0f}g</span>'
+        f'    <span>Natrium {coach_sod:,.0f}/{macro_targets["sodium_mg"]:,.0f}mg</span>'
+        f'    <span>Air {coach_water["glasses"]}/{coach_water["target"]} gelas</span>'
+        f'  </div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    coach_limit = 999 if is_admin else (3 if is_guest else 10)
+    coach_today_key = local_now.strftime("%Y-%m-%d")
+    coach_quota = st.session_state.get("coach_quota_tracker") or {}
+    if coach_quota.get("date") != coach_today_key or coach_quota.get("uid") != current_user["user_id"]:
+        coach_quota = {"date": coach_today_key, "uid": current_user["user_id"], "count": 0}
+        st.session_state["coach_quota_tracker"] = coach_quota
+    coach_used = int(coach_quota.get("count") or 0)
+    coach_remaining = max(0, coach_limit - coach_used)
+
+    if "coach_messages" not in st.session_state:
+        st.session_state["coach_messages"] = []
+
+    st.caption("Pertanyaan cepat (1 klik)")
+    COACH_QUICK_PROMPTS = [
+        ("Rekomendasi makan berikutnya", "Berdasarkan sisa kalori dan kekurangan proteinku hari ini, rekomendasikan 2 pilihan menu Indonesia atau warteg yang pas beserta porsi URT."),
+        ("Evaluasi makanku hari ini", "Evaluasi pola makanku hari ini secara singkat: apa yang sudah baik dan 1 perbaikan paling penting untuk sesi berikutnya?"),
+        ("Camilan rendah gula", "Sarankan 3 pilihan camilan atau minuman mudah didapat di minimarket/warung yang rendah gula dan tetap pas di sisa budgetku hari ini."),
+        ("Tips fokus kesehatanku", f"Berikan 3 langkah makan praktis hari ini khusus untuk fokus {user_focus} berdasarkan asupanku sekarang."),
+    ]
+    cq_cols = st.columns(2)
+    selected_quick_q = ""
+    for idx_cq, (cq_lbl, cq_prompt) in enumerate(COACH_QUICK_PROMPTS):
+        with cq_cols[idx_cq % 2]:
+            if st.button(cq_lbl, width="stretch", key=f"coach_qp_{idx_cq}"):
+                selected_quick_q = cq_prompt
+
+    c_cin1, c_cin2 = st.columns([3.5, 1.0], vertical_alignment="bottom")
+    with c_cin1:
+        typed_coach_q = st.text_input(
+            "Tulis pertanyaan gizi Anda",
+            placeholder="Malam ini sisa 450 kkal, enaknya makan apa yang tinggi protein?",
+            max_chars=280,
+            key="coach_text_in",
+        )
+    with c_cin2:
+        btn_ask_coach = st.button("Tanya", type="primary", width="stretch", key="btn_ask_coach")
+
+    active_coach_q = selected_quick_q or (typed_coach_q.strip() if btn_ask_coach else "")
+    if active_coach_q:
+        if not api_key:
+            st.warning("Fitur Tanya Gizi AI memerlukan GEMINI_API_KEY di Secrets server")
+        elif coach_remaining <= 0:
+            if is_guest:
+                st.warning("Batas 3 pertanyaan tanpa akun tercapai. Masuk atau daftar akun gratis untuk membuka 10 pertanyaan per hari.")
+            else:
+                st.warning("Batas 10 pertanyaan Tanya Gizi AI hari ini sudah tercapai. Coba lagi besok.")
+        else:
+            daily_ctx = {
+                "focus_goal": user_focus,
+                "today_kcal": today_kcal,
+                "target_kcal": target_kcal,
+                "remaining_kcal": coach_rem_kcal,
+                "protein_g": stats["today_totals"]["protein_g"],
+                "target_protein_g": macro_targets["protein_g"],
+                "fat_g": stats["today_totals"]["fat_g"],
+                "target_fat_g": macro_targets["fat_g"],
+                "carb_g": stats["today_totals"]["carb_g"],
+                "target_carb_g": macro_targets["carb_g"],
+                "fiber_g": stats["today_totals"]["fiber_g"],
+                "target_fiber_g": macro_targets["fiber_g"],
+                "sugar_g": coach_sug,
+                "target_sugar_g": macro_targets["sugar_g"],
+                "sodium_mg": coach_sod,
+                "target_sodium_mg": macro_targets["sodium_mg"],
+                "water_glasses": coach_water["glasses"],
+                "water_target": coach_water["target"],
+                "today_dishes": [m["dish_name"] for m in stats["today_meals"]],
+            }
+            with st.spinner("Menyusun saran gizi berbasis data Anda..."):
+                try:
+                    reply_txt = ask_nutrition_coach(
+                        active_coach_q,
+                        daily_ctx,
+                        chat_history=st.session_state["coach_messages"],
+                        api_key=api_key,
+                    )
+                    st.session_state["coach_messages"].append({"role": "user", "content": active_coach_q})
+                    st.session_state["coach_messages"].append({"role": "assistant", "content": reply_txt})
+                    st.session_state["coach_messages"] = st.session_state["coach_messages"][-12:]
+                    coach_quota["count"] = coach_used + 1
+                    st.session_state["coach_quota_tracker"] = coach_quota
+                    st.rerun()
+                except FoodGuardrailRejected as g_err:
+                    _render_guardrail_rejection_card(g_err)
+                except Exception as exc:
+                    st.error(f"Gagal menghubungi Tanya Gizi AI: {exc}")
+
+    if st.session_state["coach_messages"]:
+        c_ch1, c_ch2 = st.columns([3.0, 1.0], vertical_alignment="center")
+        with c_ch1:
+            quota_lbl = "Tanpa batas" if is_admin else f"Sisa {coach_remaining}/{coach_limit} pertanyaan hari ini"
+            st.caption(f"Riwayat percakapan · {quota_lbl}")
+        with c_ch2:
+            if st.button("Bersihkan chat", width="stretch", key="btn_clear_coach"):
+                st.session_state["coach_messages"] = []
+                st.rerun()
+
+        for msg in st.session_state["coach_messages"]:
+            is_user_msg = msg["role"] == "user"
+            role_lbl = "Anda" if is_user_msg else "Asisten Gizi Nutrisi Cerdas"
+            bg_style = "var(--surface-raised)" if is_user_msg else "var(--bg-card)"
+            dot_col = "var(--text-muted)" if is_user_msg else "var(--accent)"
+            safe_body = sanitize_html_text(msg["content"]).replace("\n", "<br>")
+            st.markdown(
+                f'<div style="background:{bg_style}; border:1px solid var(--border-col); border-radius:10px; padding:12px 16px; margin-bottom:10px;">'
+                f'<div style="display:flex; align-items:center; gap:8px; font-size:0.78rem; font-weight:500; color:var(--text-muted); margin-bottom:6px;">'
+                f'<span class="nc-meta-dot" style="background:{dot_col};"></span>{role_lbl}</div>'
+                f'<div style="font-size:0.88rem; color:var(--text-primary); line-height:1.55;">{safe_body}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown(
+            '<div class="nc-card" style="padding:24px; text-align:center; color:var(--text-muted); font-size:0.875rem;">'
+            'Pilih salah satu pertanyaan cepat di atas atau ketik pertanyaan pola makan Anda. '
+            'Jawaban disesuaikan otomatis dengan sisa kalori, protein, gula, natrium, dan fokus klinis Anda hari ini.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.caption("Saran bersifat edukasi gizi harian berbasis data TKPI Kemenkes RI dan bukan pengganti konsultasi dokter atau ahli gizi klinis.")
+
+# ================= TAB 4: SUMBER DATA & ENSIKLOPEDIA NUTRISI =================
 with tab_sources:
     st.markdown('<div style="font-size:1.35rem; font-weight:600; margin-bottom:4px; color:var(--text-primary);">Rujukan pangkalan data nutrisi</div>', unsafe_allow_html=True)
     st.caption("Seluruh kalkulasi nilai nutrisi berpatokan pada data uji laboratorium TKPI Kemenkes RI, USDA FoodData Central, dan Open Food Facts")
@@ -3224,10 +3432,10 @@ with tab_guide:
 
     with col_g1:
         with st.container(border=True):
-            st.markdown('<div style="font-size:0.95rem; font-weight:600; margin-bottom:8px;">1. Akun pribadi & batas Open Beta</div>', unsafe_allow_html=True)
+            st.markdown('<div style="font-size:0.95rem; font-weight:600; margin-bottom:8px;">1. Akun pribadi & auto-login perangkat</div>', unsafe_allow_html=True)
             st.markdown(
-                "- Klik **Masuk / Daftar** di bagian kanan atas untuk membuat akun dengan nama panggilan dan PIN minimal 4 karakter.\n"
-                "- Akun terdaftar mendapat kuota 5 scan foto makanan per hari, pelacak berat badan, dan streak harian."
+                "- Klik **Masuk / Daftar** di kanan atas untuk membuat akun gratis dengan ID/Email, nama panggilan, dan PIN minimal 4 karakter.\n"
+                "- Sesi login tersimpan otomatis melalui cookie perangkat selama 30 hari, lengkap dengan 5 scan foto dan 10 sesi Tanya Gizi AI per hari."
             )
 
         with st.container(border=True):
@@ -3282,7 +3490,7 @@ with tab_guide:
         )
 
 # Footer Tenang & Ringkas
-footer_ver_html = f" · <span class='nc-mono'>{APP_VERSION}</span>" if is_admin else " · Open Beta"
+footer_ver_html = f" · <span class='nc-mono'>{APP_VERSION}</span>" if is_admin else ""
 st.markdown(
     f'<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; padding:24px 0 8px 0; margin-top:32px; border-top:1px solid var(--border-col); font-size:0.8125rem; color:var(--text-muted);">'
     f'<span>Nutrisi Cerdas · Basis TKPI Kemenkes RI & Open Food Facts</span>'
