@@ -1,0 +1,27 @@
+{
+  "name": "Nutrisi Cerdas - Pelacak Gizi TKPI Kemenkes",
+  "short_name": "Nutrisi Cerdas",
+  "description": "Pelacak kalori, makronutrien, Rambu GGL, dan Tanya Gizi AI berbasis 1.304 data lab TKPI Kemenkes RI.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F7F6F2",
+  "theme_color": "#15803D",
+  "lang": "id-ID",
+  "categories": ["health", "fitness", "medical", "food"],
+  "icons": [
+    {
+      "src": "/app/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/app/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

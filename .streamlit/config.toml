@@ -4,6 +4,7 @@ showErrorDetails = false
 
 [server]
 enableXsrfProtection = true
+enableStaticServing = true
 headless = true
 
 [browser]

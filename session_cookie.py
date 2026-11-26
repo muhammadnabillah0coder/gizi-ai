@@ -62,7 +62,39 @@ function clearCookie(name) {
     document.cookie = `${name}=${cookieAttrs(0)}`;
 }
 
+function injectPwaHead() {
+    if (window.__ncPwaHeadInjected || !document.head) {
+        return;
+    }
+    window.__ncPwaHeadInjected = true;
+    try {
+        if (!document.querySelector('link[rel="manifest"]')) {
+            const link = document.createElement("link");
+            link.rel = "manifest";
+            link.href = "/app/static/manifest.json";
+            document.head.appendChild(link);
+        }
+        const metas = [
+            ["theme-color", "#15803D"],
+            ["mobile-web-app-capable", "yes"],
+            ["apple-mobile-web-app-capable", "yes"],
+            ["apple-mobile-web-app-title", "Nutrisi Cerdas"],
+            ["apple-mobile-web-app-status-bar-style", "default"]
+        ];
+        for (let i = 0; i < metas.length; i++) {
+            const [mName, mContent] = metas[i];
+            if (!document.querySelector(`meta[name="${mName}"]`)) {
+                const m = document.createElement("meta");
+                m.name = mName;
+                m.content = mContent;
+                document.head.appendChild(m);
+            }
+        }
+    } catch (_e) {}
+}
+
 export default function(component) {
+    injectPwaHead();
     const { data, setTriggerValue } = component;
     if (!data || typeof data !== "object") {
         return;

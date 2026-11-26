@@ -127,6 +127,100 @@ def compute_macro_targets(target_kcal: float, focus_goal: str = "Diet Sehat") ->
     }
 
 
+def build_personalized_nutrition_plan(
+    *,
+    gender: str = "Pria",
+    weight_kg: float = 65.0,
+    height_cm: float = 170.0,
+    age_years: int = 25,
+    target_weight_kg: float = None,
+    activity_level: str = "Ringan",
+    goal_choice: str = "Turunkan Berat Badan",
+    focus_goal: str = "Diet Sehat",
+    fasting_mode: str = "Normal",
+) -> dict:
+    """
+    Menghitung rencana gizi personal 100% deterministik untuk Kuis Onboarding 4 Langkah:
+    IMT/BMI Kemenkes RI, BMR Mifflin-St Jeor, TDEE, target kalori aman, target makro,
+    batas GGL (Gula/Natrium), target air adaptif, dan estimasi minggu ke berat target.
+    """
+    w = max(20.0, min(250.0, float(weight_kg or 65.0)))
+    h_cm = max(80.0, min(230.0, float(height_cm or 170.0)))
+    age = max(5, min(110, int(age_years or 25)))
+    tw = max(20.0, min(250.0, float(target_weight_kg if target_weight_kg is not None else w)))
+
+    h_m = h_cm / 100.0
+    bmi = round(w / (h_m * h_m), 1)
+    # Klasifikasi IMT Kemenkes RI (Permenkes)
+    if bmi < 18.5:
+        bmi_cat = "Kurus (di bawah normal)"
+    elif bmi <= 25.0:
+        bmi_cat = "Normal ideal"
+    elif bmi <= 27.0:
+        bmi_cat = "Gemuk ringan (kelebihan BB)"
+    else:
+        bmi_cat = "Obesitas (perlu kendali kalori)"
+
+    bmr = (10.0 * w) + (6.25 * h_cm) - (5.0 * age) + (5.0 if gender == "Pria" else -161.0)
+    act_low = str(activity_level or "Ringan").lower()
+    if "sangat aktif" in act_low or "intensif" in act_low:
+        act_mult = 1.725
+    elif "sedang" in act_low:
+        act_mult = 1.55
+    elif "sedentari" in act_low or "jarang" in act_low:
+        act_mult = 1.2
+    else:
+        act_mult = 1.375
+    tdee = bmr * act_mult
+
+    goal_low = str(goal_choice or "").lower()
+    focus_low = str(focus_goal or "Diet Sehat").lower()
+    if "hamil" in focus_low:
+        # Ibu hamil & menyusui tidak dianjurkan defisit agresif (+300 kkal acuan AKG)
+        adj_kcal = 300.0
+        strategy_label = "Penambahan energi aman Ibu Hamil & Menyusui (+300 kkal)"
+    elif "turun" in goal_low or "defisit" in goal_low:
+        adj_kcal = -400.0
+        strategy_label = "Defisit terukur -400 kkal/hari (~0.35-0.5 kg/minggu)"
+    elif "tambah" in goal_low or "otot" in goal_low or "surplus" in goal_low:
+        adj_kcal = 350.0
+        strategy_label = "Surplus bersih +350 kkal/hari fokus protein"
+    else:
+        adj_kcal = 0.0
+        strategy_label = "Pemeliharaan berat ideal & keseimbangan GGL"
+
+    target_kcal = float(max(1200, min(3800, int(round((tdee + adj_kcal) / 10.0) * 10))))
+    macros = compute_macro_targets(target_kcal, focus_goal)
+
+    bonus_ml = 350.0 if "hamil" in focus_low else 0.0
+    water_glasses = max(8, min(14, int(round(((w * 33.0) + bonus_ml) / 250.0))))
+
+    weight_diff = round(tw - w, 1)
+    est_weeks = 0
+    if abs(weight_diff) >= 0.5 and abs(adj_kcal) >= 100.0:
+        # 1 kg jaringan lemak ~ 7.700 kkal
+        weekly_kg = abs(adj_kcal * 7.0) / 7700.0
+        if (weight_diff < 0 and adj_kcal < 0) or (weight_diff > 0 and adj_kcal > 0):
+            est_weeks = max(1, min(104, int(round(abs(weight_diff) / max(0.15, weekly_kg)))))
+
+    return {
+        "bmi": bmi,
+        "bmi_category": bmi_cat,
+        "bmr": round(bmr),
+        "tdee": round(tdee),
+        "target_kcal": target_kcal,
+        "adjustment_kcal": adj_kcal,
+        "strategy_label": strategy_label,
+        "macros": macros,
+        "water_glasses": water_glasses,
+        "water_ml": water_glasses * 250,
+        "weight_diff_kg": weight_diff,
+        "estimated_weeks": est_weeks,
+        "focus_goal": focus_goal,
+        "fasting_mode": fasting_mode,
+    }
+
+
 def invalidate_food_catalog_cache():
     """Menghapus cache RAM katalog TKPI saat ada pembaruan katalog."""
     global _FOOD_CATALOG_CACHE, _FOOD_CATALOG_META

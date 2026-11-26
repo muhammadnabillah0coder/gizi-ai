@@ -76,7 +76,7 @@ from session_cookie import (
 )
 from nutrition_engine import (
     calculate_dish_nutrition, fetch_open_food_facts, evaluate_nutri_grade,
-    compute_macro_targets, find_best_match
+    compute_macro_targets, find_best_match, build_personalized_nutrition_plan
 )
 from db_history import (
     init_user_history_tables, get_or_create_user, log_meal, delete_meal_log,
@@ -101,12 +101,20 @@ from google_auth import (
     get_credentials as get_google_oauth_credentials
 )
 
-APP_VERSION = "v4.4.0"
+APP_VERSION = "v4.5.0"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v4.4.0 (Terbaru)",
+        "version": "v4.5.0 (Terbaru)",
+        "date": "26 Nov 2026",
+        "highlights": [
+            "Kuis Onboarding Personal 4 Langkah (Personal Plan Builder): menyusun target kalori, IMT Kemenkes RI, makro harian, batas GGL (gula/natrium), target air adaptif, estimasi minggu menuju target berat badan, dan mode puasa secara deterministik sebelum pengguna mulai mencatat.",
+            "Kesiapan Publik & Aplikasi HP (PWA): manifest aplikasi + ikon 192/512px agar bisa dipasang ke Layar Utama Android/iOS, ditambah skrip deploy 1-klik Google Cloud Run Jakarta (asia-southeast2) dan panduan custom domain HTTPS."
+        ]
+    },
+    {
+        "version": "v4.4.0",
         "date": "26 Nov 2026",
         "highlights": [
             "Kartu Visual Share IG Story & Status WA (PNG 1080x1920 / 9:16) sekali klik dengan pilihan tema Terang (Lab Paper) dan Gelap (Graphite) langsung dari ringkasan harian.",
@@ -609,6 +617,42 @@ def _reset_ephemeral_user_state():
     st.session_state.pop("selected_diary_date", None)
     st.session_state.pop("scanner_guardrail_notice", None)
     st.session_state.pop("coach_messages", None)
+    st.session_state.pop("show_onboarding_wizard", None)
+    st.session_state.pop("onboard_step", None)
+    st.session_state.pop("onboard_answers", None)
+    st.session_state["_sync_sb_prefs"] = True
+
+
+def _open_onboarding_wizard(active_user: dict):
+    """Membuka kuis rencana gizi personal 4 langkah dengan praisi profil pengguna saat ini."""
+    cur_w = min(250.0, max(20.0, float(active_user.get("weight_kg") or 65.0)))
+    cur_h = min(230.0, max(80.0, float(active_user.get("height_cm") or 170.0)))
+    cur_age = min(110, max(5, int(active_user.get("age_years") or 25)))
+    cur_focus = active_user.get("focus_goal") or "Diet Sehat"
+    cur_fast = active_user.get("fasting_mode") or "Normal"
+    if cur_fast not in VALID_FASTING_MODES:
+        cur_fast = "Normal"
+    cur_tz = int(active_user.get("timezone_offset") if active_user.get("timezone_offset") is not None else 8)
+    if cur_tz not in (7, 8, 9):
+        cur_tz = 8
+    default_goal = "Kendali Kesehatan Khusus" if cur_focus in (
+        "Ibu Hamil & Menyusui", "Kendali Gula (Diabetes)", "Kendali Natrium (Hipertensi)"
+    ) else ("Jaga Berat Badan Ideal" if cur_focus == "Jaga Berat Badan" else "Turunkan Berat Badan")
+    default_tw = max(40.0, round(cur_w - 5.0, 1)) if "Turunkan" in default_goal else cur_w
+    st.session_state["onboard_answers"] = {
+        "goal_choice": default_goal,
+        "focus_goal": cur_focus,
+        "gender": "Wanita" if active_user.get("gender") == "Wanita" else "Pria",
+        "weight_kg": cur_w,
+        "height_cm": cur_h,
+        "age_years": cur_age,
+        "target_weight_kg": default_tw,
+        "activity_level": "Ringan (Olahraga 1-3 hari/minggu)",
+        "fasting_mode": cur_fast,
+        "timezone_offset": cur_tz,
+    }
+    st.session_state["onboard_step"] = 1
+    st.session_state["show_onboarding_wizard"] = True
 
 
 def _get_or_init_guest_user(preferred_guest_id: str = "") -> dict:
@@ -1792,6 +1836,13 @@ with st.sidebar:
             _logout_to_guest()
             st.rerun()
 
+    if st.session_state.pop("_sync_sb_prefs", False):
+        for _sb_k in (
+            "sb_target_kcal", "sb_bmr_gen", "sb_bmr_bb", "sb_bmr_tb", "sb_bmr_age",
+            "sb_edit_dname", "sb_focus_goal", "sb_fasting_mode", "sb_tz_select", "sb_theme_picker",
+        ):
+            st.session_state.pop(_sb_k, None)
+
     st.markdown('<div style="font-size:0.8125rem; font-weight:500; color:var(--text-secondary); margin:16px 0 8px 0;">Target kalori harian</div>', unsafe_allow_html=True)
     current_target = float(current_user.get("daily_calorie_target") or 2000.0)
     new_target = st.number_input("Target kalori (kkal/hari)", min_value=1000, max_value=4000, value=int(current_target), step=50, key="sb_target_kcal", label_visibility="collapsed")
@@ -1857,6 +1908,7 @@ with st.sidebar:
             else:
                 update_calorie_target(current_user["user_id"], float(recom_target))
                 st.session_state["user"]["daily_calorie_target"] = float(recom_target)
+            st.session_state["_sync_sb_prefs"] = True
             _mark_db_mutated()
             st.success(f"Profil tubuh dan target {recom_target} kkal/hari disimpan")
             st.rerun()
@@ -1912,6 +1964,10 @@ with st.sidebar:
             _mark_db_mutated()
             st.toast("Preferensi fokus, mode puasa, dan zona waktu disimpan")
             st.rerun()
+
+    if st.button("Susun ulang rencana personal", width="stretch", key="sb_btn_open_onboard"):
+        _open_onboarding_wizard(current_user)
+        st.rerun()
 
     with st.expander("Tema tampilan", expanded=False):
         theme_options = list(THEME_STYLES.keys())
@@ -2137,17 +2193,22 @@ with col_head2:
 # Kartu Sambutan Singkat bagi Pengunjung yang Belum Login (Sekali Daftar -> Otomatis Tersimpan di HP 30 Hari)
 if is_guest:
     with st.container(border=True):
-        c_hero_txt, c_hero_act1, c_hero_act2 = st.columns([2.2, 0.85, 0.95], vertical_alignment="center")
+        c_hero_txt, c_hero_wiz, c_hero_act1, c_hero_act2 = st.columns([2.0, 1.05, 0.78, 0.85], vertical_alignment="center")
         with c_hero_txt:
             st.markdown(
                 '<div style="font-size:1.0rem; font-weight:600; color:var(--text-primary); margin-bottom:4px;">'
-                'Simpan riwayat otomatis di HP Anda</div>'
+                'Susun target gizi personal & simpan otomatis di HP Anda</div>'
                 '<div style="font-size:0.875rem; color:var(--text-secondary); line-height:1.5;">'
-                'Masuk atau buat akun gratis sekali saja (cukup ID, nama, dan PIN 4 digit). '
-                'Sesi tersimpan otomatis lewat cookie perangkat selama 30 hari dan catatan Anda saat ini ikut tersimpan.'
+                'Jawab 4 pertanyaan singkat untuk menghitung target kalori, makro, air, dan Rambu GGL Kemenkes RI sesuai tubuh Anda, '
+                'atau langsung masuk agar riwayat tersimpan 30 hari di perangkat ini.'
                 '</div>',
                 unsafe_allow_html=True,
             )
+
+        with c_hero_wiz:
+            if st.button("Susun rencana personal", type="primary", width="stretch", key="btn_open_onboard"):
+                _open_onboarding_wizard(current_user)
+                st.rerun()
 
         with c_hero_act1:
             with st.popover("Masuk akun", width="stretch"):
@@ -2164,7 +2225,7 @@ if is_guest:
                         st.error(res_hl)
 
         with c_hero_act2:
-            with st.popover("Buat akun gratis", type="primary", width="stretch"):
+            with st.popover("Buat akun gratis", width="stretch"):
                 st.markdown("##### Pendaftaran cepat (3 langkah)")
                 st.caption("Profil tubuh bisa diatur kapan saja di sidebar")
                 _render_google_signin_link("Daftar lewat Google")
@@ -2226,6 +2287,332 @@ if is_guest:
                             st.rerun()
                         else:
                             st.error(res)
+
+# Kuis Onboarding 4 Langkah (Personal Plan Builder Deterministik Berbasis TKPI/AKG Kemenkes RI)
+if st.session_state.get("show_onboarding_wizard"):
+    ob_step = int(st.session_state.get("onboard_step", 1))
+    ob_step = max(1, min(4, ob_step))
+    ob_ans = st.session_state.setdefault("onboard_answers", {
+        "goal_choice": "Turunkan Berat Badan",
+        "focus_goal": user_focus,
+        "gender": "Wanita" if current_user.get("gender") == "Wanita" else "Pria",
+        "weight_kg": float(current_user.get("weight_kg") or 65.0),
+        "height_cm": float(current_user.get("height_cm") or 170.0),
+        "age_years": int(current_user.get("age_years") or 25),
+        "target_weight_kg": max(40.0, float(current_user.get("weight_kg") or 65.0) - 5.0),
+        "activity_level": "Ringan (Olahraga 1-3 hari/minggu)",
+        "fasting_mode": user_fasting,
+        "timezone_offset": user_tz,
+    })
+
+    _ob_step_titles = {
+        1: "Tujuan utama & fokus kesehatan",
+        2: "Profil tubuh & target berat badan",
+        3: "Aktivitas harian, pola puasa & zona waktu",
+        4: "Rencana gizi personal Anda siap digunakan",
+    }
+
+    with st.container(border=True):
+        c_ob_hdr, c_ob_cls = st.columns([4.5, 0.8], vertical_alignment="center")
+        with c_ob_hdr:
+            st.markdown(
+                f'<div style="font-size:0.78rem; color:var(--accent); font-weight:500;">'
+                f'Rencana Gizi Personal · Langkah {ob_step} dari 4</div>'
+                f'<div style="font-size:1.1rem; font-weight:600; color:var(--text-primary); margin-top:2px;">'
+                f'{_ob_step_titles[ob_step]}</div>',
+                unsafe_allow_html=True,
+            )
+        with c_ob_cls:
+            if st.button("Tutup", width="stretch", key="ob_btn_close"):
+                st.session_state["show_onboarding_wizard"] = False
+                st.rerun()
+
+        st.progress(ob_step / 4.0)
+
+        if ob_step == 1:
+            goal_choices = [
+                "Turunkan Berat Badan",
+                "Jaga Berat Badan Ideal",
+                "Tambah Berat / Massa Otot",
+                "Kendali Kesehatan Khusus",
+            ]
+            g_idx = goal_choices.index(ob_ans["goal_choice"]) if ob_ans.get("goal_choice") in goal_choices else 0
+            sel_ob_goal = st.radio(
+                "Apa target utama Anda dalam 30 hingga 90 hari ke depan?",
+                goal_choices,
+                index=g_idx,
+                key="ob_goal_radio",
+            )
+            f_idx = FOCUS_GOALS.index(ob_ans["focus_goal"]) if ob_ans.get("focus_goal") in FOCUS_GOALS else 0
+            sel_ob_focus = st.selectbox(
+                "Fokus pemantauan klinis (mengatur rasio makro & Rambu GGL Kemenkes RI)",
+                FOCUS_GOALS,
+                index=f_idx,
+                key="ob_focus_select",
+            )
+            st.caption(
+                "Fokus Ibu Hamil otomatis melindungi dari defisit agresif (+300 kkal AKG). "
+                "Fokus Diabetes menurunkan batas gula ke 25 g/hari; fokus Hipertensi menurunkan batas natrium ke 1.500 mg/hari."
+            )
+            if st.button("Lanjut ke profil tubuh", type="primary", width="stretch", key="ob_next_1"):
+                ob_ans["goal_choice"] = sel_ob_goal
+                ob_ans["focus_goal"] = sel_ob_focus
+                if "Turunkan" in sel_ob_goal and ob_ans["target_weight_kg"] >= ob_ans["weight_kg"]:
+                    ob_ans["target_weight_kg"] = max(35.0, round(ob_ans["weight_kg"] - 5.0, 1))
+                elif "Tambah" in sel_ob_goal and ob_ans["target_weight_kg"] <= ob_ans["weight_kg"]:
+                    ob_ans["target_weight_kg"] = min(200.0, round(ob_ans["weight_kg"] + 4.0, 1))
+                st.session_state["onboard_step"] = 2
+                st.rerun()
+
+        elif ob_step == 2:
+            c_ob2_a, c_ob2_b = st.columns(2)
+            with c_ob2_a:
+                ob_gender = st.selectbox(
+                    "Jenis kelamin",
+                    ["Pria", "Wanita"],
+                    index=1 if ob_ans.get("gender") == "Wanita" else 0,
+                    key="ob_gender_sel",
+                )
+                ob_weight = st.number_input(
+                    "Berat badan saat ini (kg)",
+                    min_value=20.0, max_value=250.0,
+                    value=min(250.0, max(20.0, float(ob_ans.get("weight_kg", 65.0)))),
+                    step=0.5, key="ob_weight_num",
+                )
+                ob_target_w = st.number_input(
+                    "Target berat badan (kg)",
+                    min_value=20.0, max_value=250.0,
+                    value=min(250.0, max(20.0, float(ob_ans.get("target_weight_kg", ob_weight)))),
+                    step=0.5, key="ob_target_w_num",
+                )
+            with c_ob2_b:
+                ob_age = st.number_input(
+                    "Usia (tahun)",
+                    min_value=5, max_value=110,
+                    value=min(110, max(5, int(ob_ans.get("age_years", 25)))),
+                    step=1, key="ob_age_num",
+                )
+                ob_height = st.number_input(
+                    "Tinggi badan (cm)",
+                    min_value=80.0, max_value=230.0,
+                    value=min(230.0, max(80.0, float(ob_ans.get("height_cm", 170.0)))),
+                    step=1.0, key="ob_height_num",
+                )
+                live_bmi = round(ob_weight / ((ob_height / 100.0) ** 2), 1)
+                if live_bmi < 18.5:
+                    live_bmi_cat = "Kurus (di bawah normal)"
+                elif live_bmi <= 25.0:
+                    live_bmi_cat = "Normal ideal"
+                elif live_bmi <= 27.0:
+                    live_bmi_cat = "Gemuk ringan (kelebihan BB)"
+                else:
+                    live_bmi_cat = "Obesitas (perlu kendali kalori)"
+                st.markdown(
+                    f'<div style="background:var(--surface-raised); border:1px solid var(--border-col); '
+                    f'border-radius:8px; padding:12px 14px; margin-top:24px;">'
+                    f'<div class="nc-label">Indeks Massa Tubuh (IMT Kemenkes RI)</div>'
+                    f'<div style="font-size:1.1rem; font-weight:600; color:var(--text-primary); margin-top:2px;">'
+                    f'<span class="nc-mono">{live_bmi}</span> · {live_bmi_cat}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+            c_ob2_p, c_ob2_n = st.columns([1, 2])
+            with c_ob2_p:
+                if st.button("Kembali", width="stretch", key="ob_prev_2"):
+                    ob_ans.update({
+                        "gender": ob_gender, "weight_kg": ob_weight, "height_cm": ob_height,
+                        "age_years": int(ob_age), "target_weight_kg": ob_target_w,
+                    })
+                    st.session_state["onboard_step"] = 1
+                    st.rerun()
+            with c_ob2_n:
+                if st.button("Lanjut ke aktivitas & pola puasa", type="primary", width="stretch", key="ob_next_2"):
+                    ob_ans.update({
+                        "gender": ob_gender, "weight_kg": ob_weight, "height_cm": ob_height,
+                        "age_years": int(ob_age), "target_weight_kg": ob_target_w,
+                    })
+                    st.session_state["onboard_step"] = 3
+                    st.rerun()
+
+        elif ob_step == 3:
+            act_choices = [
+                "Sedentari (Jarang olahraga / di depan laptop)",
+                "Ringan (Olahraga 1-3 hari/minggu)",
+                "Sedang (Olahraga 3-5 hari/minggu)",
+                "Sangat Aktif (Latihan intensif setiap hari)",
+            ]
+            a_idx = act_choices.index(ob_ans["activity_level"]) if ob_ans.get("activity_level") in act_choices else 1
+            sel_ob_act = st.selectbox("Tingkat aktivitas fisik harian", act_choices, index=a_idx, key="ob_act_sel")
+
+            fast_choices = list(VALID_FASTING_MODES)
+            fm_idx = fast_choices.index(ob_ans["fasting_mode"]) if ob_ans.get("fasting_mode") in fast_choices else 0
+            sel_ob_fast = st.radio(
+                "Pola makan / mode puasa yang sedang dijalankan",
+                fast_choices,
+                index=fm_idx,
+                key="ob_fast_radio",
+            )
+
+            tz_keys_ob = list(TZ_OPTIONS.keys())
+            tz_idx_ob = tz_keys_ob.index(ob_ans["timezone_offset"]) if ob_ans.get("timezone_offset") in tz_keys_ob else 1
+            sel_ob_tz = st.selectbox(
+                "Zona waktu lokal",
+                tz_keys_ob,
+                index=tz_idx_ob,
+                format_func=lambda k: TZ_OPTIONS[k],
+                key="ob_tz_sel",
+            )
+
+            c_ob3_p, c_ob3_n = st.columns([1, 2])
+            with c_ob3_p:
+                if st.button("Kembali", width="stretch", key="ob_prev_3"):
+                    ob_ans.update({"activity_level": sel_ob_act, "fasting_mode": sel_ob_fast, "timezone_offset": sel_ob_tz})
+                    st.session_state["onboard_step"] = 2
+                    st.rerun()
+            with c_ob3_n:
+                if st.button("Hitung rencana personal", type="primary", width="stretch", key="ob_next_3"):
+                    ob_ans.update({"activity_level": sel_ob_act, "fasting_mode": sel_ob_fast, "timezone_offset": sel_ob_tz})
+                    st.session_state["onboard_step"] = 4
+                    st.rerun()
+
+        else:
+            ob_plan = build_personalized_nutrition_plan(
+                gender=ob_ans["gender"],
+                weight_kg=ob_ans["weight_kg"],
+                height_cm=ob_ans["height_cm"],
+                age_years=ob_ans["age_years"],
+                target_weight_kg=ob_ans["target_weight_kg"],
+                activity_level=ob_ans["activity_level"],
+                goal_choice=ob_ans["goal_choice"],
+                focus_goal=ob_ans["focus_goal"],
+                fasting_mode=ob_ans["fasting_mode"],
+            )
+            ob_m = ob_plan["macros"]
+            est_line = (
+                f' · Estimasi <strong class="nc-mono" style="font-weight:500;">~{ob_plan["estimated_weeks"]} minggu</strong> menuju '
+                f'<span class="nc-mono">{ob_ans["target_weight_kg"]:.1f} kg</span>'
+                if ob_plan["estimated_weeks"] > 0 else ""
+            )
+            fast_water_note = " (pola 2-4-2 Sahur/Berbuka)" if ob_ans["fasting_mode"] == "Puasa Sunnah / Ramadan" else ""
+
+            st.markdown(
+                f'<div style="background:var(--surface-raised); border:1px solid var(--border-col); border-radius:10px; padding:16px; margin-bottom:14px;">'
+                f'<div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">'
+                f'<div><div class="nc-label">Target Energi Harian Personal</div>'
+                f'<div style="font-size:1.85rem; font-weight:600; color:var(--accent); line-height:1.15;">'
+                f'<span class="nc-mono">{int(ob_plan["target_kcal"]):,}</span> <span style="font-size:0.95rem; font-weight:400; color:var(--text-secondary);">kkal / hari</span></div>'
+                f'<div style="font-size:0.84rem; color:var(--text-secondary); margin-top:4px;">{sanitize_html_text(ob_plan["strategy_label"])}{est_line}</div></div>'
+                f'<div style="text-align:right;"><span class="nc-badge">IMT <span class="nc-mono">{ob_plan["bmi"]}</span> · {sanitize_html_text(ob_plan["bmi_category"])}</span>'
+                f'<div style="font-size:0.78rem; color:var(--text-muted); margin-top:6px;">BMR <span class="nc-mono">{ob_plan["bmr"]}</span> · TDEE <span class="nc-mono">{ob_plan["tdee"]}</span> kkal</div></div>'
+                f'</div>'
+                f'<div class="nc-macro-grid">'
+                f'<div class="nc-macro-cell"><div class="nc-label">Protein</div><div class="nc-mono" style="font-size:1.0rem; font-weight:600;">{ob_m["protein_g"]} g</div></div>'
+                f'<div class="nc-macro-cell"><div class="nc-label">Lemak</div><div class="nc-mono" style="font-size:1.0rem; font-weight:600;">{ob_m["fat_g"]} g</div></div>'
+                f'<div class="nc-macro-cell"><div class="nc-label">Karbohidrat</div><div class="nc-mono" style="font-size:1.0rem; font-weight:600;">{ob_m["carb_g"]} g</div></div>'
+                f'<div class="nc-macro-cell"><div class="nc-label">Serat Minimal</div><div class="nc-mono" style="font-size:1.0rem; font-weight:600;">{ob_m["fiber_g"]} g</div></div>'
+                f'</div>'
+                f'<div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border-col); font-size:0.82rem; color:var(--text-secondary); display:flex; flex-wrap:wrap; gap:16px;">'
+                f'<span>Batas Gula GGL: <strong class="nc-mono" style="font-weight:500;">{int(ob_m["sugar_g"])} g</strong></span>'
+                f'<span>Batas Natrium: <strong class="nc-mono" style="font-weight:500;">{int(ob_m["sodium_mg"]):,} mg</strong></span>'
+                f'<span>Target Air: <strong class="nc-mono" style="font-weight:500;">{ob_plan["water_glasses"]} gelas ({ob_plan["water_ml"]:,} ml)</strong>{fast_water_note}</span>'
+                f'<span>Mode: <strong style="font-weight:500;">{sanitize_html_text(ob_ans["fasting_mode"])}</strong></span>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
+            def _apply_plan_to_active_user(target_uid: str, provider_str: str):
+                update_user_body_profile(
+                    target_uid,
+                    gender=ob_ans["gender"],
+                    weight_kg=float(ob_ans["weight_kg"]),
+                    height_cm=float(ob_ans["height_cm"]),
+                    age_years=int(ob_ans["age_years"]),
+                    daily_calorie_target=float(ob_plan["target_kcal"]),
+                )
+                update_user_preferences(
+                    target_uid,
+                    timezone_offset=int(ob_ans["timezone_offset"]),
+                    focus_goal=ob_ans["focus_goal"],
+                    fasting_mode=ob_ans["fasting_mode"],
+                )
+                log_weight_entry(
+                    target_uid,
+                    float(ob_ans["weight_kg"]),
+                    note="Target rencana personal",
+                    tz_offset=int(ob_ans["timezone_offset"]),
+                )
+                st.session_state["user"] = get_or_create_user(target_uid, auth_provider=provider_str)
+                st.session_state["selected_diary_date"] = get_local_now(int(ob_ans["timezone_offset"])).date()
+                st.session_state["show_onboarding_wizard"] = False
+                st.session_state["_sync_sb_prefs"] = True
+                _mark_db_mutated()
+
+            if is_guest:
+                c_ob4_reg, c_ob4_try = st.columns([1.25, 1.0])
+                with c_ob4_reg:
+                    st.markdown("##### Simpan rencana ke akun gratis (auto-login 30 hari)")
+                    _render_google_signin_link("Simpan lewat Google")
+                    ob_uid = st.text_input("Email atau ID unik", placeholder="nama@email.com", key="ob_reg_uid")
+                    c_ob4_np1, c_ob4_np2 = st.columns(2)
+                    with c_ob4_np1:
+                        ob_name = st.text_input("Nama panggilan", placeholder="Nama Anda", key="ob_reg_name")
+                    with c_ob4_np2:
+                        ob_pin = st.text_input("PIN (min. 4 karakter)", type="password", placeholder="4+ karakter", key="ob_reg_pin")
+                    if st.button("Buat akun & terapkan rencana", type="primary", width="stretch", key="ob_btn_reg_save"):
+                        if not ob_uid.strip() or len(ob_pin.strip()) < 4:
+                            st.error("Email/ID wajib diisi dan PIN minimal 4 karakter")
+                        else:
+                            ok_or, res_or = register_user(
+                                ob_uid, ob_name, ob_pin,
+                                gender=ob_ans["gender"],
+                                bb=float(ob_ans["weight_kg"]),
+                                tb=float(ob_ans["height_cm"]),
+                                age=int(ob_ans["age_years"]),
+                                target_kcal=float(ob_plan["target_kcal"]),
+                                focus_goal=ob_ans["focus_goal"],
+                                timezone_offset=int(ob_ans["timezone_offset"]),
+                            )
+                            if ok_or:
+                                update_user_preferences(
+                                    res_or["user_id"],
+                                    timezone_offset=int(ob_ans["timezone_offset"]),
+                                    focus_goal=ob_ans["focus_goal"],
+                                    fasting_mode=ob_ans["fasting_mode"],
+                                )
+                                res_or["fasting_mode"] = ob_ans["fasting_mode"]
+                                st.session_state["show_onboarding_wizard"] = False
+                                _activate_authenticated_user(
+                                    res_or,
+                                    auth_provider="local",
+                                    toast_prefix=f"Rencana {int(ob_plan['target_kcal'])} kkal/hari tersimpan di akun Anda",
+                                )
+                                st.rerun()
+                            else:
+                                st.error(res_or)
+                with c_ob4_try:
+                    st.markdown("##### Atau coba dulu di perangkat ini")
+                    st.caption(
+                        "Target kalori, makro, Rambu GGL, dan mode puasa langsung diterapkan ke sesi tamu Anda saat ini. "
+                        "Anda bisa membuat akun kapan saja tanpa kehilangan catatan."
+                    )
+                    if st.button("Terapkan dulu tanpa daftar", width="stretch", key="ob_btn_apply_guest"):
+                        _apply_plan_to_active_user(current_user["user_id"], "guest")
+                        st.toast(f"Rencana {int(ob_plan['target_kcal'])} kkal/hari diterapkan ke sesi Anda")
+                        st.rerun()
+                    if st.button("Kembali ubah jawaban", width="stretch", key="ob_prev_4"):
+                        st.session_state["onboard_step"] = 3
+                        st.rerun()
+            else:
+                c_ob4_p, c_ob4_s = st.columns([1, 2])
+                with c_ob4_p:
+                    if st.button("Kembali ubah jawaban", width="stretch", key="ob_prev_4"):
+                        st.session_state["onboard_step"] = 3
+                        st.rerun()
+                with c_ob4_s:
+                    if st.button("Terapkan rencana ke profil saya", type="primary", width="stretch", key="ob_btn_apply_user"):
+                        _apply_plan_to_active_user(current_user["user_id"], current_user.get("auth_provider", "local"))
+                        st.toast(f"Profil & rencana {int(ob_plan['target_kcal'])} kkal/hari diperbarui")
+                        st.rerun()
 
 # Deteksi Gemini API Key (Global)
 api_key = os.environ.get("GEMINI_API_KEY", "")

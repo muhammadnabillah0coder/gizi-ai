@@ -1,8 +1,10 @@
-# Nutrisi Cerdas (`v4.3.0`): Precision Food & Lab Nutrition Intelligence
+# Nutrisi Cerdas (`v4.5.0`): Precision Food & Lab Nutrition Intelligence
 
-Aplikasi web pelacak kalori, makronutrien, Konsultan **Tanya Gizi AI** kontekstual, dan Rambu GGL Kemenkes RI (Gula, Garam/Natrium, Lemak) berbasis **1.304 data laboratorium TKPI Kemenkes RI**, **45 produk kemasan ritel BPOM ber-barcode EAN-13**, serta **Open Food Facts / USDA**.
+Aplikasi web pelacak kalori, makronutrien, **Kuis Rencana Gizi Personal 4 Langkah**, **Mode Puasa (Ramadan/Sunnah & IF 16:8)**, **Kartu Visual IG Story / WA Status 9:16**, Konsultan **Tanya Gizi AI** kontekstual, dan Rambu GGL Kemenkes RI (Gula, Garam/Natrium, Lemak) berbasis **1.304 data laboratorium TKPI Kemenkes RI**, **45 produk kemasan ritel BPOM ber-barcode EAN-13**, serta **Open Food Facts / USDA**.
 
-Dibangun dengan arsitektur **Bottom-Up Engineering (7-Layer Production Maturity Roadmap)**, auto-login **Browser Cookie + `localStorage` 30 hari per HP**, dual-backend **Supabase PostgreSQL + SQLite**, pertahanan 4-lapis *Food Guardrails*, dan antarmuka **Unslop 60/30/10**.
+Dibangun dengan arsitektur **Bottom-Up Engineering (7-Layer Production Maturity Roadmap)**, **PWA siap pasang di HP**, auto-login **Browser Cookie + `localStorage` 30 hari per HP**, dual-backend **Supabase PostgreSQL + SQLite**, pertahanan 4-lapis *Food Guardrails*, dan antarmuka **Unslop 60/30/10**.
+
+- Panduan deploy publik **Google Cloud Run Jakarta (`asia-southeast2`) + Custom Domain HTTPS + PWA**: [DEPLOY_PUBLIC_GUIDE.md](DEPLOY_PUBLIC_GUIDE.md)
 
 ---
 
