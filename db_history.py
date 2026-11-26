@@ -62,9 +62,11 @@ TABLES_WITH_ID = {
     "custom_foods",
     "pending_foods",
     "food_catalog_additions",
+    "payment_orders",
+    "pro_vouchers",
 }
 
-SCHEMA_VERSION = "v4.4"
+SCHEMA_VERSION = "v4.6"
 GUEST_PREFIX = "guest_"
 VALID_FASTING_MODES = (
     "Normal",
@@ -680,6 +682,38 @@ def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
             sodium_mg {real_t} DEFAULT 0.0,
             barcode TEXT,
             updated_at TEXT
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS payment_orders (
+            id {pk_col},
+            order_id TEXT UNIQUE NOT NULL,
+            user_id TEXT NOT NULL,
+            plan_code TEXT NOT NULL,
+            amount_idr INTEGER NOT NULL,
+            days INTEGER NOT NULL,
+            provider TEXT DEFAULT 'qris',
+            status TEXT DEFAULT 'pending',
+            payment_url TEXT DEFAULT '',
+            external_ref TEXT DEFAULT '',
+            created_at TEXT,
+            paid_at TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_payment_orders_user ON payment_orders(user_id, created_at)",
+        f"""
+        CREATE TABLE IF NOT EXISTS pro_vouchers (
+            id {pk_col},
+            code TEXT UNIQUE NOT NULL,
+            plan_code TEXT DEFAULT 'PRO_30D',
+            days INTEGER NOT NULL,
+            max_uses INTEGER DEFAULT 1,
+            used_count INTEGER DEFAULT 0,
+            redeemed_by TEXT DEFAULT '',
+            created_by TEXT DEFAULT 'admin',
+            note TEXT DEFAULT '',
+            created_at TEXT,
+            redeemed_at TEXT
         )
         """,
     ]
@@ -1451,12 +1485,14 @@ def _compute_scan_status_from_row(user_row, user_id: str, tz_offset: int = None)
     is_beta = False
     if is_admin:
         max_scans = 999999
+        tier = "pro"
+    elif is_pro:
+        max_scans = 999999
+        tier = "pro"
     elif OPEN_BETA_MODE:
         max_scans = GUEST_DAILY_SCAN_LIMIT if is_guest else BETA_DAILY_SCAN_LIMIT
         is_beta = not is_guest
         tier = "demo" if is_guest else "beta"
-    elif is_pro:
-        max_scans = 999999
     else:
         max_scans = GUEST_DAILY_SCAN_LIMIT
 
@@ -1466,7 +1502,7 @@ def _compute_scan_status_from_row(user_row, user_id: str, tz_offset: int = None)
     if last_date != today_str:
         scans_today = 0
 
-    can_scan = True if (is_admin or (is_pro and not OPEN_BETA_MODE)) else (scans_today < max_scans)
+    can_scan = True if (is_admin or is_pro) else (scans_today < max_scans)
 
     return {
         "tier": tier,
@@ -1475,7 +1511,8 @@ def _compute_scan_status_from_row(user_row, user_id: str, tz_offset: int = None)
         "can_scan": can_scan,
         "is_pro": is_pro,
         "is_beta": is_beta,
-        "days_left": days_left
+        "days_left": days_left,
+        "pro_until": str(pro_until_str or ""),
     }
 
 
@@ -1504,13 +1541,264 @@ def record_scan_usage(user_id: str, tz_offset: int = None):
         conn.commit()
 
 
+def _compute_stacked_pro_expiry(cur, clean_uid: str, days: int) -> str:
+    """Menghitung tanggal kedaluwarsa Pro baru secara stacking (menambah sisa hari aktif jika belum habis)."""
+    safe_days = max(1, min(1095, int(days or 30)))
+    now_dt = get_local_now(DEFAULT_TIMEZONE_OFFSET)
+    base_dt = now_dt
+    row = cur.execute("SELECT subscription_tier, pro_until FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_uid,)).fetchone()
+    if row and row["subscription_tier"] == "pro" and row["pro_until"]:
+        try:
+            cur_exp = datetime.strptime(str(row["pro_until"])[:19], "%Y-%m-%d %H:%M:%S")
+            if cur_exp > now_dt:
+                base_dt = cur_exp
+        except Exception:
+            pass
+    return (base_dt + timedelta(days=safe_days)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def activate_pro_tier(user_id: str, days: int = 30):
-    """Mengaktifkan langganan Pro untuk pengguna."""
-    expiry = (get_local_now(DEFAULT_TIMEZONE_OFFSET) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    """Mengaktifkan atau memperpanjang (stacking) langganan Pro untuk pengguna terdaftar."""
+    clean_uid = _normalize_user_id(user_id)
+    if is_guest_user_id(clean_uid):
+        raise ValueError("Sesi tamu harus mendaftar akun terlebih dahulu sebelum mengaktifkan Paket Pro.")
     with _db_session() as (conn, cur):
-        cur.execute("UPDATE users SET subscription_tier = 'pro', pro_until = ? WHERE user_id = ?", (expiry, user_id))
+        expiry = _compute_stacked_pro_expiry(cur, clean_uid, days)
+        cur.execute(
+            "UPDATE users SET subscription_tier = 'pro', pro_until = ? WHERE LOWER(user_id) = ?",
+            (expiry, clean_uid),
+        )
         conn.commit()
     return expiry
+
+
+def create_payment_order(
+    user_id: str,
+    plan_code: str,
+    amount_idr: int,
+    days: int,
+    provider: str = "qris",
+    payment_url: str = "",
+    external_ref: str = "",
+    order_id: str = "",
+) -> dict:
+    """Mencatat pesanan upgrade Paket Pro QRIS di tabel payment_orders."""
+    clean_uid = _normalize_user_id(user_id)
+    if is_guest_user_id(clean_uid):
+        raise ValueError("Masuk atau buat akun terlebih dahulu sebelum membuat pesanan Pro.")
+    safe_plan = str(plan_code or "PRO_30D").strip().upper()[:24]
+    safe_amt = max(0, int(amount_idr or 0))
+    safe_days = max(1, min(1095, int(days or 30)))
+    now_dt = get_local_now(DEFAULT_TIMEZONE_OFFSET)
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    oid = (order_id or f"NC-{safe_plan}-{now_dt.strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}").strip()[:48]
+    with _db_session() as (conn, cur):
+        cur.execute(
+            """
+            INSERT INTO payment_orders
+            (order_id, user_id, plan_code, amount_idr, days, provider, status, payment_url, external_ref, created_at, paid_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL)
+            """,
+            (oid, clean_uid, safe_plan, safe_amt, safe_days, str(provider or "qris")[:30], str(payment_url or "")[:500], str(external_ref or "")[:120], now_str),
+        )
+        conn.commit()
+        row = cur.execute("SELECT * FROM payment_orders WHERE order_id = ?", (oid,)).fetchone()
+    return dict(row)
+
+
+def get_payment_order(order_id: str) -> dict | None:
+    oid = str(order_id or "").strip()
+    if not oid:
+        return None
+    with _db_session() as (conn, cur):
+        row = cur.execute("SELECT * FROM payment_orders WHERE order_id = ?", (oid,)).fetchone()
+    return dict(row) if row else None
+
+
+def mark_payment_order_paid(
+    order_id: str,
+    external_ref: str = "",
+    expected_amount: int | None = None,
+) -> tuple[bool, dict | str]:
+    """Menandai pesanan lunas secara idempoten + mengaktifkan/memperpanjang Paket Pro dalam 1 transaksi atomik."""
+    oid = str(order_id or "").strip()
+    if not oid:
+        return False, "Nomor order tidak boleh kosong."
+    now_str = get_local_now(DEFAULT_TIMEZONE_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
+    with _db_session() as (conn, cur):
+        row = cur.execute("SELECT * FROM payment_orders WHERE order_id = ?", (oid,)).fetchone()
+        if not row:
+            return False, f"Pesanan {oid} tidak ditemukan."
+        order = dict(row)
+        if expected_amount is not None and int(order["amount_idr"]) > 0 and int(expected_amount) < int(order["amount_idr"]):
+            return False, f"Nominal pembayaran tidak sesuai (diterima Rp{int(expected_amount):,}, tagihan Rp{int(order['amount_idr']):,})."
+        if order["status"] == "paid":
+            # Idempoten: webhook berulang tidak menggandakan masa aktif
+            return True, order
+
+        clean_uid = _normalize_user_id(order["user_id"])
+        expiry = _compute_stacked_pro_expiry(cur, clean_uid, int(order["days"]))
+        cur.execute(
+            "UPDATE users SET subscription_tier = 'pro', pro_until = ? WHERE LOWER(user_id) = ?",
+            (expiry, clean_uid),
+        )
+        ref_val = str(external_ref or order.get("external_ref") or "").strip()[:120]
+        cur.execute(
+            "UPDATE payment_orders SET status = 'paid', external_ref = ?, paid_at = ? WHERE order_id = ?",
+            (ref_val, now_str, oid),
+        )
+        conn.commit()
+        upd = cur.execute("SELECT * FROM payment_orders WHERE order_id = ?", (oid,)).fetchone()
+    res = dict(upd)
+    res["pro_until"] = expiry
+    return True, res
+
+
+def list_user_payment_orders(user_id: str, limit: int = 10) -> list[dict]:
+    clean_uid = _normalize_user_id(user_id)
+    with _db_session() as (conn, cur):
+        rows = cur.execute(
+            "SELECT * FROM payment_orders WHERE LOWER(user_id) = ? ORDER BY id DESC LIMIT ?",
+            (clean_uid, max(1, min(50, int(limit or 10)))),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_recent_payment_orders(limit: int = 30) -> list[dict]:
+    with _db_session() as (conn, cur):
+        rows = cur.execute(
+            "SELECT * FROM payment_orders ORDER BY id DESC LIMIT ?",
+            (max(1, min(100, int(limit or 30))),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_pro_voucher(
+    days: int = 30,
+    plan_code: str = "PRO_30D",
+    max_uses: int = 1,
+    created_by: str = "admin",
+    note: str = "",
+    custom_code: str = "",
+) -> dict:
+    """Membuat kode voucher aktivasi Pro yang aman (bebas karakter ambigu 0/O/1/I)."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    clean_custom = "".join(ch for ch in str(custom_code or "").upper().strip() if ch.isalnum() or ch == "-")[:32]
+    if clean_custom:
+        code = clean_custom
+    else:
+        part1 = "".join(secrets.choice(alphabet) for _ in range(4))
+        part2 = "".join(secrets.choice(alphabet) for _ in range(4))
+        code = f"NCPRO-{part1}-{part2}"
+    safe_days = max(1, min(1095, int(days or 30)))
+    safe_max = max(1, min(500, int(max_uses or 1)))
+    now_str = get_local_now(DEFAULT_TIMEZONE_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
+    with _db_session() as (conn, cur):
+        cur.execute(
+            """
+            INSERT INTO pro_vouchers
+            (code, plan_code, days, max_uses, used_count, redeemed_by, created_by, note, created_at, redeemed_at)
+            VALUES (?, ?, ?, ?, 0, '', ?, ?, ?, NULL)
+            """,
+            (code, str(plan_code or "PRO_30D")[:24], safe_days, safe_max, str(created_by or "admin")[:60], str(note or "")[:120], now_str),
+        )
+        conn.commit()
+        row = cur.execute("SELECT * FROM pro_vouchers WHERE code = ?", (code,)).fetchone()
+    return dict(row)
+
+
+def redeem_pro_voucher(user_id: str, raw_code: str) -> tuple[bool, dict | str]:
+    """Menukarkan kode aktivasi/voucher Pro secara atomik dengan proteksi anti-ganda."""
+    clean_uid = _normalize_user_id(user_id)
+    if is_guest_user_id(clean_uid):
+        return False, "Buat akun gratis atau masuk terlebih dahulu agar masa aktif Pro tersimpan di akun Anda."
+    code = str(raw_code or "").strip().upper()
+    if len(code) < 5:
+        return False, "Masukkan kode aktivasi Pro yang valid."
+    now_dt = get_local_now(DEFAULT_TIMEZONE_OFFSET)
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    with _db_session() as (conn, cur):
+        row = cur.execute("SELECT * FROM pro_vouchers WHERE UPPER(code) = ?", (code,)).fetchone()
+        if not row:
+            return False, "Kode aktivasi tidak ditemukan. Periksa kembali huruf dan tanda hubungnya."
+        v = dict(row)
+        used = int(v.get("used_count") or 0)
+        max_u = int(v.get("max_uses") or 1)
+        prev_users = [u.strip().lower() for u in str(v.get("redeemed_by") or "").split(",") if u.strip()]
+        if clean_uid in prev_users:
+            return False, "Kode aktivasi ini sudah pernah Anda gunakan."
+        if used >= max_u:
+            return False, "Kuota pemakaian kode aktivasi ini sudah habis."
+
+        days = int(v["days"])
+        expiry = _compute_stacked_pro_expiry(cur, clean_uid, days)
+        cur.execute(
+            "UPDATE users SET subscription_tier = 'pro', pro_until = ? WHERE LOWER(user_id) = ?",
+            (expiry, clean_uid),
+        )
+        prev_users.append(clean_uid)
+        cur.execute(
+            "UPDATE pro_vouchers SET used_count = ?, redeemed_by = ?, redeemed_at = ? WHERE id = ?",
+            (used + 1, ",".join(prev_users)[:500], now_str, v["id"]),
+        )
+        audit_oid = f"NC-VCH-{now_dt.strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
+        cur.execute(
+            """
+            INSERT INTO payment_orders
+            (order_id, user_id, plan_code, amount_idr, days, provider, status, payment_url, external_ref, created_at, paid_at)
+            VALUES (?, ?, ?, 0, ?, 'voucher', 'paid', '', ?, ?, ?)
+            """,
+            (audit_oid, clean_uid, v.get("plan_code") or "PRO_30D", days, code, now_str, now_str),
+        )
+        conn.commit()
+    return True, {"code": code, "days": days, "pro_until": expiry, "order_id": audit_oid}
+
+
+def list_pro_vouchers(limit: int = 25) -> list[dict]:
+    with _db_session() as (conn, cur):
+        rows = cur.execute(
+            "SELECT * FROM pro_vouchers ORDER BY id DESC LIMIT ?",
+            (max(1, min(100, int(limit or 25))),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_growth_metrics_summary() -> dict:
+    """Menghitung metrik pertumbuhan nyata untuk panel Admin (progres target 100 pengguna aktif & pendapatan Pro)."""
+    now_dt = get_local_now(DEFAULT_TIMEZONE_OFFSET)
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_7d = (now_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+    with _db_session() as (conn, cur):
+        user_rows = cur.execute("SELECT user_id, subscription_tier, pro_until FROM users").fetchall()
+        reg_uids = [str(r["user_id"]) for r in user_rows if not is_guest_user_id(r["user_id"]) and not is_admin_user(r["user_id"])]
+        active_pro = 0
+        for r in user_rows:
+            uid = str(r["user_id"])
+            if is_guest_user_id(uid) or is_admin_user(uid):
+                continue
+            if r["subscription_tier"] == "pro" and r["pro_until"] and str(r["pro_until"])[:19] > now_str:
+                active_pro += 1
+
+        meal_rows = cur.execute(
+            "SELECT DISTINCT user_id FROM meal_logs WHERE logged_at >= ?",
+            (cutoff_7d,),
+        ).fetchall()
+        active_7d = sum(1 for mr in meal_rows if not is_guest_user_id(mr["user_id"]) and not is_admin_user(mr["user_id"]))
+
+        ord_rows = cur.execute("SELECT status, amount_idr FROM payment_orders").fetchall()
+        paid_cnt = sum(1 for o in ord_rows if o["status"] == "paid")
+        paid_rev = sum(int(o["amount_idr"] or 0) for o in ord_rows if o["status"] == "paid")
+        pending_cnt = sum(1 for o in ord_rows if o["status"] == "pending")
+
+    return {
+        "total_registered_users": len(reg_uids),
+        "target_users": 100,
+        "active_7d_users": active_7d,
+        "active_pro_users": active_pro,
+        "paid_orders_count": paid_cnt,
+        "paid_revenue_idr": paid_rev,
+        "pending_orders_count": pending_cnt,
+    }
 
 
 def _validate_meal_nutrients(

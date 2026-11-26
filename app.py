@@ -23,6 +23,7 @@ import nutrition_engine
 import db_history
 import session_cookie
 import share_card
+import payment_gateway
 
 
 def _sync_module_from_disk(mod):
@@ -52,6 +53,7 @@ nutrition_engine = _sync_module_from_disk(nutrition_engine)
 db_history = _sync_module_from_disk(db_history)
 session_cookie = _sync_module_from_disk(session_cookie)
 share_card = _sync_module_from_disk(share_card)
+payment_gateway = _sync_module_from_disk(payment_gateway)
 
 from food_guardrails import (
     FoodGuardrailRejected,
@@ -93,20 +95,34 @@ from db_history import (
     update_user_preferences, log_weight_entry, get_weight_history, get_logging_streak,
     get_storage_backend_info, get_dashboard_bundle,
     is_guest_user_id, create_guest_session_id, migrate_guest_data_to_user,
-    update_user_body_profile, change_user_password, VALID_FASTING_MODES
+    update_user_body_profile, change_user_password, VALID_FASTING_MODES,
+    activate_pro_tier, mark_payment_order_paid, list_user_payment_orders,
+    list_recent_payment_orders, create_pro_voucher, redeem_pro_voucher,
+    list_pro_vouchers, get_growth_metrics_summary,
 )
 from share_card import generate_daily_share_card_png
+from payment_gateway import (
+    PRO_PLANS, get_payment_gateway_status, create_qris_checkout, build_manual_wa_confirm_url,
+)
 from google_auth import (
     get_google_auth_url, exchange_code_for_user, verify_oauth_state,
     get_credentials as get_google_oauth_credentials
 )
 
-APP_VERSION = "v4.5.0"
+APP_VERSION = "v4.6.0"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v4.5.0 (Terbaru)",
+        "version": "v4.6.0 (Terbaru)",
+        "date": "26 Nov 2026",
+        "highlights": [
+            "Paket Pro & Pembayaran QRIS (Mayar.id API, Midtrans Snap SHA-512, dan Kode Voucher Aktivasi Pro): membuka Scan Foto AI & Tanya Gizi AI tanpa batas harian dengan aturan perpanjangan stacking yang adil.",
+            "Panel Growth & Billing Admin: memantau progres target 100 pengguna aktif, menerbitkan kode voucher Pro 1-klik, dan mengonfirmasi pesanan QRIS langsung dari sidebar."
+        ]
+    },
+    {
+        "version": "v4.5.0",
         "date": "26 Nov 2026",
         "highlights": [
             "Kuis Onboarding Personal 4 Langkah (Personal Plan Builder): menyusun target kalori, IMT Kemenkes RI, makro harian, batas GGL (gula/natrium), target air adaptif, estimasi minggu menuju target berat badan, dan mode puasa secara deterministik sebelum pengguna mulai mencatat.",
@@ -487,7 +503,7 @@ def _render_scan_quota_exhausted_notice(active_user: dict, sc_status: dict):
         st.info("Buat akun gratis dalam 10 detik untuk membuka 5 scan foto per hari, atau gunakan tab Ketik & Menu Cepat tanpa batas.")
     else:
         st.warning(f"Kuota scan foto hari ini tercapai ({max_sc}/{max_sc})")
-        st.info("Anda tetap dapat mencatat tanpa batas lewat tab Ketik & Menu Cepat, Menu Cepat Beranda, atau Barcode & Manual.")
+        st.info("Anda tetap dapat mencatat tanpa batas lewat tab Ketik & Menu Cepat, Menu Cepat Beranda, atau Barcode & Manual. Untuk scan foto AI tanpa batas harian, buka menu Paket Pro di kanan atas.")
 
 
 def _safe_open_uploaded_image(uploaded_file):
@@ -620,6 +636,7 @@ def _reset_ephemeral_user_state():
     st.session_state.pop("show_onboarding_wizard", None)
     st.session_state.pop("onboard_step", None)
     st.session_state.pop("onboard_answers", None)
+    st.session_state.pop("last_qris_order", None)
     st.session_state["_sync_sb_prefs"] = True
 
 
@@ -2019,6 +2036,80 @@ with st.sidebar:
                     "3. Tempel DATABASE_URL di Streamlit Cloud Secrets."
                 )
 
+        with st.expander("Target 100 user & billing Pro (Admin)", expanded=False):
+            gm = get_growth_metrics_summary()
+            gw_st = get_payment_gateway_status()
+            pct_100 = min(1.0, gm["total_registered_users"] / max(1, gm["target_users"]))
+            st.markdown(
+                f'<div style="font-size:0.84rem; font-weight:500; color:var(--text-primary); margin-bottom:4px;">'
+                f'Progres target awal: <span class="nc-mono">{gm["total_registered_users"]} / {gm["target_users"]}</span> akun terdaftar</div>',
+                unsafe_allow_html=True,
+            )
+            st.progress(pct_100)
+            st.caption(
+                f"Aktif 7 hari: {gm['active_7d_users']} · Pro aktif: {gm['active_pro_users']} · "
+                f"Order lunas: {gm['paid_orders_count']} (Rp{gm['paid_revenue_idr']:,}) · Pending: {gm['pending_orders_count']}"
+            )
+            st.caption(f"Gateway QRIS aktif: {gw_st['label']}")
+
+            st.markdown("---")
+            st.markdown("**Buat kode voucher Pro (1 klik)**")
+            v_plan_code = st.selectbox(
+                "Durasi voucher",
+                ["PRO_7D", "PRO_30D", "PRO_365D"],
+                index=1,
+                format_func=lambda k: f"{PRO_PLANS[k]['name']} ({PRO_PLANS[k]['days']} hari)",
+                key="adm_v_plan",
+            )
+            c_av1, c_av2 = st.columns(2)
+            with c_av1:
+                v_max_uses = st.number_input("Maks. pakai", min_value=1, max_value=100, value=1, step=1, key="adm_v_uses")
+            with c_av2:
+                v_note = st.text_input("Catatan", placeholder="Pembeli QRIS / Tester", key="adm_v_note")
+            if st.button("Terbitkan kode voucher", type="primary", width="stretch", key="adm_btn_gen_voucher"):
+                new_v = create_pro_voucher(
+                    days=PRO_PLANS[v_plan_code]["days"],
+                    plan_code=v_plan_code,
+                    max_uses=int(v_max_uses),
+                    created_by=current_user["user_id"],
+                    note=v_note,
+                )
+                st.session_state["adm_last_voucher"] = new_v["code"]
+                _mark_db_mutated()
+                st.success(f"Voucher {new_v['code']} ({new_v['days']} hari) siap dikirim")
+            if st.session_state.get("adm_last_voucher"):
+                st.code(st.session_state["adm_last_voucher"], language=None)
+
+            pending_orders = [o for o in list_recent_payment_orders(limit=15) if o.get("status") == "pending"]
+            if pending_orders:
+                st.markdown("---")
+                st.markdown(f"**Konfirmasi order QRIS pending ({len(pending_orders)})**")
+                for po in pending_orders[:5]:
+                    st.caption(f"`{po['order_id']}` · {po['user_id']} · Rp{int(po['amount_idr']):,} ({po['days']}h)")
+                    if st.button(f"Tandai lunas {po['order_id'][-6:]}", width="stretch", key=f"adm_mark_paid_{po['order_id']}"):
+                        ok_mp, res_mp = mark_payment_order_paid(po["order_id"], external_ref="manual_admin_confirm")
+                        if ok_mp:
+                            _mark_db_mutated()
+                            st.success(f"Pro aktif untuk {po['user_id']}")
+                            st.rerun()
+                        else:
+                            st.error(res_mp)
+
+            st.markdown("---")
+            st.markdown("**Aktivasi Pro langsung ke akun**")
+            g_uid = st.text_input("Email / ID pengguna", placeholder="user@email.com", key="adm_grant_uid")
+            g_days = st.number_input("Tambah hari Pro", min_value=1, max_value=365, value=30, step=1, key="adm_grant_days")
+            if st.button("Aktifkan Pro akun ini", width="stretch", key="adm_btn_grant_pro"):
+                if not g_uid.strip():
+                    st.warning("Isi email atau ID pengguna terlebih dahulu")
+                else:
+                    try:
+                        exp_str = activate_pro_tier(g_uid.strip(), days=int(g_days))
+                        _mark_db_mutated()
+                        st.success(f"Paket Pro aktif hingga {exp_str[:10]}")
+                    except Exception as exc_grant:
+                        st.error(str(exc_grant))
+
         with st.expander(f"Catatan rilis ({APP_VERSION})", expanded=False):
             st.caption(f"Dikembangkan oleh Muhammad Nabillah ({APP_CREATOR})")
             for p in PATCH_NOTES:
@@ -2054,8 +2145,11 @@ with col_head1:
     )
 
 with col_head2:
+    is_pro_active = bool(scan_status.get("is_pro") and not is_admin)
     if is_admin:
         tier_meta = "Admin · Tanpa batas"
+    elif is_pro_active:
+        tier_meta = f"Pro · Sisa {scan_status['days_left']} hari · Tanpa batas"
     elif is_guest:
         tier_meta = f"Tamu · {scan_status['scans_today']}/{scan_status['max_scans']} scan foto"
     else:
@@ -2164,31 +2258,117 @@ with col_head2:
                             st.error(res)
 
     with c_acc2:
-        with st.popover("Paket Gratis", width="stretch"):
-            st.markdown("##### Gratis permanen untuk harian")
-            st.caption("Tanpa biaya langganan wajib, berbasis 1.304 data lab TKPI Kemenkes RI")
+        pro_pop_lbl = "Admin" if is_admin else ("Pro Aktif" if is_pro_active else "Paket Pro")
+        with st.popover(pro_pop_lbl, width="stretch"):
+            st.markdown("##### Gratis permanen & opsi Paket Pro")
+            st.caption("Berbasis 1.304 data lab TKPI Kemenkes RI, tanpa paywall wajib untuk harian")
 
             if is_admin:
                 st.success("Status: Admin (tanpa batas)")
+            elif is_pro_active:
+                exp_date_lbl = str(scan_status.get("pro_until") or "")[:10]
+                st.success(f"Paket Pro Aktif · Sisa {scan_status['days_left']} hari (s.d. {exp_date_lbl})")
+                st.markdown(
+                    "Fasilitas Pro aktif di akun Anda:\n"
+                    "- Scan foto makanan & barcode AI tanpa batas harian\n"
+                    "- Konsultasi Tanya Gizi AI kontekstual tanpa batas\n"
+                    "- Perpanjangan sebelum habis otomatis menambah sisa hari"
+                )
             elif is_guest:
                 st.info(f"Akses tanpa akun: {scan_status['scans_today']}/{scan_status['max_scans']} scan foto hari ini")
                 st.markdown(
-                    "Masuk atau daftar akun gratis (10 detik, otomatis tersimpan di HP ini) untuk:\n"
-                    "- Login otomatis 30 hari di perangkat Anda\n"
+                    "Daftar akun gratis (10 detik, tersimpan 30 hari di HP) untuk:\n"
                     "- 5 scan foto makanan + 10 konsultasi Tanya Gizi AI per hari\n"
-                    "- 5 fokus klinis (Diet, Ibu Hamil, Diabetes, Hipertensi)\n"
+                    "- 5 fokus klinis, Mode Puasa 2-4-2, dan Kartu Share IG Story 9:16\n"
                     "- Catat teks, 45 barcode ritel, dan 1.304 database TKPI tanpa batas"
                 )
             else:
                 sisa_scan = max(0, scan_status["max_scans"] - scan_status["scans_today"])
-                st.success(f"Sisa scan foto hari ini: {sisa_scan}/{scan_status['max_scans']}")
+                st.info(f"Akun Gratis Permanen · Sisa {sisa_scan}/{scan_status['max_scans']} scan foto hari ini")
                 st.markdown(
-                    "Fasilitas akun Anda (Gratis Permanen):\n"
-                    "- Login tersimpan otomatis di perangkat ini selama 30 hari\n"
-                    "- 5 scan foto makanan & 10 sesi Tanya Gizi AI per hari\n"
-                    "- Catat teks, menu cepat, barcode, dan 1.304 data TKPI tanpa batas\n"
-                    "- Grafik berat badan, Rambu GGL, streak harian, dan fokus klinis"
+                    "Upgrade opsional ke **Paket Pro (QRIS)** bila butuh:\n"
+                    "- Scan foto makanan AI tanpa batas tiap hari\n"
+                    "- Tanya Gizi AI kontekstual tanpa batas harian\n"
+                    "- Mulai Rp9.000 (7 hari), Rp19.000/bulan, atau Rp149.000/tahun"
                 )
+
+            if not is_admin:
+                st.markdown("---")
+                if is_guest:
+                    st.caption("Masuk atau buat akun gratis terlebih dahulu untuk memesan Paket Pro atau menukar kode aktivasi.")
+                else:
+                    gw_info = get_payment_gateway_status()
+                    plan_keys = ["PRO_7D", "PRO_30D", "PRO_365D"]
+                    sel_plan = st.selectbox(
+                        "Pilih paket Pro (QRIS / E-Wallet)",
+                        plan_keys,
+                        index=1,
+                        format_func=lambda k: f"{PRO_PLANS[k]['name']} · {PRO_PLANS[k]['price_label']} ({PRO_PLANS[k]['badge']})",
+                        key="pro_plan_select",
+                    )
+                    st.caption(PRO_PLANS[sel_plan]["desc"])
+                    btn_order_lbl = "Perpanjang Pro via QRIS" if is_pro_active else "Lanjut upgrade via QRIS"
+                    if st.button(btn_order_lbl, type="primary", width="stretch", key="btn_create_qris_order"):
+                        ok_ord, res_ord = create_qris_checkout(
+                            current_user["user_id"],
+                            current_user["display_name"],
+                            sel_plan,
+                        )
+                        if ok_ord:
+                            st.session_state["last_qris_order"] = res_ord
+                            _mark_db_mutated()
+                        else:
+                            st.error(res_ord)
+
+                    last_ord = st.session_state.get("last_qris_order")
+                    if isinstance(last_ord, dict) and last_ord.get("user_id") == current_user["user_id"]:
+                        st.markdown(
+                            f'<div style="background:var(--surface-raised); border:1px solid var(--border-col); border-radius:8px; padding:10px 12px; margin:8px 0; font-size:0.82rem;">'
+                            f'Pesanan: <span class="nc-mono" style="font-weight:500;">{sanitize_html_text(last_ord["order_id"])}</span><br>'
+                            f'Nominal: <span class="nc-mono" style="font-weight:500;">Rp{int(last_ord["amount_idr"]):,}</span> ({int(last_ord["days"])} hari)</div>',
+                            unsafe_allow_html=True,
+                        )
+                        if last_ord.get("payment_url"):
+                            st.markdown(
+                                f'<a href="{last_ord["payment_url"]}" target="_blank" style="text-decoration:none; display:block; margin-bottom:8px;">'
+                                f'<div style="background:var(--accent); color:var(--accent-fg); padding:9px 12px; border-radius:8px; text-align:center; font-weight:500; font-size:0.86rem;">'
+                                f'Bayar sekarang lewat {sanitize_html_text(gw_info["label"])}</div></a>',
+                                unsafe_allow_html=True,
+                            )
+                        elif last_ord.get("wa_confirm_url"):
+                            st.markdown(
+                                f'<a href="{last_ord["wa_confirm_url"]}" target="_blank" style="text-decoration:none; display:block; margin-bottom:8px;">'
+                                f'<div style="background:var(--accent); color:var(--accent-fg); padding:9px 12px; border-radius:8px; text-align:center; font-weight:500; font-size:0.86rem;">'
+                                f'Konfirmasi QRIS ke WhatsApp Admin</div></a>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.caption("Nomor pesanan tercatat. Hubungi admin untuk menerima kode QRIS atau kode aktivasi Pro di bawah.")
+
+                    st.markdown("---")
+                    st.caption("Punya kode aktivasi / voucher Pro?")
+                    v_code_in = st.text_input("Kode aktivasi", placeholder="NCPRO-XXXX-XXXX", key="pro_voucher_in", label_visibility="collapsed")
+                    if st.button("Aktifkan kode Pro", width="stretch", key="btn_redeem_voucher"):
+                        ok_v, res_v = redeem_pro_voucher(current_user["user_id"], v_code_in)
+                        if ok_v:
+                            st.session_state["user"] = get_or_create_user(
+                                current_user["user_id"],
+                                auth_provider=current_user.get("auth_provider", "local"),
+                            )
+                            st.session_state.pop("last_qris_order", None)
+                            _mark_db_mutated()
+                            st.toast(f"Paket Pro aktif {res_v['days']} hari hingga {res_v['pro_until'][:10]}")
+                            st.rerun()
+                        else:
+                            st.error(res_v)
+
+                    u_orders = list_user_payment_orders(current_user["user_id"], limit=3)
+                    if u_orders:
+                        with st.expander("Riwayat pesanan Pro terbaru", expanded=False):
+                            for uo in u_orders:
+                                st.caption(
+                                    f"`{uo['order_id']}` · {uo['plan_code']} · Rp{int(uo['amount_idr']):,} · **{uo['status']}**"
+                                )
 
 # Kartu Sambutan Singkat bagi Pengunjung yang Belum Login (Sekali Daftar -> Otomatis Tersimpan di HP 30 Hari)
 if is_guest:
@@ -3587,7 +3767,8 @@ with tab_coach:
         unsafe_allow_html=True,
     )
 
-    coach_limit = 999 if is_admin else (3 if is_guest else 10)
+    is_coach_unlimited = bool(is_admin or scan_status.get("is_pro"))
+    coach_limit = 999 if is_coach_unlimited else (3 if is_guest else 10)
     coach_today_key = local_now.strftime("%Y-%m-%d")
     coach_quota = st.session_state.get("coach_quota_tracker") or {}
     if coach_quota.get("date") != coach_today_key or coach_quota.get("uid") != current_user["user_id"]:
@@ -3632,7 +3813,7 @@ with tab_coach:
             if is_guest:
                 st.warning("Batas 3 pertanyaan tanpa akun tercapai. Masuk atau daftar akun gratis untuk membuka 10 pertanyaan per hari.")
             else:
-                st.warning("Batas 10 pertanyaan Tanya Gizi AI hari ini sudah tercapai. Coba lagi besok.")
+                st.warning("Batas 10 pertanyaan Tanya Gizi AI hari ini sudah tercapai. Coba lagi besok atau aktifkan Paket Pro di kanan atas untuk konsultasi tanpa batas.")
         else:
             daily_ctx = {
                 "focus_goal": user_focus,
@@ -3678,7 +3859,7 @@ with tab_coach:
     if st.session_state["coach_messages"]:
         c_ch1, c_ch2 = st.columns([3.0, 1.0], vertical_alignment="center")
         with c_ch1:
-            quota_lbl = "Tanpa batas" if is_admin else f"Sisa {coach_remaining}/{coach_limit} pertanyaan hari ini"
+            quota_lbl = "Tanpa batas" if is_coach_unlimited else f"Sisa {coach_remaining}/{coach_limit} pertanyaan hari ini"
             st.caption(f"Riwayat percakapan · {quota_lbl}")
         with c_ch2:
             if st.button("Bersihkan chat", width="stretch", key="btn_clear_coach"):

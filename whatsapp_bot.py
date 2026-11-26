@@ -27,6 +27,7 @@ from db_history import (
     get_user_scan_status, record_scan_usage, get_local_now,
     create_session_token, is_admin_user
 )
+from payment_gateway import process_midtrans_notification, process_mayar_webhook
 
 app = FastAPI(title="Nutrisi Cerdas WhatsApp Bot API")
 
@@ -252,6 +253,38 @@ async def whatsapp_webhook(request: Request):
             return {"reply": f"Maaf, tidak dapat menganalisis teks tersebut: {str(e)}"}
             
     return {"reply": "Kirimkan teks nama makanan atau foto piringmu untuk saya hitung profil nutrisinya secara akurat!"}
+
+
+@app.post("/webhook/midtrans")
+async def midtrans_qris_webhook(request: Request):
+    """Webhook resmi Midtrans Snap/QRIS dengan verifikasi tanda tangan SHA-512 & aktivasi Pro idempoten."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Payload JSON tidak valid."})
+    ok, status_code, message = process_midtrans_notification(payload)
+    return JSONResponse(status_code=status_code, content={"ok": ok, "message": message})
+
+
+@app.post("/webhook/mayar")
+async def mayar_qris_webhook(request: Request):
+    """Webhook resmi Mayar.id QRIS dengan validasi token fail-closed & aktivasi Pro idempoten."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Payload JSON tidak valid."})
+    auth_hdr = (request.headers.get("authorization") or "").strip()
+    bearer = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
+    supplied = (
+        request.headers.get("x-callback-token")
+        or request.headers.get("x-mayar-token")
+        or bearer
+        or request.query_params.get("token")
+        or ""
+    ).strip()
+    ok, status_code, message = process_mayar_webhook(payload, supplied_token=supplied)
+    return JSONResponse(status_code=status_code, content={"ok": ok, "message": message})
+
 
 if __name__ == "__main__":
     import uvicorn

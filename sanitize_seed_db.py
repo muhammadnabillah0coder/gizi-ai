@@ -18,6 +18,8 @@ USER_DATA_TABLES = (
     "weight_logs",
     "custom_foods",
     "pending_foods",
+    "payment_orders",
+    "pro_vouchers",
     "app_meta",
 )
 
