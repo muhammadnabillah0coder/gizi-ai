@@ -406,6 +406,7 @@ def ask_nutrition_coach(
     context_block = (
         f"Data harian pengguna saat ini:\n"
         f"- Fokus kesehatan: {ctx.get('focus_goal', 'Diet Sehat')}\n"
+        f"- Pola makan / puasa: {ctx.get('fasting_mode', 'Normal')}\n"
         f"- Kalori masuk: {ctx.get('today_kcal', 0):.0f} / {ctx.get('target_kcal', 2000):.0f} kkal "
         f"(sisa {ctx.get('remaining_kcal', 0):.0f} kkal)\n"
         f"- Protein: {ctx.get('protein_g', 0):.1f} / {ctx.get('target_protein_g', 100):.0f} g\n"

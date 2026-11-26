@@ -26,7 +26,7 @@ jobs:
 
       - name: Syntax check (py_compile)
         run: |
-          python -m py_compile app.py db_history.py nutrition_engine.py gemini_extractor.py food_guardrails.py google_auth.py alert_manager.py whatsapp_bot.py session_cookie.py sanitize_seed_db.py inject_retail_foods.py map_barcodes.py
+          python -m py_compile app.py db_history.py nutrition_engine.py gemini_extractor.py food_guardrails.py google_auth.py alert_manager.py whatsapp_bot.py session_cookie.py share_card.py sanitize_seed_db.py inject_retail_foods.py map_barcodes.py
 
       - name: Audit seed tkpi_nutrition.db hygiene (zero user data or secrets)
         run: |

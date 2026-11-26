@@ -22,6 +22,7 @@ import google_auth
 import nutrition_engine
 import db_history
 import session_cookie
+import share_card
 
 
 def _sync_module_from_disk(mod):
@@ -50,6 +51,7 @@ google_auth = _sync_module_from_disk(google_auth)
 nutrition_engine = _sync_module_from_disk(nutrition_engine)
 db_history = _sync_module_from_disk(db_history)
 session_cookie = _sync_module_from_disk(session_cookie)
+share_card = _sync_module_from_disk(share_card)
 
 from food_guardrails import (
     FoodGuardrailRejected,
@@ -91,19 +93,28 @@ from db_history import (
     update_user_preferences, log_weight_entry, get_weight_history, get_logging_streak,
     get_storage_backend_info, get_dashboard_bundle,
     is_guest_user_id, create_guest_session_id, migrate_guest_data_to_user,
-    update_user_body_profile, change_user_password
+    update_user_body_profile, change_user_password, VALID_FASTING_MODES
 )
+from share_card import generate_daily_share_card_png
 from google_auth import (
     get_google_auth_url, exchange_code_for_user, verify_oauth_state,
     get_credentials as get_google_oauth_credentials
 )
 
-APP_VERSION = "v4.3.0"
+APP_VERSION = "v4.4.0"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v4.3.0 (Terbaru)",
+        "version": "v4.4.0 (Terbaru)",
+        "date": "26 Nov 2026",
+        "highlights": [
+            "Kartu Visual Share IG Story & Status WA (PNG 1080x1920 / 9:16) sekali klik dengan pilihan tema Terang (Lab Paper) dan Gelap (Graphite) langsung dari ringkasan harian.",
+            "Mode Puasa (Puasa Sunnah / Ramadan & Intermittent Fasting 16:8): otomatis menyesuaikan sesi makan menjadi Sahur, Takjil & Buka, Makan Utama, serta panduan pola minum air 2-4-2."
+        ]
+    },
+    {
+        "version": "v4.3.0",
         "date": "26 Nov 2026",
         "highlights": [
             "Auto-login 30 hari tersimpan otomatis di tiap HP via Browser Cookie + cadangan localStorage native (tanpa simpan PIN polos, sekali login langsung masuk akun pribadi saat membuka web lagi).",
@@ -777,6 +788,9 @@ is_google = current_user.get("auth_provider") == "google"
 is_admin = is_admin_user(current_user["user_id"])
 user_tz = int(current_user.get("timezone_offset") if current_user.get("timezone_offset") is not None else 8)
 user_focus = current_user.get("focus_goal") or "Diet Sehat"
+user_fasting = current_user.get("fasting_mode") or "Normal"
+if user_fasting not in VALID_FASTING_MODES:
+    user_fasting = "Normal"
 local_now = get_local_now(user_tz)
 if "selected_diary_date" not in st.session_state:
     st.session_state["selected_diary_date"] = local_now.date()
@@ -1310,9 +1324,45 @@ MEAL_SESSION_MAP = {
     "Camilan": "Camilan",
 }
 
+FASTING_SESSION_MAPS = {
+    "Normal": MEAL_SESSION_MAP,
+    "Puasa Sunnah / Ramadan": {
+        "Sahur": "Sahur",
+        "Takjil & Buka": "Takjil & Buka",
+        "Makan Utama": "Makan Utama",
+        "Camilan Malam": "Camilan Malam",
+    },
+    "Intermittent Fasting 16:8": {
+        "Buka Jendela": "Buka Jendela",
+        "Makan Utama": "Makan Utama",
+        "Tutup Jendela": "Tutup Jendela",
+        "Minuman 0 kkal": "Minuman 0 kkal",
+    },
+}
 
-def _infer_meal_type(tz_offset: int) -> str:
+
+def _get_meal_sessions(fasting_mode: str = "Normal") -> dict:
+    return FASTING_SESSION_MAPS.get(fasting_mode or "Normal", MEAL_SESSION_MAP)
+
+
+def _infer_meal_type(tz_offset: int, fasting_mode: str = "Normal") -> str:
     h = get_local_now(tz_offset).hour
+    if fasting_mode == "Puasa Sunnah / Ramadan":
+        if 2 <= h < 6:
+            return "Sahur"
+        if 17 <= h < 19:
+            return "Takjil & Buka"
+        if 19 <= h < 22:
+            return "Makan Utama"
+        return "Camilan Malam"
+    if fasting_mode == "Intermittent Fasting 16:8":
+        if 11 <= h < 14:
+            return "Buka Jendela"
+        if 14 <= h < 18:
+            return "Makan Utama"
+        if 18 <= h < 21:
+            return "Tutup Jendela"
+        return "Minuman 0 kkal"
     if 4 <= h < 11:
         return "Sarapan"
     if 11 <= h < 16:
@@ -1333,7 +1383,12 @@ def _closest_portion_opt(val: float) -> float:
 def _normalize_meal_key(raw_mtype: str) -> str:
     if not raw_mtype:
         return "Lainnya"
-    for k in ["Sarapan", "Makan Siang", "Makan Malam", "Camilan"]:
+    known = [
+        "Sahur", "Takjil & Buka", "Makan Utama", "Camilan Malam",
+        "Buka Jendela", "Tutup Jendela", "Minuman 0 kkal",
+        "Sarapan", "Makan Siang", "Makan Malam", "Camilan",
+    ]
+    for k in known:
         if k.lower() in raw_mtype.lower():
             return k
     return raw_mtype
@@ -1350,23 +1405,32 @@ def _open_food_preview(payload: dict, origin_tab: str = "scanner"):
     st.session_state["comp_toggle_nonce"] = st.session_state.get("comp_toggle_nonce", 0) + 1
 
 
-def format_whatsapp_daily_report(display_name: str, diary_date, today_kcal: float, target_kcal: float, pct_actual: float, today_totals: dict, today_meals: list) -> str:
-    """Menyusun laporan WhatsApp rapi per waktu makan dengan persentase aktual."""
+def format_whatsapp_daily_report(display_name: str, diary_date, today_kcal: float, target_kcal: float, pct_actual: float, today_totals: dict, today_meals: list, fasting_mode: str = "Normal") -> str:
+    """Menyusun laporan WhatsApp rapi per waktu makan dengan persentase aktual & status mode puasa."""
     grouped = {}
     for m in today_meals:
         mt = _normalize_meal_key(m.get("meal_type"))
         grouped.setdefault(mt, []).append(m)
 
+    mode_line = f"Mode: {fasting_mode}" if fasting_mode and fasting_mode != "Normal" else ""
     lines = [
         f"*Laporan Nutrisi Harian ({diary_date.strftime('%d %B %Y')})*",
         f"Akun: {display_name}",
+    ]
+    if mode_line:
+        lines.append(mode_line)
+    lines.extend([
         f"*Total Kalori:* {today_kcal:,.1f} / {target_kcal:,.0f} kkal ({pct_actual}%)",
-        f"P: {today_totals['protein_g']}g | L: {today_totals['fat_g']}g | K: {today_totals['carb_g']}g | S: {today_totals['fiber_g']}g",
+        f"P: {today_totals['protein_g']}g | L: {today_totals['fat_g']}g | K: {today_totals['carb_g']}g | S: {today_totals['fiber_g']}g | Gula: {today_totals.get('sugar_g', 0.0)}g",
         "",
         "*Daftar Menu:*",
-    ]
+    ])
+    ordered_mt = list(_get_meal_sessions(fasting_mode).values())
+    for extra_k in grouped:
+        if extra_k not in ordered_mt:
+            ordered_mt.append(extra_k)
     idx_num = 1
-    for mt in ["Sarapan", "Makan Siang", "Makan Malam", "Camilan", "Lainnya"]:
+    for mt in ordered_mt:
         if mt not in grouped:
             continue
         lines.append(f"*{mt}*")
@@ -1495,10 +1559,11 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
             unsafe_allow_html=True,
         )
 
-        meal_keys = list(MEAL_SESSION_MAP.keys())
-        meal_vals = list(MEAL_SESSION_MAP.values())
-        target_mt = saved_mt or _infer_meal_type(tz_offset)
-        def_idx = meal_vals.index(target_mt) if target_mt in meal_vals else 1
+        active_sessions = _get_meal_sessions(active_user.get("fasting_mode") or "Normal")
+        meal_keys = list(active_sessions.keys())
+        meal_vals = list(active_sessions.values())
+        target_mt = saved_mt or _infer_meal_type(tz_offset, active_user.get("fasting_mode") or "Normal")
+        def_idx = meal_vals.index(target_mt) if target_mt in meal_vals else 0
 
         st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
         sel_meal_label = st.radio(
@@ -1509,7 +1574,7 @@ def render_nutrition_preview_card(context_key: str, active_user: dict, active_da
             label_visibility="collapsed",
             key=f"prev_meal_{context_key}_{nonce}"
         )
-        sel_meal_clean = MEAL_SESSION_MAP[sel_meal_label]
+        sel_meal_clean = active_sessions[sel_meal_label]
 
         if not saved_id:
             col_act1, col_act2 = st.columns([3, 1])
@@ -1829,19 +1894,23 @@ with st.sidebar:
                 quick_url = f"https://nutrisi-cerdas.streamlit.app/?u={urllib.parse.quote(current_user['user_id'])}&s={quick_tok}"
                 st.code(quick_url, language=None)
 
-    with st.expander("Fokus kesehatan & zona waktu", expanded=False):
+    with st.expander("Fokus, mode puasa & zona waktu", expanded=False):
         focus_idx = FOCUS_GOALS.index(user_focus) if user_focus in FOCUS_GOALS else 0
         sel_focus = st.selectbox("Fokus pemantauan gizi", FOCUS_GOALS, index=focus_idx, key="sb_focus_goal")
+        fast_opts = list(VALID_FASTING_MODES)
+        fast_idx = fast_opts.index(user_fasting) if user_fasting in fast_opts else 0
+        sel_fasting = st.selectbox("Pola makan / mode puasa", fast_opts, index=fast_idx, key="sb_fasting_mode")
         tz_keys = list(TZ_OPTIONS.keys())
         tz_idx = tz_keys.index(user_tz) if user_tz in tz_keys else 1
         sel_tz = st.selectbox("Zona waktu", tz_keys, index=tz_idx, format_func=lambda k: TZ_OPTIONS[k], key="sb_tz_select")
-        if sel_focus != user_focus or sel_tz != user_tz:
-            update_user_preferences(current_user["user_id"], timezone_offset=sel_tz, focus_goal=sel_focus)
+        if sel_focus != user_focus or sel_tz != user_tz or sel_fasting != user_fasting:
+            update_user_preferences(current_user["user_id"], timezone_offset=sel_tz, focus_goal=sel_focus, fasting_mode=sel_fasting)
             st.session_state["user"]["timezone_offset"] = sel_tz
             st.session_state["user"]["focus_goal"] = sel_focus
+            st.session_state["user"]["fasting_mode"] = sel_fasting
             st.session_state["selected_diary_date"] = get_local_now(sel_tz).date()
             _mark_db_mutated()
-            st.toast("Preferensi fokus dan zona waktu disimpan")
+            st.toast("Preferensi fokus, mode puasa, dan zona waktu disimpan")
             st.rerun()
 
     with st.expander("Tema tampilan", expanded=False):
@@ -2258,11 +2327,12 @@ with tab_diary:
     fib_fill = min(100.0, (fib_g / max(1.0, macro_targets['fiber_g'])) * 100.0)
     ring_svg = _render_calorie_ring_svg(pct_today_actual, today_kcal, target_kcal)
 
+    fasting_hdr_suffix = f" · {sanitize_html_text(user_fasting)}" if user_fasting != "Normal" else ""
     st.markdown(
         f'<div class="nc-card">'
         f'  <div style="display:flex; justify-content:space-between; align-items:center; gap:20px; flex-wrap:wrap;">'
         f'    <div style="flex:1 1 260px; min-width:0;">'
-        f'      <div class="nc-label">Asupan kalori · {sanitize_html_text(user_focus)}</div>'
+        f'      <div class="nc-label">Asupan kalori · {sanitize_html_text(user_focus)}{fasting_hdr_suffix}</div>'
         f'      <div class="nc-mono" style="font-size:2.15rem; font-weight:500; line-height:1.15; margin:8px 0 6px 0; color:var(--text-primary);">'
         f'        {today_kcal:,.1f} <span style="font-size:1.0rem; font-weight:400; color:var(--text-muted);">/ {target_kcal:,.0f} kkal</span>'
         f'      </div>'
@@ -2454,7 +2524,16 @@ with tab_diary:
                     unsafe_allow_html=True,
                 )
                 st.progress(water_pct)
-                st.caption(f"Target adaptif {water_data['target']} gelas ({water_data.get('target_ml', water_data['target'] * 250):,} ml) sesuai berat badan & fokus")
+                if user_fasting == "Puasa Sunnah / Ramadan":
+                    g_now = int(water_data["glasses"])
+                    buka_done = min(2, g_now)
+                    malam_done = min(4, max(0, g_now - 2))
+                    sahur_done = min(2, max(0, g_now - 6))
+                    st.caption(f"Pola minum puasa 2-4-2: Berbuka {buka_done}/2 · Malam {malam_done}/4 · Sahur {sahur_done}/2 gelas")
+                elif user_fasting == "Intermittent Fasting 16:8":
+                    st.caption(f"Target adaptif {water_data['target']} gelas ({water_data.get('target_ml', water_data['target'] * 250):,} ml) · Saat jendela puasa: air putih/teh tawar 0 kkal")
+                else:
+                    st.caption(f"Target adaptif {water_data['target']} gelas ({water_data.get('target_ml', water_data['target'] * 250):,} ml) sesuai berat badan & fokus")
             with col_w3:
                 col_b1, col_b2 = st.columns(2)
                 with col_b1:
@@ -2611,21 +2690,60 @@ with tab_diary:
             pct_actual=pct_today_actual,
             today_totals=stats["today_totals"],
             today_meals=stats["today_meals"],
+            fasting_mode=user_fasting,
         )
         wa_encoded = urllib.parse.quote(wa_text)
         wa_url = f"https://api.whatsapp.com/send?text={wa_encoded}"
 
-        col_share1, col_share2 = st.columns([1, 1])
+        col_share1, col_share2, col_share3 = st.columns([1.15, 1.15, 0.9])
         with col_share1:
+            with st.popover("Kartu IG Story / WA (PNG)", width="stretch"):
+                st.caption("Format vertikal 1080x1920 (9:16) siap unggah ke Instagram Story atau Status WhatsApp")
+                def_card_idx = 1 if user_theme in {"Cal AI Dark", "Royal Purple Dark", "Cyberpunk Gold"} else 0
+                card_style_lbl = st.radio(
+                    "Gaya kartu",
+                    ["Terang (Lab Paper)", "Gelap (Graphite)"],
+                    index=def_card_idx,
+                    horizontal=True,
+                    key="share_card_style",
+                )
+                card_style_key = "dark" if "Gelap" in card_style_lbl else "light"
+                day_lbl_card = f"{day_id}, {active_diary_date.strftime('%d %b %Y')}"
+                png_bytes = generate_daily_share_card_png(
+                    display_name=current_user["display_name"],
+                    date_label=day_lbl_card,
+                    focus_goal=user_focus,
+                    fasting_mode=user_fasting,
+                    today_kcal=today_kcal,
+                    target_kcal=target_kcal,
+                    totals=stats["today_totals"],
+                    macro_targets=macro_targets,
+                    water_data=water_data,
+                    streak_days=streak_days,
+                    today_meals=stats["today_meals"],
+                    style=card_style_key,
+                )
+                st.image(png_bytes, caption="Preview kartu 9:16", width=220)
+                st.download_button(
+                    "Unduh PNG 9:16",
+                    data=png_bytes,
+                    file_name=f"nutrisi_cerdas_story_{active_diary_date.strftime('%Y%m%d')}.png",
+                    mime="image/png",
+                    type="primary",
+                    width="stretch",
+                    key="btn_dl_story_png",
+                )
+
+        with col_share2:
             st.markdown(
                 f'<a href="{wa_url}" target="_blank" style="text-decoration:none; display:block;">'
                 f'<div style="background:var(--bg-card); color:var(--text-primary); border:1px solid var(--border-col); padding:8px 16px; min-height:38px; border-radius:8px; font-weight:500; font-size:0.875rem; display:flex; align-items:center; justify-content:center; gap:8px;">'
-                f'{_lucide_svg("share", 16)}<span>Bagikan laporan ke WhatsApp</span>'
+                f'{_lucide_svg("share", 16)}<span>Bagikan teks ke WhatsApp</span>'
                 f'</div></a>',
                 unsafe_allow_html=True,
             )
 
-        with col_share2:
+        with col_share3:
             df_export = pd.DataFrame(stats["today_meals"])
             if not df_export.empty:
                 cols_to_export = [c for c in ["logged_at", "meal_type", "dish_name", "energy_kcal", "protein_g", "fat_g", "carb_g", "fiber_g", "sugar_g", "sodium_mg", "photo_caption"] if c in df_export.columns]
@@ -2634,16 +2752,12 @@ with tab_diary:
                     if txt_col in safe_df.columns:
                         safe_df[txt_col] = safe_df[txt_col].map(lambda v: sanitize_csv_cell(v) if isinstance(v, str) else v)
                 csv_data = safe_df.to_csv(index=False).encode('utf-8')
-                st.download_button("Unduh rekap CSV", data=csv_data, file_name=f"nutrisi_harian_{active_diary_date.strftime('%Y%m%d')}.csv", mime="text/csv", width="stretch")
+                st.download_button("Unduh CSV", data=csv_data, file_name=f"nutrisi_harian_{active_diary_date.strftime('%Y%m%d')}.csv", mime="text/csv", width="stretch")
 
         st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-        MEAL_ORDER = [
-            ("Sarapan", "Sarapan"),
-            ("Makan Siang", "Makan Siang"),
-            ("Makan Malam", "Makan Malam"),
-            ("Camilan", "Camilan & Minuman"),
-        ]
+        active_sess_dict = _get_meal_sessions(user_fasting)
+        MEAL_ORDER = [(v, "Camilan & Minuman" if v == "Camilan" else v) for v in active_sess_dict.values()]
 
         grouped_meals = {}
         for m in stats["today_meals"]:
@@ -2657,7 +2771,7 @@ with tab_diary:
             if k not in ordered_keys:
                 ordered_keys.append(k)
 
-        EDIT_MEAL_CHOICES = ["Sarapan", "Makan Siang", "Makan Malam", "Camilan"]
+        EDIT_MEAL_CHOICES = list(active_sess_dict.values())
 
         for mtype in ordered_keys:
             meals_in_group = grouped_meals[mtype]
@@ -2969,12 +3083,7 @@ with tab_scanner:
                     m_fat = st.number_input("Lemak (g)", min_value=0.0, max_value=200.0, value=4.0, step=1.0)
                     m_carb = st.number_input("Karbohidrat (g)", min_value=0.0, max_value=400.0, value=24.0, step=1.0)
 
-                MEAL_MAP_MANUAL = {
-                    "Sarapan": "Sarapan",
-                    "Makan Siang": "Makan Siang",
-                    "Makan Malam": "Makan Malam",
-                    "Camilan": "Camilan"
-                }
+                MEAL_MAP_MANUAL = _get_meal_sessions(user_fasting)
                 m_meal_label = st.selectbox("Waktu makan", list(MEAL_MAP_MANUAL.keys()), key="sel_manual_time")
                 m_meal_clean = MEAL_MAP_MANUAL[m_meal_label]
 
@@ -3140,6 +3249,7 @@ with tab_coach:
         else:
             daily_ctx = {
                 "focus_goal": user_focus,
+                "fasting_mode": user_fasting,
                 "today_kcal": today_kcal,
                 "target_kcal": target_kcal,
                 "remaining_kcal": coach_rem_kcal,

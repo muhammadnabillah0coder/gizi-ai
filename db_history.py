@@ -64,8 +64,13 @@ TABLES_WITH_ID = {
     "food_catalog_additions",
 }
 
-SCHEMA_VERSION = "v4.2"
+SCHEMA_VERSION = "v4.4"
 GUEST_PREFIX = "guest_"
+VALID_FASTING_MODES = (
+    "Normal",
+    "Puasa Sunnah / Ramadan",
+    "Intermittent Fasting 16:8",
+)
 _INITIALIZED_BACKENDS: set[str] = set()
 
 
@@ -577,6 +582,7 @@ def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
             last_scan_date TEXT,
             timezone_offset INTEGER DEFAULT 8,
             focus_goal TEXT DEFAULT 'Diet Sehat',
+            fasting_mode TEXT DEFAULT 'Normal',
             created_at TEXT
         )
         """,
@@ -695,6 +701,7 @@ def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
         ("users", "last_scan_date", "TEXT"),
         ("users", "timezone_offset", "INTEGER DEFAULT 8"),
         ("users", "focus_goal", "TEXT DEFAULT 'Diet Sehat'"),
+        ("users", "fasting_mode", "TEXT DEFAULT 'Normal'"),
         ("meal_logs", "meal_type", "TEXT DEFAULT 'Makan Siang'"),
         ("meal_logs", "sodium_mg", f"{real_t} DEFAULT 0.0"),
         ("meal_logs", "sugar_g", f"{real_t} DEFAULT 0.0"),
@@ -1200,13 +1207,17 @@ def update_user_theme(user_id: str, theme_name: str):
         conn.commit()
 
 
-def update_user_preferences(user_id: str, timezone_offset: int = None, focus_goal: str = None):
-    """Memperbarui preferensi zona waktu (WIB/WITA/WIT) dan fokus kesehatan pengguna."""
+def update_user_preferences(user_id: str, timezone_offset: int = None, focus_goal: str = None, fasting_mode: str = None):
+    """Memperbarui preferensi zona waktu (WIB/WITA/WIT), fokus kesehatan, dan mode puasa pengguna."""
     with _db_session() as (conn, cur):
         if timezone_offset is not None:
             cur.execute("UPDATE users SET timezone_offset = ? WHERE user_id = ?", (int(timezone_offset), user_id))
         if focus_goal is not None:
             cur.execute("UPDATE users SET focus_goal = ? WHERE user_id = ?", (focus_goal.strip(), user_id))
+        if fasting_mode is not None:
+            clean_fm = fasting_mode.strip()
+            if clean_fm in VALID_FASTING_MODES:
+                cur.execute("UPDATE users SET fasting_mode = ? WHERE user_id = ?", (clean_fm, user_id))
         conn.commit()
     return True
 
@@ -2091,7 +2102,7 @@ def export_user_data_json(user_id: str) -> str:
     import json
     with _db_session() as (conn, cur):
         user_row = cur.execute(
-            "SELECT user_id, display_name, daily_calorie_target, theme_preference, gender, weight_kg, height_cm, age_years, subscription_tier, timezone_offset, focus_goal, created_at FROM users WHERE user_id = ?",
+            "SELECT user_id, display_name, daily_calorie_target, theme_preference, gender, weight_kg, height_cm, age_years, subscription_tier, timezone_offset, focus_goal, fasting_mode, created_at FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         meal_rows = cur.execute(
