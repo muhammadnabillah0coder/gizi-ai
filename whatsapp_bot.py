@@ -23,13 +23,18 @@ from gemini_extractor import analyze_food_text, analyze_food_image
 from nutrition_engine import calculate_dish_nutrition
 from food_guardrails import FoodGuardrailRejected, open_safe_image, validate_extracted_dish_totals
 from db_history import (
-    get_or_create_user, log_meal, get_user_history_stats,
+    init_user_history_tables, get_or_create_user, log_meal, get_user_history_stats,
     get_user_scan_status, record_scan_usage, get_local_now,
     create_session_token, is_admin_user
 )
 from payment_gateway import process_midtrans_notification, process_mayar_webhook
 
 app = FastAPI(title="Nutrisi Cerdas WhatsApp Bot API")
+
+
+@app.on_event("startup")
+def _startup_init_db():
+    init_user_history_tables()
 
 DASHBOARD_BASE_URL = "https://nutrisi-cerdas.streamlit.app"
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024

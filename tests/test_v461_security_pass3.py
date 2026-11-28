@@ -18,6 +18,7 @@ import hashlib
 import os
 import sqlite3
 import sys
+import time
 import unittest
 import uuid
 from unittest.mock import MagicMock, patch
@@ -29,6 +30,7 @@ import food_guardrails as fg
 import google_auth
 import payment_gateway
 import session_cookie
+import whatsapp_bot
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -281,6 +283,102 @@ class TestSecurityPass3V461(unittest.TestCase):
                 self.assertTrue(ok_p)
                 self.assertEqual(code_p, 200)
                 mock_tg.assert_called_once()
+
+    def test_09_high_p4_01_open_tab_session_revoked_after_pin_change_and_no_admin_rolling_refresh(self):
+        from streamlit.testing.v1 import AppTest
+
+        app_path = os.path.join(ROOT_DIR, "app.py")
+        tok_v1 = db_history.create_session_token(self.test_uid)
+        at = AppTest.from_file(app_path, default_timeout=30)
+        at.query_params["u"] = self.test_uid
+        at.query_params["s"] = tok_v1
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Initial tab boot crash: {at.exception}")
+        self.assertEqual(at.session_state["user"]["user_id"], self.test_uid)
+
+        # Korban mengganti PIN dari perangkat lain saat tab penyerang masih terbuka
+        ok_ch, _ = db_history.change_user_password(self.test_uid, "1234", "9876")
+        self.assertTrue(ok_ch)
+
+        # Rerun tab penyerang -> token lama TIDAK boleh dicetak ulang, harus dipaksa keluar ke guest!
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Revocation rerun crash: {at.exception}")
+        kicked_uid = at.session_state["user"]["user_id"]
+        self.created_uids.append(kicked_uid)
+        self.assertTrue(db_history.is_guest_user_id(kicked_uid), f"Tab terbuka wajib dikeluarkan ke tamu, bukan: {kicked_uid}")
+        self.assertIsNone(at.session_state.get("active_session_token"))
+        self.assertTrue(at.session_state.get("block_ls_restore"))
+
+        # Sesi Admin dengan token 8 jam valid tidak boleh mengalami rolling refresh setiap rerun, dan wajib ditendang bila direvokasi
+        adm_uid = f"adm_p4_{uuid.uuid4().hex[:6]}@example.com"
+        self.created_uids.append(adm_uid)
+        db_history.register_user(adm_uid, "Admin P4", "1234")
+        adm_tok = db_history.create_session_token(adm_uid, ttl_seconds=db_history.ADMIN_SESSION_TOKEN_TTL_SECONDS)
+        with patch.object(db_history, "ADMIN_IDENTIFIERS", db_history.ADMIN_IDENTIFIERS | {adm_uid}):
+            at_adm = AppTest.from_file(app_path, default_timeout=30)
+            at_adm.session_state["user"] = db_history.get_or_create_user(adm_uid)
+            at_adm.session_state["active_session_token"] = adm_tok
+            at_adm.run()
+            self.assertEqual(len(at_adm.exception), 0)
+            self.assertEqual(at_adm.session_state["active_session_token"], adm_tok)
+
+            # Cabut sesi Admin -> rerun berikutnya harus langsung mengeluarkan Admin
+            db_history.bump_user_session_version(adm_uid)
+            at_adm.run()
+            self.assertEqual(len(at_adm.exception), 0)
+            adm_kicked_uid = at_adm.session_state["user"]["user_id"]
+            self.created_uids.append(adm_kicked_uid)
+            self.assertTrue(db_history.is_guest_user_id(adm_kicked_uid))
+
+    def test_10_medium_p4_02_fail_closed_db_errors_and_admin_url_login_blocked(self):
+        from streamlit.testing.v1 import AppTest
+
+        tok_ok = db_history.create_session_token(self.test_uid)
+        self.assertTrue(db_history.verify_session_token(self.test_uid, tok_ok))
+
+        # 1. Fail-closed ketika DB melempar exception
+        with patch.object(db_history, "_db_session", side_effect=RuntimeError("DB sementara tidak terjangkau")):
+            self.assertEqual(db_history.get_user_session_version(self.test_uid), 0)
+            self.assertFalse(db_history.verify_session_token(self.test_uid, tok_ok))
+            self.assertFalse(db_history.consume_oauth_nonce_db("nonce_db_err", int(time.time()) + 600))
+
+        # 2. Admin ?u=&s= melalui URL wajib diblokir
+        adm_url_uid = f"adm_url_{uuid.uuid4().hex[:6]}@example.com"
+        self.created_uids.append(adm_url_uid)
+        db_history.register_user(adm_url_uid, "Admin URL", "1234")
+        adm_tok = db_history.create_session_token(adm_url_uid, ttl_seconds=db_history.ADMIN_SESSION_TOKEN_TTL_SECONDS)
+        app_path = os.path.join(ROOT_DIR, "app.py")
+        with patch.object(db_history, "ADMIN_IDENTIFIERS", db_history.ADMIN_IDENTIFIERS | {adm_url_uid}):
+            at = AppTest.from_file(app_path, default_timeout=30)
+            at.query_params["u"] = adm_url_uid
+            at.query_params["s"] = adm_tok
+            at.run()
+            self.assertEqual(len(at.exception), 0)
+            booted_uid = at.session_state["user"]["user_id"]
+            self.created_uids.append(booted_uid)
+            self.assertTrue(db_history.is_guest_user_id(booted_uid))
+
+    def test_11_low_p4_03_atomic_coach_quota_refund_and_bot_startup_init(self):
+        # 1. Reservasi & refund kuota Tanya Gizi AI bekerja atomik
+        for _ in range(10):
+            ok_r, _ = db_history.consume_coach_quota(self.test_uid, tz_offset=8)
+            self.assertTrue(ok_r)
+        ok_over, st_over = db_history.consume_coach_quota(self.test_uid, tz_offset=8)
+        self.assertFalse(ok_over)
+        self.assertFalse(st_over["can_ask"])
+
+        # Refund 1 slot saat panggilan model gagal -> tepat 1 slot terbuka lalu tertutup kembali
+        db_history.refund_coach_quota(self.test_uid, tz_offset=8)
+        self.assertEqual(db_history.get_coach_quota_status(self.test_uid, tz_offset=8)["remaining"], 1)
+        ok_after, _ = db_history.consume_coach_quota(self.test_uid, tz_offset=8)
+        self.assertTrue(ok_after)
+        ok_over2, _ = db_history.consume_coach_quota(self.test_uid, tz_offset=8)
+        self.assertFalse(ok_over2)
+
+        # 2. Startup whatsapp_bot.py menginisialisasi skema DB terbaru
+        with patch.object(whatsapp_bot, "init_user_history_tables") as mock_init:
+            whatsapp_bot._startup_init_db()
+            mock_init.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -121,10 +121,13 @@ class TestAppUISmoke(unittest.TestCase):
         app_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app.py"))
         with patch.object(db_history, "ADMIN_IDENTIFIERS", db_history.ADMIN_IDENTIFIERS | {self.test_uid}):
             at = AppTest.from_file(app_path, default_timeout=30)
-            at.query_params["u"] = self.test_uid
-            at.query_params["s"] = self.session_tok
+            at.session_state["user"] = db_history.get_or_create_user(self.test_uid)
+            at.session_state["active_session_token"] = self.session_tok
             at.run()
             self.assertEqual(len(at.exception), 0, f"Admin UI crash: {at.exception}")
+            self.assertEqual(at.session_state["user"]["user_id"], self.test_uid)
+            all_caps = "\n".join(c.value for c in at.caption)
+            self.assertIn("Muhammad Nabillah", all_caps)
 
 
 if __name__ == "__main__":

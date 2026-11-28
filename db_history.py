@@ -543,7 +543,7 @@ def _get_session_secret_key() -> bytes:
 
 
 def get_user_session_version(user_id: str) -> int:
-    """Mengambil versi sesi aktif pengguna dari DB untuk mendukung revokasi token server-side."""
+    """Mengambil versi sesi aktif pengguna secara fail-closed (mengembalikan 0 bila DB error)."""
     clean_id = (user_id or "").strip().lower()
     if not clean_id or is_guest_user_id(clean_id):
         return 1
@@ -552,9 +552,9 @@ def get_user_session_version(user_id: str) -> int:
             row = cur.execute("SELECT session_version FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_id,)).fetchone()
             if row and row["session_version"] is not None:
                 return max(1, int(row["session_version"]))
+            return 1
     except Exception:
-        pass
-    return 1
+        return 0
 
 
 def bump_user_session_version(user_id: str) -> int:
@@ -601,7 +601,7 @@ def verify_session_token(user_id: str, token: str) -> bool:
     if exp_ts <= now_ts or exp_ts > (now_ts + SESSION_TOKEN_TTL_SECONDS + 300):
         return False
     cur_sv = get_user_session_version(clean_id)
-    if tok_sv != cur_sv:
+    if cur_sv < 1 or tok_sv < 1 or tok_sv != cur_sv:
         return False
     key = _get_session_secret_key()
     expected = hmac.new(key, f"{clean_id}|{tok_sv}|{exp_ts}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
@@ -1107,7 +1107,7 @@ def consume_oauth_nonce_db(nonce: str, exp_ts: int) -> bool:
             conn.commit()
             return inserted
     except Exception:
-        return True
+        return False
 
 
 def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str = "Pria", bb: float = 65.0, tb: float = 170.0, age: int = 25, target_kcal: float = 2000.0, focus_goal: str = "Diet Sehat", timezone_offset: int = DEFAULT_TIMEZONE_OFFSET):
@@ -1792,7 +1792,7 @@ def get_coach_quota_status(user_id: str, tz_offset: int = None) -> dict:
 
 
 def consume_coach_quota(user_id: str, tz_offset: int = None) -> tuple[bool, dict]:
-    """Memeriksa & mengurangi 1 kuota harian Tanya Gizi AI secara persisten di database."""
+    """Memeriksa & mencadangkan 1 kuota harian Tanya Gizi AI secara atomik & kondisional di DB."""
     clean_uid = _normalize_user_id(user_id)
     with _db_session() as (conn, cur):
         row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_uid,)).fetchone()
@@ -1800,16 +1800,67 @@ def consume_coach_quota(user_id: str, tz_offset: int = None) -> tuple[bool, dict
         if not st_q["can_ask"]:
             return False, st_q
         if row and not st_q["is_unlimited"]:
-            new_used = st_q["used"] + 1
+            t_day = st_q["today_str"]
+            lim = int(st_q["limit"])
             cur.execute(
-                "UPDATE users SET daily_coach_count = ?, last_coach_date = ? WHERE id = ?",
-                (new_used, st_q["today_str"], row["id"]),
+                """
+                UPDATE users
+                SET daily_coach_count = CASE
+                        WHEN last_coach_date = ? THEN COALESCE(daily_coach_count, 0) + 1
+                        ELSE 1
+                    END,
+                    last_coach_date = ?
+                WHERE id = ?
+                  AND (last_coach_date IS NULL OR last_coach_date != ? OR COALESCE(daily_coach_count, 0) < ?)
+                """,
+                (t_day, t_day, row["id"], t_day, lim),
             )
+            if cur.rowcount != 1:
+                conn.rollback()
+                fresh_row = cur.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
+                fresh_st = _compute_coach_quota_from_row(fresh_row, clean_uid, tz_offset=tz_offset)
+                fresh_st["can_ask"] = False
+                return False, fresh_st
             conn.commit()
+            new_used = st_q["used"] + 1
             st_q["used"] = new_used
-            st_q["remaining"] = max(0, st_q["limit"] - new_used)
-            st_q["can_ask"] = new_used < st_q["limit"]
+            st_q["remaining"] = max(0, lim - new_used)
+            st_q["can_ask"] = new_used < lim
         return True, st_q
+
+
+def refund_coach_quota(user_id: str, tz_offset: int = None) -> None:
+    """Mengembalikan 1 kuota Tanya Gizi AI bila pemanggilan AI gagal atau ditolak guardrail."""
+    clean_uid = _normalize_user_id(user_id)
+    if is_admin_user(clean_uid):
+        return
+    try:
+        with _db_session() as (conn, cur):
+            row = cur.execute(
+                "SELECT id, timezone_offset, last_coach_date, daily_coach_count FROM users WHERE LOWER(user_id) = ? LIMIT 1",
+                (clean_uid,),
+            ).fetchone()
+            if not row:
+                return
+            eff_tz = tz_offset if tz_offset is not None else (
+                row["timezone_offset"] if row["timezone_offset"] is not None else DEFAULT_TIMEZONE_OFFSET
+            )
+            t_day = get_local_now(eff_tz).strftime("%Y-%m-%d")
+            if row["last_coach_date"] == t_day and int(row["daily_coach_count"] or 0) > 0:
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET daily_coach_count = CASE
+                            WHEN COALESCE(daily_coach_count, 0) > 1 THEN COALESCE(daily_coach_count, 0) - 1
+                            ELSE 0
+                        END
+                    WHERE id = ? AND last_coach_date = ?
+                    """,
+                    (row["id"], t_day),
+                )
+                conn.commit()
+    except Exception:
+        pass
 
 
 def consume_unclear_retry_or_scan_quota(user_id: str, tz_offset: int = None, max_free_retries: int = 2) -> dict:

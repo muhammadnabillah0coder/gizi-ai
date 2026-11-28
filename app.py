@@ -96,7 +96,7 @@ from db_history import (
     get_local_now, create_session_token, verify_session_token, session_token_needs_refresh,
     SESSION_TOKEN_TTL_SECONDS, ADMIN_SESSION_TOKEN_TTL_SECONDS,
     bump_user_session_version, claim_verified_google_account,
-    get_coach_quota_status, consume_coach_quota, consume_unclear_retry_or_scan_quota,
+    get_coach_quota_status, consume_coach_quota, refund_coach_quota, consume_unclear_retry_or_scan_quota,
     update_user_preferences, log_weight_entry, get_weight_history, get_logging_streak,
     get_storage_backend_info, get_dashboard_bundle,
     is_guest_user_id, create_guest_session_id, migrate_guest_data_to_user,
@@ -114,12 +114,20 @@ from google_auth import (
     get_credentials as get_google_oauth_credentials
 )
 
-APP_VERSION = "v4.6.1"
+APP_VERSION = "v4.6.2"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v4.6.1 (Terbaru)",
+        "version": "v4.6.2 (Terbaru)",
+        "date": "28 Nov 2026",
+        "highlights": [
+            "Penambalan Bug Hunter Pass 4: revokasi paksa tab/sesi terbuka seketika saat session_version berubah (ganti PIN, logout, atau klaim Google OAuth), penutupan akses tautan ?u=&s= untuk Admin, dan penghapusan perpanjangan bergulir tak terbatas pada sesi Admin 8 jam.",
+            "Penguatan fail-closed pada pemeriksaan DB (session_version & replay nonce OAuth), pembaruan tautan bookmark aktif, reservasi kuota Tanya Gizi AI atomik sebelum panggilan model, serta inisialisasi skema otomatis saat startup webhook WhatsApp/QRIS."
+        ]
+    },
+    {
+        "version": "v4.6.1",
         "date": "28 Nov 2026",
         "highlights": [
             "Penambalan Bug Hunter Pass 3 (10 temuan Critical hingga Low): blokir registrasi publik akun sistem/Admin dengan whitelist ADMIN_EMAILS, revokasi token sesi via session_version saat logout/ganti PIN, serta batas sesi Admin non-persisten 8 jam.",
@@ -820,7 +828,7 @@ cookie_guest = extract_valid_guest_cookie(browser_cookies)
 if "user" not in st.session_state:
     safe_url_auth = saved_auth_param if saved_auth_param in {"local", "google"} else "local"
     safe_ck_auth = cookie_auth if cookie_auth in {"local", "google"} else "local"
-    if saved_user_param and verify_session_token(saved_user_param, saved_sig_param):
+    if saved_user_param and not is_admin_user(saved_user_param) and verify_session_token(saved_user_param, saved_sig_param):
         st.session_state["user"] = get_or_create_user(saved_user_param.strip().lower(), auth_provider=safe_url_auth)
         st.session_state["active_session_token"] = saved_sig_param
     elif cookie_uid and not is_admin_user(cookie_uid) and verify_session_token(cookie_uid, cookie_sig):
@@ -837,10 +845,23 @@ else:
     active_uid = st.session_state["user"]["user_id"]
     if not is_guest_user_id(active_uid):
         cur_tok = st.session_state.get("active_session_token") or saved_sig_param or cookie_sig
-        eff_ttl = ADMIN_SESSION_TOKEN_TTL_SECONDS if is_admin_user(active_uid) else SESSION_TOKEN_TTL_SECONDS
-        if not verify_session_token(active_uid, cur_tok) or session_token_needs_refresh(cur_tok):
-            cur_tok = create_session_token(active_uid, ttl_seconds=eff_ttl)
-        st.session_state["active_session_token"] = cur_tok
+        is_adm_sess = is_admin_user(active_uid)
+        if not verify_session_token(active_uid, cur_tok):
+            # Token sudah direvokasi (ganti PIN / logout / klaim Google) atau kedaluwarsa -> paksa keluar!
+            st.session_state["guest_session_id"] = create_guest_session_id()
+            st.session_state["user"] = _get_or_init_guest_user()
+            st.session_state.pop("active_session_token", None)
+            st.session_state["pending_cookie_clear"] = True
+            st.session_state["block_ls_restore"] = True
+            st.session_state["session_revoked_notice"] = True
+            _reset_ephemeral_user_state()
+            st.query_params.clear()
+            _mark_db_mutated()
+            st.rerun()
+        elif not is_adm_sess and session_token_needs_refresh(cur_tok):
+            st.session_state["active_session_token"] = create_session_token(
+                active_uid, ttl_seconds=SESSION_TOKEN_TTL_SECONDS
+            )
 
 # Sinkronisasi Cookie & localStorage Native Per-HP (berjalan same-origin 0px, aman untuk iOS Safari & Android Chrome)
 _bridge_user = st.session_state["user"]
@@ -2003,7 +2024,7 @@ with st.sidebar:
             if not is_admin:
                 st.markdown("---")
                 st.caption("Bookmark tautan di bawah atau tambahkan ke Layar Utama HP agar langsung masuk ke akun Anda tanpa kembali ke akses tamu (berlaku 30 hari):")
-                quick_tok = st.query_params.get("s") or create_session_token(current_user["user_id"])
+                quick_tok = st.session_state.get("active_session_token") or create_session_token(current_user["user_id"])
                 quick_url = f"https://nutrisi-cerdas.streamlit.app/?u={urllib.parse.quote(current_user['user_id'])}&s={quick_tok}"
                 st.code(quick_url, language=None)
 
@@ -2162,6 +2183,9 @@ with st.sidebar:
                     st.caption(f"- {hl}")
 
 # Header Brand Utama (Tenang, Tanpa Badge Gradien Ungu / Glow)
+if st.session_state.pop("session_revoked_notice", False):
+    st.warning("Sesi Anda telah berakhir atau dicabut (misalnya karena ganti PIN atau logout). Silakan masuk kembali.")
+
 if st.session_state.get("auth_url_warning"):
     st.warning(
         f"Untuk menjaga privasi buku harian {st.session_state['auth_url_warning']}, "
@@ -3879,23 +3903,31 @@ with tab_coach:
                 "today_dishes": [m["dish_name"] for m in stats["today_meals"]],
             }
             with st.spinner("Menyusun saran gizi berbasis data Anda..."):
-                try:
-                    reply_txt = ask_nutrition_coach(
-                        active_coach_q,
-                        daily_ctx,
-                        chat_history=st.session_state["coach_messages"],
-                        api_key=api_key,
-                    )
-                    st.session_state["coach_messages"].append({"role": "user", "content": active_coach_q})
-                    st.session_state["coach_messages"].append({"role": "assistant", "content": reply_txt})
-                    st.session_state["coach_messages"] = st.session_state["coach_messages"][-12:]
-                    consume_coach_quota(current_user["user_id"], tz_offset=user_tz)
-                    _mark_db_mutated()
-                    st.rerun()
-                except FoodGuardrailRejected as g_err:
-                    _render_guardrail_rejection_card(g_err)
-                except Exception as exc:
-                    st.error(f"Gagal menghubungi Tanya Gizi AI: {exc}")
+                ok_resv, _ = consume_coach_quota(current_user["user_id"], tz_offset=user_tz)
+                if not ok_resv:
+                    if is_guest:
+                        st.warning("Batas 3 pertanyaan tanpa akun tercapai. Masuk atau daftar akun gratis untuk membuka 10 pertanyaan per hari.")
+                    else:
+                        st.warning("Batas 10 pertanyaan Tanya Gizi AI hari ini sudah tercapai. Coba lagi besok atau aktifkan Paket Pro di kanan atas untuk konsultasi tanpa batas.")
+                else:
+                    try:
+                        reply_txt = ask_nutrition_coach(
+                            active_coach_q,
+                            daily_ctx,
+                            chat_history=st.session_state["coach_messages"],
+                            api_key=api_key,
+                        )
+                        st.session_state["coach_messages"].append({"role": "user", "content": active_coach_q})
+                        st.session_state["coach_messages"].append({"role": "assistant", "content": reply_txt})
+                        st.session_state["coach_messages"] = st.session_state["coach_messages"][-12:]
+                        _mark_db_mutated()
+                        st.rerun()
+                    except FoodGuardrailRejected as g_err:
+                        refund_coach_quota(current_user["user_id"], tz_offset=user_tz)
+                        _render_guardrail_rejection_card(g_err)
+                    except Exception as exc:
+                        refund_coach_quota(current_user["user_id"], tz_offset=user_tz)
+                        st.error(f"Gagal menghubungi Tanya Gizi AI: {exc}")
 
     if st.session_state["coach_messages"]:
         c_ch1, c_ch2 = st.columns([3.0, 1.0], vertical_alignment="center")
