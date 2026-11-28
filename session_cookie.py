@@ -16,8 +16,10 @@ COOKIE_UID = "nc_uid"
 COOKIE_SIG = "nc_sig"
 COOKIE_AUTH = "nc_auth"
 COOKIE_GUEST = "nc_guest"
+COOKIE_OAUTH_NONCE = "nc_oauth"
 AUTH_COOKIE_MAX_AGE = 30 * 86400   # 30 hari
 GUEST_COOKIE_MAX_AGE = 7 * 86400   # 7 hari
+OAUTH_NONCE_MAX_AGE = 600          # 10 menit
 
 _GUEST_ID_RE = re.compile(r"^guest_[0-9a-f]{12}$")
 
@@ -100,8 +102,11 @@ export default function(component) {
         return;
     }
     const action = data.action || "";
+    if (data.oauth_nonce && getCookie("nc_oauth") !== data.oauth_nonce) {
+        setCookie("nc_oauth", data.oauth_nonce, Number(data.oauth_max_age || 600));
+    }
 
-    if (action === "clear") {
+    if (action === "clear" || action === "admin_ephemeral") {
         clearCookie("nc_uid");
         clearCookie("nc_sig");
         clearCookie("nc_auth");
@@ -223,14 +228,20 @@ def build_cookie_bridge_payload(
     *,
     clear: bool = False,
     is_guest: bool = True,
+    is_admin: bool = False,
     user_id: str = "",
     session_token: str = "",
     auth_provider: str = "local",
     try_restore: bool = True,
+    oauth_nonce: str = "",
 ) -> dict:
     """Menyusun instruksi data terstruktur yang aman untuk dikirim ke komponen cookie bridge."""
     if clear:
         return {"action": "clear"}
+    if is_admin:
+        # Sesi Admin dilarang disimpan di cookie non-HttpOnly atau localStorage 30 hari
+        return {"action": "admin_ephemeral"}
+    extra_oauth = {"oauth_nonce": str(oauth_nonce).strip(), "oauth_max_age": OAUTH_NONCE_MAX_AGE} if oauth_nonce else {}
     if not is_guest and user_id and session_token:
         return {
             "action": "set_auth",
@@ -238,12 +249,14 @@ def build_cookie_bridge_payload(
             "s": str(session_token).strip(),
             "auth": auth_provider if auth_provider in {"local", "google"} else "local",
             "max_age": AUTH_COOKIE_MAX_AGE,
+            **extra_oauth,
         }
     return {
         "action": "set_guest",
         "g": str(user_id).strip().lower() if _GUEST_ID_RE.fullmatch(str(user_id or "").strip().lower()) else "",
         "try_restore": bool(try_restore),
         "max_age": GUEST_COOKIE_MAX_AGE,
+        **extra_oauth,
     }
 
 

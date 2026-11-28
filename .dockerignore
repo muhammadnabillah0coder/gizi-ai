@@ -4,4 +4,8 @@ __pycache__/
 .git/
 .gitignore
 .env
+.env.*
+.streamlit/secrets.toml
+*.log
+marketing_pack/
 tests/

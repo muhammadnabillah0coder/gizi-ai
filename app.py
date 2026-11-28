@@ -10,6 +10,7 @@ import streamlit as st
 from PIL import Image
 import os
 import json
+import secrets
 import pandas as pd
 from datetime import datetime, timedelta
 import urllib.parse
@@ -71,6 +72,7 @@ from session_cookie import (
     COOKIE_UID,
     COOKIE_SIG,
     COOKIE_AUTH,
+    COOKIE_OAUTH_NONCE,
     read_browser_cookies,
     extract_valid_guest_cookie,
     build_cookie_bridge_payload,
@@ -92,6 +94,9 @@ from db_history import (
     stage_pending_food, get_pending_foods, publish_food_to_catalog, reject_pending_food,
     export_user_data_json, import_user_data_json,
     get_local_now, create_session_token, verify_session_token, session_token_needs_refresh,
+    SESSION_TOKEN_TTL_SECONDS, ADMIN_SESSION_TOKEN_TTL_SECONDS,
+    bump_user_session_version, claim_verified_google_account,
+    get_coach_quota_status, consume_coach_quota, consume_unclear_retry_or_scan_quota,
     update_user_preferences, log_weight_entry, get_weight_history, get_logging_streak,
     get_storage_backend_info, get_dashboard_bundle,
     is_guest_user_id, create_guest_session_id, migrate_guest_data_to_user,
@@ -109,12 +114,20 @@ from google_auth import (
     get_credentials as get_google_oauth_credentials
 )
 
-APP_VERSION = "v4.6.0"
+APP_VERSION = "v4.6.1"
 APP_CREATOR = "original by MN"
 
 PATCH_NOTES = [
     {
-        "version": "v4.6.0 (Terbaru)",
+        "version": "v4.6.1 (Terbaru)",
+        "date": "28 Nov 2026",
+        "highlights": [
+            "Penambalan Bug Hunter Pass 3 (10 temuan Critical hingga Low): blokir registrasi publik akun sistem/Admin dengan whitelist ADMIN_EMAILS, revokasi token sesi via session_version saat logout/ganti PIN, serta batas sesi Admin non-persisten 8 jam.",
+            "Penguatan bisnis & pembayaran: tabel relasional voucher_redemptions anti-truncation & anti-TOCTOU, update atomik webhook Midtrans/Mayar + notifikasi Telegram aktif, pengikatan browser nonce pada Google OAuth anti-CSRF & anti pre-ATO, lockout login PIN, serta kuota Tanya Gizi AI & retry foto buram berbasis DB persisten."
+        ]
+    },
+    {
+        "version": "v4.6.0",
         "date": "26 Nov 2026",
         "highlights": [
             "Paket Pro & Pembayaran QRIS (Mayar.id API, Midtrans Snap SHA-512, dan Kode Voucher Aktivasi Pro): membuka Scan Foto AI & Tanya Gizi AI tanpa batas harian dengan aturan perpanjangan stacking yang adil.",
@@ -479,20 +492,17 @@ def _render_guardrail_rejection_card(g_err: FoodGuardrailRejected):
 
 
 def _consume_scan_or_free_unclear(uid: str, tz_offset: int, g_err: FoodGuardrailRejected):
-    """Memotong kuota pada foto iseng/non-pangan dan membatasi toleransi gratis foto buram maks. 2x/hari."""
+    """Memotong kuota pada foto iseng/non-pangan dan membatasi toleransi foto buram secara persisten di DB."""
     if g_err.consumes_scan_quota:
         record_scan_usage(uid, tz_offset=tz_offset)
         _mark_db_mutated()
         return
-    today_key = get_local_now(tz_offset).strftime("%Y-%m-%d")
-    bucket = st.session_state.get("unclear_free_tracker") or {}
-    if bucket.get("date") != today_key or bucket.get("uid") != uid:
-        bucket = {"date": today_key, "uid": uid, "count": 0}
-    bucket["count"] = int(bucket.get("count") or 0) + 1
-    st.session_state["unclear_free_tracker"] = bucket
-    if bucket["count"] > MAX_FREE_UNCLEAR_IMAGE_RETRIES_PER_DAY:
-        record_scan_usage(uid, tz_offset=tz_offset)
-        _mark_db_mutated()
+    consume_unclear_retry_or_scan_quota(
+        uid,
+        tz_offset=tz_offset,
+        max_free_retries=MAX_FREE_UNCLEAR_IMAGE_RETRIES_PER_DAY,
+    )
+    _mark_db_mutated()
 
 
 def _render_scan_quota_exhausted_notice(active_user: dict, sc_status: dict):
@@ -681,8 +691,17 @@ def _get_or_init_guest_user(preferred_guest_id: str = "") -> dict:
     return get_or_create_user(gid, display_name="Tamu", auth_provider="guest")
 
 
+def _is_safe_https_href(raw_url: str) -> bool:
+    """Memastikan tautan eksternal pada HTML aman dan strictly memakai skema https."""
+    try:
+        parsed = urllib.parse.urlparse(str(raw_url or "").strip())
+        return parsed.scheme.lower() == "https" and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
 def _activate_authenticated_user(user_dict: dict, auth_provider: str = "local", toast_prefix: str = ""):
-    """Mengaktifkan sesi akun terdaftar, memigrasikan catatan sesi tamu sebelumnya, dan menyimpan cookie HP 30 hari."""
+    """Mengaktifkan sesi akun terdaftar, memigrasikan catatan sesi tamu sebelumnya, dan menerbitkan token ber-TTL sesuai peran."""
     prev_user = st.session_state.get("user") or {}
     prev_uid = str(prev_user.get("user_id") or "")
     migrated = {"meals": 0, "water": 0, "weights": 0, "custom": 0}
@@ -691,7 +710,8 @@ def _activate_authenticated_user(user_dict: dict, auth_provider: str = "local", 
             migrated = migrate_guest_data_to_user(prev_uid, user_dict["user_id"])
         except Exception:
             pass
-    tok = create_session_token(user_dict["user_id"])
+    ttl_sec = ADMIN_SESSION_TOKEN_TTL_SECONDS if is_admin_user(user_dict["user_id"]) else SESSION_TOKEN_TTL_SECONDS
+    tok = create_session_token(user_dict["user_id"], ttl_seconds=ttl_sec)
     st.session_state["user"] = user_dict
     st.session_state["active_session_token"] = tok
     st.session_state["block_ls_restore"] = False
@@ -707,7 +727,13 @@ def _activate_authenticated_user(user_dict: dict, auth_provider: str = "local", 
 
 
 def _logout_to_guest():
-    """Keluar dari akun aktif, hapus cookie + localStorage perangkat, dan buka sesi tamu baru yang bersih."""
+    """Keluar dari akun aktif, revokasi session_version di server, hapus cookie + localStorage perangkat, lalu buka sesi tamu baru."""
+    prev_uid = str((st.session_state.get("user") or {}).get("user_id") or "")
+    if prev_uid and not is_guest_user_id(prev_uid):
+        try:
+            bump_user_session_version(prev_uid)
+        except Exception:
+            pass
     st.session_state["guest_session_id"] = create_guest_session_id()
     st.session_state["user"] = _get_or_init_guest_user()
     st.session_state.pop("active_session_token", None)
@@ -720,20 +746,22 @@ def _logout_to_guest():
 
 
 def _render_google_signin_link(label: str = "Masuk dengan Google") -> bool:
-    """Merender tombol Masuk dengan Google secara otomatis hanya jika GOOGLE_CLIENT_ID & SECRET aktif."""
+    """Merender tombol Masuk dengan Google yang mengikat parameter state OAuth ke browser nonce pengguna."""
     cid, csec = get_google_oauth_credentials()
     if not cid or not csec:
         return False
-    auth_url = get_google_auth_url("https://nutrisi-cerdas.streamlit.app")
-    if not auth_url or auth_url == "#":
+    b_nonce = str(st.session_state.get("oauth_browser_nonce") or "").strip()
+    auth_url = get_google_auth_url("https://nutrisi-cerdas.streamlit.app", browser_binding=b_nonce)
+    if not auth_url or auth_url == "#" or not _is_safe_https_href(auth_url):
         return False
+    safe_auth_url = sanitize_html_text(auth_url)
     g_svg = (
         '<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;">'
         '<path fill="currentColor" d="M21.35 11.1h-9.18v2.98h5.27c-.23 1.47-1.69 4.3-5.27 4.3-3.17 0-5.76-2.63-5.76-5.88s2.59-5.88 5.76-5.88c1.81 0 3.02.77 3.71 1.43l2.53-2.44C16.78 4.1 14.68 3.2 12.17 3.2 7.16 3.2 3.1 7.26 3.1 12.5s4.06 9.3 9.07 9.3c5.24 0 8.71-3.68 8.71-8.87 0-.6-.06-1.05-.13-1.83Z"/>'
         '</svg>'
     )
     st.markdown(
-        f'<a href="{auth_url}" target="_self" style="text-decoration:none; display:block; margin-bottom:10px;">'
+        f'<a href="{safe_auth_url}" target="_self" rel="noopener noreferrer" style="text-decoration:none; display:block; margin-bottom:10px;">'
         f'<div style="background:var(--bg-card); color:var(--text-primary); border:1px solid var(--border-col); '
         f'padding:9px 14px; min-height:40px; border-radius:8px; font-weight:500; font-size:0.875rem; '
         f'display:flex; align-items:center; justify-content:center; gap:10px;">'
@@ -746,13 +774,21 @@ def _render_google_signin_link(label: str = "Masuk dengan Google") -> bool:
 
 _ensure_schema_ready(getattr(db_history, "_MODULE_MTIME", 0.0))
 
-# Tangani Redirect Google OAuth Callback (?code=...&state=...)
+# Baca HTTP cookies di awal agar binding anti-Login CSRF OAuth tersedia sebelum memproses callback
+browser_cookies = read_browser_cookies()
+_cookie_oauth_nonce = str(browser_cookies.get(COOKIE_OAUTH_NONCE) or "").strip().lower()
+if len(_cookie_oauth_nonce) == 24 and all(ch in "0123456789abcdef" for ch in _cookie_oauth_nonce):
+    st.session_state["oauth_browser_nonce"] = _cookie_oauth_nonce
+elif not st.session_state.get("oauth_browser_nonce"):
+    st.session_state["oauth_browser_nonce"] = secrets.token_hex(12)
+
+# Tangani Redirect Google OAuth Callback (?code=...&state=...) dengan validasi state terikat browser
 auth_code = st.query_params.get("code", "")
 auth_state = st.query_params.get("state", "")
 if auth_code:
-    if not verify_oauth_state(auth_state):
+    if not verify_oauth_state(auth_state, browser_binding=_cookie_oauth_nonce, require_binding=True):
         st.query_params.clear()
-        st.error("Gagal memverifikasi sesi login Google: parameter keamanan `state` tidak valid atau sudah kedaluwarsa. Ulangi proses masuk.")
+        st.error("Gagal memverifikasi sesi login Google: parameter keamanan `state` tidak valid, sudah dipakai, atau tidak cocok dengan browser Anda. Ulangi proses masuk.")
     else:
         redirect_uri = "https://nutrisi-cerdas.streamlit.app"
         user_info, err_details = exchange_code_for_user(auth_code, redirect_uri)
@@ -764,7 +800,7 @@ if auth_code:
         if user_info and user_info.get("email") and user_info.get("verified_email"):
             email = user_info["email"].strip().lower()
             name = user_info.get("name") or email.split("@")[0]
-            u = get_or_create_user(email, display_name=name, auth_provider="google")
+            u = claim_verified_google_account(email, display_name=name)
             _activate_authenticated_user(u, auth_provider="google", toast_prefix=f"Masuk sebagai {name} lewat akun Google")
             st.rerun()
         else:
@@ -772,7 +808,6 @@ if auth_code:
             st.caption("Pastikan Redirect URI di Google Cloud Console adalah `https://nutrisi-cerdas.streamlit.app` dan status OAuth Consent Screen sudah In Production")
 
 # Inisialisasi Sesi Akun Pengguna: Prioritas URL (?u=&s=) -> Cookie HP (30 hari) -> Cookie Tamu (7 hari) -> Tamu Baru
-browser_cookies = read_browser_cookies()
 saved_user_param = st.query_params.get("u", "")
 saved_sig_param = st.query_params.get("s", "")
 saved_auth_param = st.query_params.get("auth", "local")
@@ -788,7 +823,7 @@ if "user" not in st.session_state:
     if saved_user_param and verify_session_token(saved_user_param, saved_sig_param):
         st.session_state["user"] = get_or_create_user(saved_user_param.strip().lower(), auth_provider=safe_url_auth)
         st.session_state["active_session_token"] = saved_sig_param
-    elif cookie_uid and verify_session_token(cookie_uid, cookie_sig):
+    elif cookie_uid and not is_admin_user(cookie_uid) and verify_session_token(cookie_uid, cookie_sig):
         st.session_state["user"] = get_or_create_user(cookie_uid, auth_provider=safe_ck_auth)
         st.session_state["active_session_token"] = (
             create_session_token(cookie_uid) if session_token_needs_refresh(cookie_sig) else cookie_sig
@@ -802,26 +837,30 @@ else:
     active_uid = st.session_state["user"]["user_id"]
     if not is_guest_user_id(active_uid):
         cur_tok = st.session_state.get("active_session_token") or saved_sig_param or cookie_sig
+        eff_ttl = ADMIN_SESSION_TOKEN_TTL_SECONDS if is_admin_user(active_uid) else SESSION_TOKEN_TTL_SECONDS
         if not verify_session_token(active_uid, cur_tok) or session_token_needs_refresh(cur_tok):
-            cur_tok = create_session_token(active_uid)
+            cur_tok = create_session_token(active_uid, ttl_seconds=eff_ttl)
         st.session_state["active_session_token"] = cur_tok
 
 # Sinkronisasi Cookie & localStorage Native Per-HP (berjalan same-origin 0px, aman untuk iOS Safari & Android Chrome)
 _bridge_user = st.session_state["user"]
 _bridge_is_guest = is_guest_user_id(_bridge_user["user_id"])
+_bridge_is_admin = is_admin_user(_bridge_user["user_id"])
 _should_clear_cookie = bool(st.session_state.pop("pending_cookie_clear", False))
 _bridge_payload = build_cookie_bridge_payload(
     clear=_should_clear_cookie,
     is_guest=_bridge_is_guest,
+    is_admin=_bridge_is_admin,
     user_id=_bridge_user["user_id"],
     session_token=st.session_state.get("active_session_token") or "",
     auth_provider=_bridge_user.get("auth_provider", "local"),
     try_restore=(not _should_clear_cookie and not st.session_state.get("block_ls_restore", False)),
+    oauth_nonce=st.session_state.get("oauth_browser_nonce", ""),
 )
 _restored_sess = mount_session_cookie_bridge(_bridge_payload)
 if _bridge_is_guest and not _should_clear_cookie and not st.session_state.get("block_ls_restore", False) and _restored_sess:
     r_uid, r_sig, r_auth = _restored_sess
-    if verify_session_token(r_uid, r_sig):
+    if not is_admin_user(r_uid) and verify_session_token(r_uid, r_sig):
         u_restored = get_or_create_user(r_uid, auth_provider=r_auth)
         st.session_state["user"] = u_restored
         st.session_state["active_session_token"] = (
@@ -1944,17 +1983,22 @@ with st.sidebar:
                     st.error(res_dn)
 
             st.markdown("---")
-            st.caption("Ganti PIN atau password akun")
             has_local_pw = bool(current_user.get("password_hash"))
-            cur_pin_in = st.text_input("PIN saat ini", type="password", key="sb_cur_pin") if has_local_pw else ""
-            new_pin_in = st.text_input("PIN baru (min. 4 karakter)", type="password", key="sb_new_pin")
-            if st.button("Perbarui PIN", width="stretch", key="sb_btn_change_pin"):
-                ok_pw, msg_pw = change_user_password(current_user["user_id"], cur_pin_in, new_pin_in)
-                if ok_pw:
-                    st.session_state["user"] = get_or_create_user(current_user["user_id"], auth_provider=current_user.get("auth_provider", "local"))
-                    st.success(msg_pw)
-                else:
-                    st.error(msg_pw)
+            if is_google and not has_local_pw:
+                st.caption("Akun ini masuk melalui Google OAuth dan tidak memakai PIN lokal.")
+            else:
+                st.caption("Ganti PIN atau password akun (sesi perangkat lain otomatis dicabut)")
+                cur_pin_in = st.text_input("PIN saat ini", type="password", key="sb_cur_pin") if has_local_pw else ""
+                new_pin_in = st.text_input("PIN baru (min. 4 karakter)", type="password", key="sb_new_pin")
+                if st.button("Perbarui PIN", width="stretch", key="sb_btn_change_pin"):
+                    ok_pw, msg_pw = change_user_password(current_user["user_id"], cur_pin_in, new_pin_in)
+                    if ok_pw:
+                        st.session_state["user"] = get_or_create_user(current_user["user_id"], auth_provider=current_user.get("auth_provider", "local"))
+                        ttl_pin = ADMIN_SESSION_TOKEN_TTL_SECONDS if is_admin else SESSION_TOKEN_TTL_SECONDS
+                        st.session_state["active_session_token"] = create_session_token(current_user["user_id"], ttl_seconds=ttl_pin)
+                        st.success(msg_pw)
+                    else:
+                        st.error(msg_pw)
 
             if not is_admin:
                 st.markdown("---")
@@ -2328,16 +2372,18 @@ with col_head2:
                             f'Nominal: <span class="nc-mono" style="font-weight:500;">Rp{int(last_ord["amount_idr"]):,}</span> ({int(last_ord["days"])} hari)</div>',
                             unsafe_allow_html=True,
                         )
-                        if last_ord.get("payment_url"):
+                        if _is_safe_https_href(last_ord.get("payment_url")):
+                            safe_pay_href = sanitize_html_text(str(last_ord["payment_url"]).strip())
                             st.markdown(
-                                f'<a href="{last_ord["payment_url"]}" target="_blank" style="text-decoration:none; display:block; margin-bottom:8px;">'
+                                f'<a href="{safe_pay_href}" target="_blank" rel="noopener noreferrer" style="text-decoration:none; display:block; margin-bottom:8px;">'
                                 f'<div style="background:var(--accent); color:var(--accent-fg); padding:9px 12px; border-radius:8px; text-align:center; font-weight:500; font-size:0.86rem;">'
                                 f'Bayar sekarang lewat {sanitize_html_text(gw_info["label"])}</div></a>',
                                 unsafe_allow_html=True,
                             )
-                        elif last_ord.get("wa_confirm_url"):
+                        elif _is_safe_https_href(last_ord.get("wa_confirm_url")):
+                            safe_wa_href = sanitize_html_text(str(last_ord["wa_confirm_url"]).strip())
                             st.markdown(
-                                f'<a href="{last_ord["wa_confirm_url"]}" target="_blank" style="text-decoration:none; display:block; margin-bottom:8px;">'
+                                f'<a href="{safe_wa_href}" target="_blank" rel="noopener noreferrer" style="text-decoration:none; display:block; margin-bottom:8px;">'
                                 f'<div style="background:var(--accent); color:var(--accent-fg); padding:9px 12px; border-radius:8px; text-align:center; font-weight:500; font-size:0.86rem;">'
                                 f'Konfirmasi QRIS ke WhatsApp Admin</div></a>',
                                 unsafe_allow_html=True,
@@ -3767,15 +3813,10 @@ with tab_coach:
         unsafe_allow_html=True,
     )
 
-    is_coach_unlimited = bool(is_admin or scan_status.get("is_pro"))
-    coach_limit = 999 if is_coach_unlimited else (3 if is_guest else 10)
-    coach_today_key = local_now.strftime("%Y-%m-%d")
-    coach_quota = st.session_state.get("coach_quota_tracker") or {}
-    if coach_quota.get("date") != coach_today_key or coach_quota.get("uid") != current_user["user_id"]:
-        coach_quota = {"date": coach_today_key, "uid": current_user["user_id"], "count": 0}
-        st.session_state["coach_quota_tracker"] = coach_quota
-    coach_used = int(coach_quota.get("count") or 0)
-    coach_remaining = max(0, coach_limit - coach_used)
+    coach_q_state = get_coach_quota_status(current_user["user_id"], tz_offset=user_tz)
+    is_coach_unlimited = bool(coach_q_state["is_unlimited"])
+    coach_limit = int(coach_q_state["limit"])
+    coach_remaining = int(coach_q_state["remaining"])
 
     if "coach_messages" not in st.session_state:
         st.session_state["coach_messages"] = []
@@ -3848,8 +3889,8 @@ with tab_coach:
                     st.session_state["coach_messages"].append({"role": "user", "content": active_coach_q})
                     st.session_state["coach_messages"].append({"role": "assistant", "content": reply_txt})
                     st.session_state["coach_messages"] = st.session_state["coach_messages"][-12:]
-                    coach_quota["count"] = coach_used + 1
-                    st.session_state["coach_quota_tracker"] = coach_quota
+                    consume_coach_quota(current_user["user_id"], tz_offset=user_tz)
+                    _mark_db_mutated()
                     st.rerun()
                 except FoodGuardrailRejected as g_err:
                     _render_guardrail_rejection_card(g_err)
@@ -3898,12 +3939,18 @@ with tab_sources:
 
     if is_admin:
         pending_list = _fetch_pending_foods_cached("pending", st.session_state.get("db_mutation_ver", 0))
-        with st.expander(f"Panel kurasi data gizi sebelum publikasi ({len(pending_list)} draft menunggu, Admin)", expanded=bool(len(pending_list) > 0)):
+        with st.expander(f"Panel kurasi data gizi sebelum publikasi ({len(pending_list)} draft menunggu, Admin)", expanded=False):
             st.caption("Data baru dari Open Food Facts, auto-learn, dan usulan pengguna masuk ke ruang tinjauan sebelum dipublikasikan ke katalog utama.")
             if pending_list:
                 for p_item in pending_list[:15]:
                     with st.container(border=True):
-                        st.markdown(f"**Draft #{p_item['id']}: {p_item['food_name']}** · `{p_item['source_origin']}`")
+                        st.markdown(
+                            f'<div style="font-weight:600; font-size:0.9rem; margin-bottom:6px; color:var(--text-primary);">'
+                            f'Draft #{int(p_item["id"])}: {sanitize_html_text(p_item["food_name"])} · '
+                            f'<span class="nc-mono" style="font-weight:400; color:var(--text-muted);">{sanitize_html_text(p_item["source_origin"])}</span>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
                         pc1, pc2, pc3 = st.columns([2, 2, 1.2])
                         with pc1:
                             p_name = st.text_input("Nama pangan", value=p_item["food_name"], key=f"pend_n_{p_item['id']}")

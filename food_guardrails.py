@@ -380,6 +380,11 @@ def _validate_food_name_core(raw_text: str, allow_trailing_model_code: bool = Fa
             "prompt_injection",
             "Format awal teks ('=' atau '@') tidak valid sebagai nama makanan.",
         )
+    if "![" in clean or "](" in clean:
+        raise FoodGuardrailRejected(
+            "prompt_injection",
+            "Format tautan atau gambar Markdown tidak diperbolehkan pada nama makanan.",
+        )
     check_prompt_injection(clean)
     _check_text_gibberish(clean)
     _check_taboo_and_non_food(clean)

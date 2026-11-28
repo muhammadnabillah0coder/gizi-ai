@@ -1,8 +1,8 @@
-# Nutrisi Cerdas (`v4.6.0`): Precision Food & Lab Nutrition Intelligence
+# Nutrisi Cerdas (`v4.6.1`): Precision Food & Lab Nutrition Intelligence
 
 Aplikasi web pelacak kalori, makronutrien, **Kuis Rencana Gizi Personal 4 Langkah**, **Mode Puasa (Ramadan/Sunnah & IF 16:8)**, **Kartu Visual IG Story / WA Status 9:16**, **Paket Pro & Pembayaran QRIS (Mayar.id / Midtrans / Voucher)**, Konsultan **Tanya Gizi AI** kontekstual, dan Rambu GGL Kemenkes RI (Gula, Garam/Natrium, Lemak) berbasis **1.304 data laboratorium TKPI Kemenkes RI**, **45 produk kemasan ritel BPOM ber-barcode EAN-13**, serta **Open Food Facts / USDA**.
 
-Dibangun dengan arsitektur **Bottom-Up Engineering (7-Layer Production Maturity Roadmap)**, **PWA siap pasang di HP**, auto-login **Browser Cookie + `localStorage` 30 hari per HP**, dual-backend **Supabase PostgreSQL + SQLite**, pertahanan 4-lapis *Food Guardrails*, dan antarmuka **Unslop 60/30/10**.
+Dibangun dengan arsitektur **Bottom-Up Engineering (7-Layer Production Maturity Roadmap)**, **PWA siap pasang di HP**, auto-login **Browser Cookie + `localStorage` 30 hari per HP** (dengan revokasi `session_version`), **Security Hardening Pass 3**, dual-backend **Supabase PostgreSQL + SQLite**, pertahanan 4-lapis *Food Guardrails*, dan antarmuka **Unslop 60/30/10**.
 
 - Panduan deploy publik **Google Cloud Run Jakarta (`asia-southeast2`) + Custom Domain HTTPS + PWA**: [DEPLOY_PUBLIC_GUIDE.md](DEPLOY_PUBLIC_GUIDE.md)
 - Panduan setup **Paket Pro & Pembayaran QRIS (Mayar.id / Midtrans / Voucher)**: [PAYMENT_QRIS_GUIDE.md](PAYMENT_QRIS_GUIDE.md)

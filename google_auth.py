@@ -30,17 +30,24 @@ def _get_oauth_state_secret() -> bytes:
         return _FALLBACK_STATE_SECRET
 
 
-def create_oauth_state(ttl_seconds: int = 600) -> str:
-    """Membuat parameter state bertanda tangan HMAC dengan nonce acak sekali pakai (anti-Login CSRF)."""
+def create_oauth_state(ttl_seconds: int = 600, browser_binding: str = "") -> str:
+    """Membuat parameter state bertanda tangan HMAC dengan pengikatan sesi browser (anti-Login CSRF)."""
     exp_ts = int(time.time()) + int(ttl_seconds)
     nonce = secrets.token_hex(12)
+    b_tag = hashlib.sha256(str(browser_binding or "").encode("utf-8")).hexdigest()[:12] if browser_binding else "unbound"
     key = _get_oauth_state_secret()
-    sig = hmac.new(key, f"oauth|{exp_ts}|{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    sig = hmac.new(key, f"oauth|{exp_ts}|{b_tag}|{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
     return f"{exp_ts}.{nonce}.{sig}"
 
 
-def verify_oauth_state(state: str, max_ttl_seconds: int = 600, consume: bool = True) -> bool:
-    """Memvalidasi integritas, masa berlaku, dan keunikan parameter state OAuth."""
+def verify_oauth_state(
+    state: str,
+    max_ttl_seconds: int = 600,
+    consume: bool = True,
+    browser_binding: str = "",
+    require_binding: bool = False,
+) -> bool:
+    """Memvalidasi integritas, masa berlaku, pengikatan browser, dan replay nonce DB untuk state OAuth."""
     raw = str(state or "").strip()
     parts = raw.split(".")
     if len(parts) != 3:
@@ -48,12 +55,15 @@ def verify_oauth_state(state: str, max_ttl_seconds: int = 600, consume: bool = T
     exp_str, nonce, sig = parts
     if not exp_str.isdigit() or len(nonce) < 8 or len(sig) != 24:
         return False
+    if require_binding and not str(browser_binding or "").strip():
+        return False
     exp_ts = int(exp_str)
     now_ts = int(time.time())
     if exp_ts <= now_ts or exp_ts > (now_ts + max_ttl_seconds + 60):
         return False
+    b_tag = hashlib.sha256(str(browser_binding or "").encode("utf-8")).hexdigest()[:12] if browser_binding else "unbound"
     key = _get_oauth_state_secret()
-    expected = hmac.new(key, f"oauth|{exp_ts}|{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    expected = hmac.new(key, f"oauth|{exp_ts}|{b_tag}|{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
     if not hmac.compare_digest(expected, sig):
         return False
 
@@ -64,6 +74,12 @@ def verify_oauth_state(state: str, max_ttl_seconds: int = 600, consume: bool = T
         if nonce in _CONSUMED_OAUTH_STATES:
             return False
         if consume:
+            try:
+                from db_history import consume_oauth_nonce_db
+                if not consume_oauth_nonce_db(nonce, exp_ts):
+                    return False
+            except Exception:
+                pass
             _CONSUMED_OAUTH_STATES[nonce] = exp_ts
     return True
 
@@ -84,7 +100,7 @@ def get_credentials():
         
     return client_id, client_secret
 
-def get_google_auth_url(redirect_uri: str, state: str = None) -> str:
+def get_google_auth_url(redirect_uri: str, state: str = None, browser_binding: str = "") -> str:
     """Membuat URL resmi Sign-In with Google lengkap dengan parameter state anti-CSRF."""
     client_id, _ = get_credentials()
     if not client_id:
@@ -98,7 +114,7 @@ def get_google_auth_url(redirect_uri: str, state: str = None) -> str:
         "scope": "openid email profile",
         "access_type": "online",
         "prompt": "select_account",
-        "state": state or create_oauth_state(),
+        "state": state or create_oauth_state(browser_binding=browser_binding),
     }
     return f"{base_url}?{urllib.parse.urlencode(params)}"
 

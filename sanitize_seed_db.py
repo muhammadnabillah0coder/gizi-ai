@@ -20,6 +20,8 @@ USER_DATA_TABLES = (
     "pending_foods",
     "payment_orders",
     "pro_vouchers",
+    "voucher_redemptions",
+    "oauth_used_nonces",
     "app_meta",
 )
 

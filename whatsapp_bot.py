@@ -86,7 +86,8 @@ def _is_safe_public_https_url(raw_url: str) -> bool:
         except ValueError:
             return False
         if (
-            ip_obj.is_private
+            not getattr(ip_obj, "is_global", True)
+            or ip_obj.is_private
             or ip_obj.is_loopback
             or ip_obj.is_link_local
             or ip_obj.is_multicast
@@ -219,7 +220,8 @@ async def whatsapp_webhook(request: Request):
                 record_scan_usage(sender_clean)
             return {"reply": f"🛡️ *Tidak Dapat Diproses*\n\n{g_err.message}"}
         except Exception as e:
-            return {"reply": f"Maaf, gagal memproses foto: {str(e)}. Coba kirim ulang dengan foto lebih jelas ya!"}
+            print(f"[WA FOTO ERROR]: {type(e).__name__}: {e}")
+            return {"reply": "Maaf, gagal memproses foto makanan Anda saat ini. Pastikan foto cukup terang dan coba lagi."}
 
     # 2. Kasus Kirim Pesan Teks
     elif message_text:
@@ -250,7 +252,8 @@ async def whatsapp_webhook(request: Request):
         except FoodGuardrailRejected as g_err:
             return {"reply": f"🛡️ *Tidak Dapat Diproses*\n\n{g_err.message}"}
         except Exception as e:
-            return {"reply": f"Maaf, tidak dapat menganalisis teks tersebut: {str(e)}"}
+            print(f"[WA TEKS ERROR]: {type(e).__name__}: {e}")
+            return {"reply": "Maaf, terjadi kendala saat menganalisis pesan makanan tersebut. Silakan coba beberapa saat lagi."}
             
     return {"reply": "Kirimkan teks nama makanan atau foto piringmu untuk saya hitung profil nutrisinya secara akurat!"}
 
@@ -268,7 +271,7 @@ async def midtrans_qris_webhook(request: Request):
 
 @app.post("/webhook/mayar")
 async def mayar_qris_webhook(request: Request):
-    """Webhook resmi Mayar.id QRIS dengan validasi token fail-closed & aktivasi Pro idempoten."""
+    """Webhook resmi Mayar.id QRIS dengan validasi token header fail-closed & aktivasi Pro idempoten."""
     try:
         payload = await request.json()
     except Exception:
@@ -279,7 +282,6 @@ async def mayar_qris_webhook(request: Request):
         request.headers.get("x-callback-token")
         or request.headers.get("x-mayar-token")
         or bearer
-        or request.query_params.get("token")
         or ""
     ).strip()
     ok, status_code, message = process_mayar_webhook(payload, supplied_token=supplied)
@@ -288,4 +290,5 @@ async def mayar_qris_webhook(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("whatsapp_bot:app", host="0.0.0.0", port=8000, reload=True)
+    dev_reload = os.environ.get("DEV_RELOAD", "").strip().lower() == "true"
+    uvicorn.run("whatsapp_bot:app", host="0.0.0.0", port=8000, reload=dev_reload)

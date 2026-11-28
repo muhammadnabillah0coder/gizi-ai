@@ -46,12 +46,27 @@ BETA_DAILY_SCAN_LIMIT = 5
 GUEST_DAILY_SCAN_LIMIT = 3
 DEFAULT_TIMEZONE_OFFSET = 8  # WITA (Tanah Grogot / Kaltim)
 SESSION_TOKEN_TTL_SECONDS = 30 * 86400  # 30 hari masa berlaku token tautan sesi ?u=&s=
+ADMIN_SESSION_TOKEN_TTL_SECONDS = 8 * 3600  # 8 jam masa berlaku sesi Admin
+LOGIN_MAX_FAILED_ATTEMPTS = 5
+LOGIN_LOCKOUT_MINUTES = 15
+VOUCHER_MAX_FAILED_ATTEMPTS = 5
+VOUCHER_LOCKOUT_MINUTES = 15
 
 ADMIN_IDENTIFIERS = {
     "nabillah",
     "muhammadnabillah0coder@gmail.com",
     "pkm tanah grogot",
     "admin"
+}
+
+RESERVED_PUBLIC_REGISTRATION_IDS = {
+    "admin",
+    "administrator",
+    "root",
+    "system",
+    "nabillah",
+    "pkm tanah grogot",
+    "muhammadnabillah0coder@gmail.com",
 }
 
 TABLES_WITH_ID = {
@@ -64,9 +79,10 @@ TABLES_WITH_ID = {
     "food_catalog_additions",
     "payment_orders",
     "pro_vouchers",
+    "voucher_redemptions",
 }
 
-SCHEMA_VERSION = "v4.6"
+SCHEMA_VERSION = "v4.7"
 GUEST_PREFIX = "guest_"
 VALID_FASTING_MODES = (
     "Normal",
@@ -74,6 +90,8 @@ VALID_FASTING_MODES = (
     "Intermittent Fasting 16:8",
 )
 _INITIALIZED_BACKENDS: set[str] = set()
+_VOUCHER_FAIL_LOCK = threading.Lock()
+_VOUCHER_FAIL_BUCKETS: dict[str, list[float]] = {}
 
 
 def is_guest_user_id(user_id: str) -> bool:
@@ -225,6 +243,13 @@ class _UnifiedCursor:
         cols = [d[0] for d in (self._raw.description or [])]
         return [_DictRow(cols, r) for r in rows]
 
+    @property
+    def rowcount(self) -> int:
+        try:
+            return int(getattr(self._raw, "rowcount", -1))
+        except Exception:
+            return -1
+
 
 class _UnifiedConnection:
     """Wrapper koneksi seragam dengan backend SQLite atau PostgreSQL."""
@@ -303,10 +328,11 @@ def parse_database_url(uri: str) -> dict:
     is_supabase_host = parsed.hostname.endswith(".supabase.com") or parsed.hostname.endswith(".supabase.co")
     use_ssl = False if (sslmode == "disable" or (is_local_host and sslmode != "require")) else True
 
-    if sslmode in {"verify-ca", "verify-full"}:
+    root_cert = (os.environ.get("DATABASE_SSL_ROOT_CERT") or "").strip()
+    if sslmode in {"verify-ca", "verify-full"} or (root_cert and os.path.isfile(root_cert)):
         ssl_verify = True
     elif sslmode in {"no-verify", "require"} or (not sslmode and is_supabase_host):
-        # Standar libpq sslmode=require / pooler Supabase memakai TLS tanpa verifikasi CA internal
+        # Standar libpq sslmode=require / pooler Supabase memakai TLS tanpa CA khusus bila root cert tidak dipasang
         ssl_verify = False
     else:
         ssl_verify = True
@@ -319,6 +345,7 @@ def parse_database_url(uri: str) -> dict:
         "database": (parsed.path or "/postgres").lstrip("/") or "postgres",
         "use_ssl": use_ssl,
         "ssl_verify": ssl_verify,
+        "ssl_root_cert": root_cert if (root_cert and os.path.isfile(root_cert)) else "",
     }
 
 
@@ -328,7 +355,10 @@ def _open_pg_raw(uri: str):
     cfg = parse_database_url(uri)
     ssl_ctx = None
     if cfg["use_ssl"]:
-        ssl_ctx = ssl.create_default_context()
+        if cfg.get("ssl_root_cert"):
+            ssl_ctx = ssl.create_default_context(cafile=cfg["ssl_root_cert"])
+        else:
+            ssl_ctx = ssl.create_default_context()
         if not cfg["ssl_verify"]:
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -481,16 +511,13 @@ def get_local_now(tz_offset: int = DEFAULT_TIMEZONE_OFFSET) -> datetime:
 
 
 def _get_session_secret_key() -> bytes:
-    """Mengambil atau membuat kunci HMAC sesi server secara aman tanpa hardcode di kode sumber."""
-    env_sec = os.environ.get("SESSION_SECRET", "") or os.environ.get("GEMINI_API_KEY", "")
+    """Mengambil atau membuat kunci HMAC sesi terpisah (tidak pernah memakai GEMINI_API_KEY)."""
+    env_sec = (os.environ.get("SESSION_SECRET") or "").strip()
     if not env_sec:
         try:
             import streamlit as st
-            if hasattr(st, "secrets"):
-                if "SESSION_SECRET" in st.secrets:
-                    env_sec = st.secrets["SESSION_SECRET"]
-                elif "GEMINI_API_KEY" in st.secrets:
-                    env_sec = st.secrets["GEMINI_API_KEY"]
+            if hasattr(st, "secrets") and "SESSION_SECRET" in st.secrets:
+                env_sec = str(st.secrets["SESSION_SECRET"]).strip()
         except Exception:
             pass
 
@@ -515,45 +542,79 @@ def _get_session_secret_key() -> bytes:
     return secret_hex.encode("utf-8")
 
 
+def get_user_session_version(user_id: str) -> int:
+    """Mengambil versi sesi aktif pengguna dari DB untuk mendukung revokasi token server-side."""
+    clean_id = (user_id or "").strip().lower()
+    if not clean_id or is_guest_user_id(clean_id):
+        return 1
+    try:
+        with _db_session() as (conn, cur):
+            row = cur.execute("SELECT session_version FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_id,)).fetchone()
+            if row and row["session_version"] is not None:
+                return max(1, int(row["session_version"]))
+    except Exception:
+        pass
+    return 1
+
+
+def bump_user_session_version(user_id: str) -> int:
+    """Menaikkan session_version pengguna sehingga seluruh token sesi lama otomatis hangus."""
+    clean_id = (user_id or "").strip().lower()
+    if not clean_id or is_guest_user_id(clean_id):
+        return 1
+    with _db_session() as (conn, cur):
+        cur.execute(
+            "UPDATE users SET session_version = COALESCE(session_version, 1) + 1 WHERE LOWER(user_id) = ?",
+            (clean_id,),
+        )
+        conn.commit()
+        row = cur.execute("SELECT session_version FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_id,)).fetchone()
+    return int(row["session_version"]) if row and row["session_version"] else 1
+
+
 def create_session_token(user_id: str, ttl_seconds: int = SESSION_TOKEN_TTL_SECONDS) -> str:
-    """Membuat token HMAC bertanda tangan dengan masa kedaluwarsa (default 30 hari)."""
+    """Membuat token HMAC bertanda tangan dengan session_version yang dapat direvokasi."""
     clean_id = (user_id or "").strip().lower()
     if is_guest_user_id(clean_id):
         return ""
+    sv = get_user_session_version(clean_id)
     exp_ts = int(time.time()) + int(ttl_seconds)
     key = _get_session_secret_key()
-    payload = f"{clean_id}|{exp_ts}".encode("utf-8")
+    payload = f"{clean_id}|{sv}|{exp_ts}".encode("utf-8")
     sig = hmac.new(key, payload, hashlib.sha256).hexdigest()[:24]
-    return f"{exp_ts}.{sig}"
+    return f"{exp_ts}.{sv}.{sig}"
 
 
 def verify_session_token(user_id: str, token: str) -> bool:
-    """Memvalidasi integritas & masa berlaku token HMAC URL secara constant-time."""
+    """Memvalidasi integritas HMAC, masa berlaku, dan session_version token sesi secara constant-time."""
     clean_id = (user_id or "").strip().lower()
     tok_str = str(token or "").strip()
-    if is_guest_user_id(clean_id) or not tok_str or "." not in tok_str:
+    parts = tok_str.split(".")
+    if is_guest_user_id(clean_id) or len(parts) != 3:
         return False
-    exp_str, sig_str = tok_str.split(".", 1)
-    if not exp_str.isdigit() or not sig_str:
+    exp_str, ver_str, sig_str = parts
+    if not exp_str.isdigit() or not ver_str.isdigit() or not sig_str:
         return False
     exp_ts = int(exp_str)
+    tok_sv = int(ver_str)
     now_ts = int(time.time())
     if exp_ts <= now_ts or exp_ts > (now_ts + SESSION_TOKEN_TTL_SECONDS + 300):
         return False
+    cur_sv = get_user_session_version(clean_id)
+    if tok_sv != cur_sv:
+        return False
     key = _get_session_secret_key()
-    expected = hmac.new(key, f"{clean_id}|{exp_ts}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    expected = hmac.new(key, f"{clean_id}|{tok_sv}|{exp_ts}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
     return hmac.compare_digest(expected, sig_str)
 
 
 def session_token_needs_refresh(token: str, refresh_window_seconds: int = 15 * 86400) -> bool:
-    """Mengembalikan True bila token perlu diperbarui (hilang atau sisa masa aktif < 15 hari)."""
+    """Mengembalikan True bila token perlu diperbarui (format invalid atau sisa masa aktif < 15 hari)."""
     tok_str = str(token or "").strip()
-    if "." not in tok_str:
+    parts = tok_str.split(".")
+    if len(parts) != 3 or not parts[0].isdigit():
         return True
-    exp_str = tok_str.split(".", 1)[0]
-    if not exp_str.isdigit():
-        return True
-    return (int(exp_str) - int(time.time())) < refresh_window_seconds
+    return (int(parts[0]) - int(time.time())) < refresh_window_seconds
 
 
 def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
@@ -585,6 +646,13 @@ def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
             timezone_offset INTEGER DEFAULT 8,
             focus_goal TEXT DEFAULT 'Diet Sehat',
             fasting_mode TEXT DEFAULT 'Normal',
+            session_version INTEGER DEFAULT 1,
+            failed_login_attempts INTEGER DEFAULT 0,
+            locked_until TEXT,
+            daily_coach_count INTEGER DEFAULT 0,
+            last_coach_date TEXT,
+            daily_unclear_count INTEGER DEFAULT 0,
+            last_unclear_date TEXT,
             created_at TEXT
         )
         """,
@@ -716,6 +784,21 @@ def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
             redeemed_at TEXT
         )
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS voucher_redemptions (
+            id {pk_col},
+            voucher_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            redeemed_at TEXT,
+            UNIQUE(voucher_id, user_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_used_nonces (
+            nonce TEXT PRIMARY KEY,
+            expires_at INTEGER NOT NULL
+        )
+        """,
     ]
 
     for stmt in ddl_statements:
@@ -736,6 +819,13 @@ def _create_tables_on_cursor(conn: _UnifiedConnection, cur: _UnifiedCursor):
         ("users", "timezone_offset", "INTEGER DEFAULT 8"),
         ("users", "focus_goal", "TEXT DEFAULT 'Diet Sehat'"),
         ("users", "fasting_mode", "TEXT DEFAULT 'Normal'"),
+        ("users", "session_version", "INTEGER DEFAULT 1"),
+        ("users", "failed_login_attempts", "INTEGER DEFAULT 0"),
+        ("users", "locked_until", "TEXT"),
+        ("users", "daily_coach_count", "INTEGER DEFAULT 0"),
+        ("users", "last_coach_date", "TEXT"),
+        ("users", "daily_unclear_count", "INTEGER DEFAULT 0"),
+        ("users", "last_unclear_date", "TEXT"),
         ("meal_logs", "meal_type", "TEXT DEFAULT 'Makan Siang'"),
         ("meal_logs", "sodium_mg", f"{real_t} DEFAULT 0.0"),
         ("meal_logs", "sugar_g", f"{real_t} DEFAULT 0.0"),
@@ -976,18 +1066,57 @@ def _verify_password(input_password: str, saved_hash: str) -> tuple[bool, bool]:
 
 
 def is_admin_user(user_id: str) -> bool:
-    """Mengecek secara ketat (exact match) apakah user adalah Founder / Admin aplikasi."""
+    """Mengecek secara ketat (exact match) apakah user adalah Admin resmi (opsional override via ADMIN_EMAILS)."""
     if not user_id:
         return False
     uid = user_id.strip().lower()
+    raw_env = (os.environ.get("ADMIN_EMAILS") or "").strip()
+    if not raw_env:
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets") and "ADMIN_EMAILS" in st.secrets:
+                raw_env = str(st.secrets["ADMIN_EMAILS"]).strip()
+        except Exception:
+            pass
+    if raw_env:
+        allowed = {item.strip().lower() for item in raw_env.split(",") if item.strip()}
+        return uid in allowed
     return uid in ADMIN_IDENTIFIERS
 
 
+def consume_oauth_nonce_db(nonce: str, exp_ts: int) -> bool:
+    """Mencatat nonce OAuth sekali pakai di DB agar replay state diblokir lintas proses/kontainer."""
+    clean_nonce = str(nonce or "").strip()
+    if not clean_nonce:
+        return False
+    now_ts = int(time.time())
+    try:
+        with _db_session() as (conn, cur):
+            cur.execute("DELETE FROM oauth_used_nonces WHERE expires_at <= ?", (now_ts,))
+            if conn.backend == "postgres":
+                cur.execute(
+                    "INSERT INTO oauth_used_nonces (nonce, expires_at) VALUES (?, ?) ON CONFLICT (nonce) DO NOTHING",
+                    (clean_nonce, int(exp_ts)),
+                )
+            else:
+                cur.execute(
+                    "INSERT OR IGNORE INTO oauth_used_nonces (nonce, expires_at) VALUES (?, ?)",
+                    (clean_nonce, int(exp_ts)),
+                )
+            inserted = (cur.rowcount == 1)
+            conn.commit()
+            return inserted
+    except Exception:
+        return True
+
+
 def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str = "Pria", bb: float = 65.0, tb: float = 170.0, age: int = 25, target_kcal: float = 2000.0, focus_goal: str = "Diet Sehat", timezone_offset: int = DEFAULT_TIMEZONE_OFFSET):
-    """Mendaftarkan akun baru dengan verifikasi PIN/Password aman PBKDF2 dan profil tubuh pribadi."""
+    """Mendaftarkan akun baru secara aman (memblokir registrasi publik ID Admin/sistem)."""
     clean_id = (user_id or "").strip().lower()
-    if is_guest_user_id(clean_id):
-        return False, "ID Pengguna / Email tidak valid atau kosong."
+    if is_guest_user_id(clean_id) or len(clean_id) > 120:
+        return False, "ID Pengguna / Email tidak valid atau terlalu panjang."
+    if is_admin_user(clean_id) or clean_id in RESERVED_PUBLIC_REGISTRATION_IDS:
+        return False, "ID ini dicadangkan oleh sistem dan tidak dapat didaftarkan secara publik."
     if not pin_or_pass or len(pin_or_pass.strip()) < 4:
         return False, "PIN / Password minimal 4 karakter agar akun Anda aman."
     ok_dname, dname_or_err = validate_display_name(display_name or "")
@@ -1000,17 +1129,15 @@ def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str
             return False, "ID Pengguna / Email ini sudah terdaftar. Silakan login."
 
         p_hash = hash_password(pin_or_pass)
-        is_admin = is_admin_user(clean_id)
-        initial_tier = "pro" if is_admin else ("beta" if OPEN_BETA_MODE else "free")
-        initial_expiry = "2099-12-31 23:59:59" if is_admin else None
+        initial_tier = "beta" if OPEN_BETA_MODE else "free"
         local_now = get_local_now(timezone_offset)
         now_str = local_now.strftime("%Y-%m-%d %H:%M:%S")
 
         cur.execute(
             """
             INSERT INTO users
-            (user_id, display_name, password_hash, auth_provider, daily_calorie_target, gender, weight_kg, height_cm, age_years, subscription_tier, pro_until, timezone_offset, focus_goal, created_at)
-            VALUES (?, ?, ?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (user_id, display_name, password_hash, auth_provider, daily_calorie_target, gender, weight_kg, height_cm, age_years, subscription_tier, pro_until, timezone_offset, focus_goal, session_version, created_at)
+            VALUES (?, ?, ?, 'local', ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1, ?)
             """,
             (
                 clean_id,
@@ -1022,7 +1149,6 @@ def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str
                 float(tb),
                 int(age),
                 initial_tier,
-                initial_expiry,
                 int(timezone_offset),
                 focus_goal,
                 now_str,
@@ -1048,33 +1174,116 @@ def register_user(user_id: str, display_name: str, pin_or_pass: str, gender: str
 
 
 def authenticate_user(user_id: str, pin_or_pass: str):
-    """Memverifikasi login pengguna dengan ID dan PIN/Password (otomatis upgrade hash lama ke PBKDF2)."""
+    """Memverifikasi login dengan proteksi rate-limit/lockout & pesan kesalahan seragam."""
     clean_id = (user_id or "").strip().lower()
     if is_guest_user_id(clean_id):
         return False, "Ketikkan ID Pengguna / Email Anda."
     if not (pin_or_pass or "").strip():
         return False, "PIN / Password wajib diisi."
 
+    unified_err = "ID atau PIN / Password salah. Silakan periksa kembali."
+    now_dt = get_local_now(DEFAULT_TIMEZONE_OFFSET)
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
     with _db_session() as (conn, cur):
         user = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (clean_id,)).fetchone()
         if not user:
-            return False, "Akun tidak ditemukan. Silakan klik 'Daftar Akun Baru'."
+            return False, unified_err
 
         u_dict = dict(user)
+        locked_until = str(u_dict.get("locked_until") or "").strip()
+        if locked_until and locked_until[:19] > now_str:
+            return False, f"Terlalu banyak percobaan login gagal. Akun dikunci sementara hingga {locked_until[:16]} WITA."
+
         saved_hash = u_dict.get("password_hash")
         if not saved_hash:
-            return False, "Akun ini terhubung lewat Google/WhatsApp dan belum memakai PIN lokal. Gunakan Masuk Google atau daftar akun ber-PIN."
+            return False, "Akun ini terhubung lewat Google/WhatsApp dan tidak memakai PIN lokal. Gunakan Masuk dengan Google."
 
         valid, needs_upgrade = _verify_password(pin_or_pass, saved_hash)
         if not valid:
-            return False, "PIN / Password salah! Silakan periksa kembali."
+            attempts = int(u_dict.get("failed_login_attempts") or 0) + 1
+            if attempts >= LOGIN_MAX_FAILED_ATTEMPTS:
+                lock_ts = (now_dt + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    "UPDATE users SET failed_login_attempts = ?, locked_until = ? WHERE id = ?",
+                    (attempts, lock_ts, u_dict["id"]),
+                )
+                conn.commit()
+                return False, f"Terlalu banyak percobaan PIN salah. Akun dikunci sementara selama {LOGIN_LOCKOUT_MINUTES} menit."
+            cur.execute("UPDATE users SET failed_login_attempts = ? WHERE id = ?", (attempts, u_dict["id"]))
+            conn.commit()
+            return False, unified_err
+
+        updates = []
+        params = []
         if needs_upgrade:
             new_hash = hash_password(pin_or_pass)
-            cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, u_dict["id"]))
-            conn.commit()
+            updates.append("password_hash = ?")
+            params.append(new_hash)
             u_dict["password_hash"] = new_hash
+        if int(u_dict.get("failed_login_attempts") or 0) > 0 or locked_until:
+            updates.append("failed_login_attempts = 0")
+            updates.append("locked_until = NULL")
+            u_dict["failed_login_attempts"] = 0
+            u_dict["locked_until"] = None
+        if updates:
+            params.append(u_dict["id"])
+            cur.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", tuple(params))
+            conn.commit()
 
         return True, u_dict
+
+
+def claim_verified_google_account(email: str, display_name: str = "") -> dict:
+    """Mengambil/membuat akun dari Google OAuth terverifikasi sambil membersihkan PIN lokal tak terverifikasi (anti pre-ATO)."""
+    clean_email = _normalize_user_id(email)
+    if is_guest_user_id(clean_email):
+        raise ValueError("Email Google tidak valid.")
+    now_str = get_local_now(DEFAULT_TIMEZONE_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
+    is_admin = is_admin_user(clean_email)
+    with _db_session() as (conn, cur):
+        row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (clean_email,)).fetchone()
+        if not row:
+            name = display_name or clean_email.split("@")[0].capitalize()
+            initial_tier = "pro" if is_admin else ("beta" if OPEN_BETA_MODE else "free")
+            initial_expiry = "2099-12-31 23:59:59" if is_admin else None
+            cur.execute(
+                """
+                INSERT INTO users
+                (user_id, display_name, password_hash, auth_provider, daily_calorie_target, subscription_tier, pro_until, timezone_offset, focus_goal, session_version, created_at)
+                VALUES (?, ?, NULL, 'google', 2000.0, ?, ?, ?, 'Diet Sehat', 1, ?)
+                """,
+                (clean_email, name, initial_tier, initial_expiry, DEFAULT_TIMEZONE_OFFSET, now_str),
+            )
+            conn.commit()
+            row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? ORDER BY id ASC LIMIT 1", (clean_email,)).fetchone()
+        else:
+            existing = dict(row)
+            needs_takeover_reset = (existing.get("auth_provider") != "google") or bool(existing.get("password_hash"))
+            if needs_takeover_reset:
+                # Cabut PIN & seluruh sesi lokal yang mungkin dibuat sebelum klaim Google OAuth sah
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET password_hash = NULL,
+                        auth_provider = 'google',
+                        failed_login_attempts = 0,
+                        locked_until = NULL,
+                        session_version = COALESCE(session_version, 1) + 1
+                    WHERE id = ?
+                    """,
+                    (existing["id"],),
+                )
+                if display_name and (not existing.get("display_name") or existing.get("display_name") == clean_email.split("@")[0].capitalize()):
+                    cur.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, existing["id"]))
+            if is_admin and existing.get("subscription_tier") != "pro":
+                cur.execute(
+                    "UPDATE users SET subscription_tier = 'pro', pro_until = '2099-12-31 23:59:59' WHERE id = ?",
+                    (existing["id"],),
+                )
+            conn.commit()
+            row = cur.execute("SELECT * FROM users WHERE id = ?", (existing["id"],)).fetchone()
+        return dict(row)
 
 
 def _normalize_user_id(user_id: str) -> str:
@@ -1310,7 +1519,7 @@ def update_user_body_profile(
 
 
 def change_user_password(user_id: str, current_pin: str, new_pin: str) -> tuple[bool, str]:
-    """Mengganti PIN/Password akun lokal (atau menetapkan PIN awal untuk akun Google/WA)."""
+    """Mengganti PIN/Password akun lokal dan merevokasi semua token sesi lama lewat session_version."""
     clean_id = (user_id or "").strip().lower()
     if is_guest_user_id(clean_id):
         return False, "Akun tamu tidak memiliki PIN. Buat akun terlebih dahulu."
@@ -1319,18 +1528,30 @@ def change_user_password(user_id: str, current_pin: str, new_pin: str) -> tuple[
         return False, "PIN atau password baru minimal 4 karakter."
 
     with _db_session() as (conn, cur):
-        row = cur.execute("SELECT id, password_hash FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_id,)).fetchone()
+        row = cur.execute("SELECT id, password_hash, auth_provider FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_id,)).fetchone()
         if not row:
             return False, "Akun tidak ditemukan."
         saved_hash = row["password_hash"]
+        if row["auth_provider"] == "google" and not saved_hash:
+            return False, "Akun Google menggunakan autentikasi Google OAuth dan tidak memerlukan PIN lokal."
         if saved_hash:
             valid, _ = _verify_password(current_pin, saved_hash)
             if not valid:
                 return False, "PIN / Password saat ini tidak cocok."
         new_hash = hash_password(clean_new)
-        cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, row["id"]))
+        cur.execute(
+            """
+            UPDATE users
+            SET password_hash = ?,
+                failed_login_attempts = 0,
+                locked_until = NULL,
+                session_version = COALESCE(session_version, 1) + 1
+            WHERE id = ?
+            """,
+            (new_hash, row["id"]),
+        )
         conn.commit()
-    return True, "PIN / Password berhasil diperbarui."
+    return True, "PIN / Password berhasil diperbarui dan sesi perangkat lain dicabut."
 
 
 def log_weight_entry(user_id: str, weight_kg: float, note: str = "", tz_offset: int = DEFAULT_TIMEZONE_OFFSET, recorded_date: str = None):
@@ -1541,6 +1762,88 @@ def record_scan_usage(user_id: str, tz_offset: int = None):
         conn.commit()
 
 
+def _compute_coach_quota_from_row(user_row, user_id: str, tz_offset: int = None) -> dict:
+    u_dict = dict(user_row) if user_row else {}
+    effective_tz = tz_offset if tz_offset is not None else (
+        u_dict["timezone_offset"] if u_dict.get("timezone_offset") is not None else DEFAULT_TIMEZONE_OFFSET
+    )
+    today_str = get_local_now(effective_tz).strftime("%Y-%m-%d")
+    scan_st = _compute_scan_status_from_row(user_row, user_id, tz_offset=effective_tz)
+    is_unlimited = bool(is_admin_user(user_id) or scan_st["is_pro"])
+    limit = 999 if is_unlimited else (3 if is_guest_user_id(user_id) else 10)
+    used = int(u_dict.get("daily_coach_count") or 0) if u_dict.get("last_coach_date") == today_str else 0
+    remaining = 999 if is_unlimited else max(0, limit - used)
+    return {
+        "used": used,
+        "limit": limit,
+        "remaining": remaining,
+        "can_ask": True if is_unlimited else (used < limit),
+        "is_unlimited": is_unlimited,
+        "today_str": today_str,
+    }
+
+
+def get_coach_quota_status(user_id: str, tz_offset: int = None) -> dict:
+    """Membaca sisa kuota konsultasi Tanya Gizi AI hari ini secara permanen dari DB (tahan refresh/tab baru)."""
+    clean_uid = _normalize_user_id(user_id)
+    with _db_session() as (conn, cur):
+        row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_uid,)).fetchone()
+    return _compute_coach_quota_from_row(row, clean_uid, tz_offset=tz_offset)
+
+
+def consume_coach_quota(user_id: str, tz_offset: int = None) -> tuple[bool, dict]:
+    """Memeriksa & mengurangi 1 kuota harian Tanya Gizi AI secara persisten di database."""
+    clean_uid = _normalize_user_id(user_id)
+    with _db_session() as (conn, cur):
+        row = cur.execute("SELECT * FROM users WHERE LOWER(user_id) = ? LIMIT 1", (clean_uid,)).fetchone()
+        st_q = _compute_coach_quota_from_row(row, clean_uid, tz_offset=tz_offset)
+        if not st_q["can_ask"]:
+            return False, st_q
+        if row and not st_q["is_unlimited"]:
+            new_used = st_q["used"] + 1
+            cur.execute(
+                "UPDATE users SET daily_coach_count = ?, last_coach_date = ? WHERE id = ?",
+                (new_used, st_q["today_str"], row["id"]),
+            )
+            conn.commit()
+            st_q["used"] = new_used
+            st_q["remaining"] = max(0, st_q["limit"] - new_used)
+            st_q["can_ask"] = new_used < st_q["limit"]
+        return True, st_q
+
+
+def consume_unclear_retry_or_scan_quota(user_id: str, tz_offset: int = None, max_free_retries: int = 2) -> dict:
+    """Mencatat retry foto buram secara persisten di DB dan memotong kuota scan setelah melampaui batas gratis."""
+    clean_uid = _normalize_user_id(user_id)
+    with _db_session() as (conn, cur):
+        row = cur.execute(
+            "SELECT id, timezone_offset, last_unclear_date, daily_unclear_count, last_scan_date, daily_scans_count FROM users WHERE LOWER(user_id) = ? LIMIT 1",
+            (clean_uid,),
+        ).fetchone()
+        if not row:
+            return {"unclear_today": 0, "scan_consumed": False}
+        eff_tz = tz_offset if tz_offset is not None else (
+            row["timezone_offset"] if row["timezone_offset"] is not None else DEFAULT_TIMEZONE_OFFSET
+        )
+        today_str = get_local_now(eff_tz).strftime("%Y-%m-%d")
+        prev_unc = int(row["daily_unclear_count"] or 0) if row["last_unclear_date"] == today_str else 0
+        new_unc = prev_unc + 1
+        scan_consumed = new_unc > max(0, int(max_free_retries))
+        if scan_consumed:
+            prev_sc = int(row["daily_scans_count"] or 0) if row["last_scan_date"] == today_str else 0
+            cur.execute(
+                "UPDATE users SET daily_unclear_count = ?, last_unclear_date = ?, daily_scans_count = ?, last_scan_date = ? WHERE id = ?",
+                (new_unc, today_str, prev_sc + 1, today_str, row["id"]),
+            )
+        else:
+            cur.execute(
+                "UPDATE users SET daily_unclear_count = ?, last_unclear_date = ? WHERE id = ?",
+                (new_unc, today_str, row["id"]),
+            )
+        conn.commit()
+    return {"unclear_today": new_unc, "scan_consumed": scan_consumed}
+
+
 def _compute_stacked_pro_expiry(cur, clean_uid: str, days: int) -> str:
     """Menghitung tanggal kedaluwarsa Pro baru secara stacking (menambah sisa hari aktif jika belum habis)."""
     safe_days = max(1, min(1095, int(days or 30)))
@@ -1620,7 +1923,7 @@ def mark_payment_order_paid(
     external_ref: str = "",
     expected_amount: int | None = None,
 ) -> tuple[bool, dict | str]:
-    """Menandai pesanan lunas secara idempoten + mengaktifkan/memperpanjang Paket Pro dalam 1 transaksi atomik."""
+    """Menandai pesanan lunas secara atomik & idempoten sebelum mengaktifkan Paket Pro."""
     oid = str(order_id or "").strip()
     if not oid:
         return False, "Nomor order tidak boleh kosong."
@@ -1633,19 +1936,24 @@ def mark_payment_order_paid(
         if expected_amount is not None and int(order["amount_idr"]) > 0 and int(expected_amount) < int(order["amount_idr"]):
             return False, f"Nominal pembayaran tidak sesuai (diterima Rp{int(expected_amount):,}, tagihan Rp{int(order['amount_idr']):,})."
         if order["status"] == "paid":
-            # Idempoten: webhook berulang tidak menggandakan masa aktif
             return True, order
+
+        ref_val = str(external_ref or order.get("external_ref") or "").strip()[:120]
+        cur.execute(
+            "UPDATE payment_orders SET status = 'paid', external_ref = ?, paid_at = ? WHERE order_id = ? AND status != 'paid'",
+            (ref_val, now_str, oid),
+        )
+        if cur.rowcount != 1:
+            # Transaksi paralel sudah lebih dulu menandai lunas -> idempoten, jangan tambah hari Pro lagi
+            conn.rollback()
+            upd_existing = cur.execute("SELECT * FROM payment_orders WHERE order_id = ?", (oid,)).fetchone()
+            return True, (dict(upd_existing) if upd_existing else order)
 
         clean_uid = _normalize_user_id(order["user_id"])
         expiry = _compute_stacked_pro_expiry(cur, clean_uid, int(order["days"]))
         cur.execute(
             "UPDATE users SET subscription_tier = 'pro', pro_until = ? WHERE LOWER(user_id) = ?",
             (expiry, clean_uid),
-        )
-        ref_val = str(external_ref or order.get("external_ref") or "").strip()[:120]
-        cur.execute(
-            "UPDATE payment_orders SET status = 'paid', external_ref = ?, paid_at = ? WHERE order_id = ?",
-            (ref_val, now_str, oid),
         )
         conn.commit()
         upd = cur.execute("SELECT * FROM payment_orders WHERE order_id = ?", (oid,)).fetchone()
@@ -1707,27 +2015,67 @@ def create_pro_voucher(
     return dict(row)
 
 
+def _check_and_record_voucher_fail(clean_uid: str, record_failure: bool = False) -> bool:
+    """Membatasi percobaan tebak kode voucher (maks 5 gagal per 15 menit per akun)."""
+    now_mono = time.monotonic()
+    window = VOUCHER_LOCKOUT_MINUTES * 60.0
+    with _VOUCHER_FAIL_LOCK:
+        bucket = [ts for ts in _VOUCHER_FAIL_BUCKETS.get(clean_uid, []) if (now_mono - ts) < window]
+        if record_failure:
+            bucket.append(now_mono)
+        if bucket:
+            _VOUCHER_FAIL_BUCKETS[clean_uid] = bucket
+        else:
+            _VOUCHER_FAIL_BUCKETS.pop(clean_uid, None)
+        return len(bucket) >= VOUCHER_MAX_FAILED_ATTEMPTS
+
+
 def redeem_pro_voucher(user_id: str, raw_code: str) -> tuple[bool, dict | str]:
-    """Menukarkan kode aktivasi/voucher Pro secara atomik dengan proteksi anti-ganda."""
+    """Menukarkan kode aktivasi/voucher Pro secara relasional & atomik (tahan TOCTOU & bebas batas 500 char)."""
     clean_uid = _normalize_user_id(user_id)
     if is_guest_user_id(clean_uid):
         return False, "Buat akun gratis atau masuk terlebih dahulu agar masa aktif Pro tersimpan di akun Anda."
+    if _check_and_record_voucher_fail(clean_uid, record_failure=False):
+        return False, f"Terlalu banyak percobaan kode voucher gagal. Coba lagi dalam {VOUCHER_LOCKOUT_MINUTES} menit."
+
     code = str(raw_code or "").strip().upper()
     if len(code) < 5:
+        _check_and_record_voucher_fail(clean_uid, record_failure=True)
         return False, "Masukkan kode aktivasi Pro yang valid."
+
     now_dt = get_local_now(DEFAULT_TIMEZONE_OFFSET)
     now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
     with _db_session() as (conn, cur):
         row = cur.execute("SELECT * FROM pro_vouchers WHERE UPPER(code) = ?", (code,)).fetchone()
         if not row:
+            _check_and_record_voucher_fail(clean_uid, record_failure=True)
             return False, "Kode aktivasi tidak ditemukan. Periksa kembali huruf dan tanda hubungnya."
+
         v = dict(row)
-        used = int(v.get("used_count") or 0)
-        max_u = int(v.get("max_uses") or 1)
-        prev_users = [u.strip().lower() for u in str(v.get("redeemed_by") or "").split(",") if u.strip()]
-        if clean_uid in prev_users:
+        # Cek riwayat penukaran baik dari tabel relasional voucher_redemptions maupun kolom legacy CSV
+        already_rel = cur.execute(
+            "SELECT id FROM voucher_redemptions WHERE voucher_id = ? AND LOWER(user_id) = ? LIMIT 1",
+            (v["id"], clean_uid),
+        ).fetchone()
+        legacy_users = [u.strip().lower() for u in str(v.get("redeemed_by") or "").split(",") if u.strip()]
+        if already_rel or clean_uid in legacy_users:
             return False, "Kode aktivasi ini sudah pernah Anda gunakan."
-        if used >= max_u:
+
+        try:
+            cur.execute(
+                "INSERT INTO voucher_redemptions (voucher_id, user_id, redeemed_at) VALUES (?, ?, ?)",
+                (v["id"], clean_uid, now_str),
+            )
+        except Exception:
+            conn.rollback()
+            return False, "Kode aktivasi ini sudah pernah Anda gunakan."
+
+        cur.execute(
+            "UPDATE pro_vouchers SET used_count = COALESCE(used_count, 0) + 1, redeemed_at = ? WHERE id = ? AND COALESCE(used_count, 0) < max_uses",
+            (now_str, v["id"]),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
             return False, "Kuota pemakaian kode aktivasi ini sudah habis."
 
         days = int(v["days"])
@@ -1735,11 +2083,6 @@ def redeem_pro_voucher(user_id: str, raw_code: str) -> tuple[bool, dict | str]:
         cur.execute(
             "UPDATE users SET subscription_tier = 'pro', pro_until = ? WHERE LOWER(user_id) = ?",
             (expiry, clean_uid),
-        )
-        prev_users.append(clean_uid)
-        cur.execute(
-            "UPDATE pro_vouchers SET used_count = ?, redeemed_by = ?, redeemed_at = ? WHERE id = ?",
-            (used + 1, ",".join(prev_users)[:500], now_str, v["id"]),
         )
         audit_oid = f"NC-VCH-{now_dt.strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
         cur.execute(
@@ -1751,6 +2094,8 @@ def redeem_pro_voucher(user_id: str, raw_code: str) -> tuple[bool, dict | str]:
             (audit_oid, clean_uid, v.get("plan_code") or "PRO_30D", days, code, now_str, now_str),
         )
         conn.commit()
+    with _VOUCHER_FAIL_LOCK:
+        _VOUCHER_FAIL_BUCKETS.pop(clean_uid, None)
     return True, {"code": code, "days": days, "pro_until": expiry, "order_id": audit_oid}
 
 

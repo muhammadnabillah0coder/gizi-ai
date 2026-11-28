@@ -24,9 +24,9 @@ except Exception:
     st = None
 
 try:
-    from alert_manager import send_system_alert
+    from alert_manager import send_alert_to_phone
 except Exception:
-    send_system_alert = None
+    send_alert_to_phone = None
 
 
 PRO_PLANS: dict[str, dict] = {
@@ -314,7 +314,8 @@ def process_midtrans_notification(payload: dict, server_key: str = "") -> tuple[
     fraud_status = str(payload.get("fraud_status") or "accept").strip().lower()
     tx_id = str(payload.get("transaction_id") or "").strip()
 
-    if tx_status in {"settlement", "capture"} and fraud_status != "deny":
+    is_paid_tx = (tx_status == "settlement") or (tx_status == "capture" and fraud_status == "accept")
+    if is_paid_tx:
         try:
             paid_amt = int(round(float(gross_amount)))
         except (TypeError, ValueError):
@@ -322,19 +323,18 @@ def process_midtrans_notification(payload: dict, server_key: str = "") -> tuple[
         ok, res = db_history.mark_payment_order_paid(order_id, external_ref=tx_id, expected_amount=paid_amt)
         if not ok:
             return False, 400, str(res)
-        if callable(send_system_alert):
+        if callable(send_alert_to_phone) and res.get("pro_until"):
             try:
-                send_system_alert(
-                    "Pembayaran Pro Midtrans Lunas",
+                send_alert_to_phone(
                     f"Order {order_id} (Rp{paid_amt:,}) aktif untuk {res['user_id']} hingga {res.get('pro_until', '-')}.",
-                    level="INFO",
-                    dedupe_key=f"paid_{order_id}",
+                    context=f"Pro Midtrans Paid {order_id}",
+                    force=True,
                 )
             except Exception:
                 pass
         return True, 200, "Paket Pro berhasil diaktifkan."
 
-    return True, 200, f"Status transaksi {tx_status or 'unknown'} dicatat tanpa aktivasi."
+    return True, 200, f"Status transaksi {tx_status or 'unknown'} (fraud={fraud_status}) dicatat tanpa aktivasi."
 
 
 def verify_mayar_webhook_token(supplied_token: str, expected_token: str = "") -> bool:
@@ -383,26 +383,31 @@ def process_mayar_webhook(payload: dict, supplied_token: str, expected_token: st
         return False, 400, "Order ID Nutrisi Cerdas tidak ditemukan pada payload Mayar."
 
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    inner_status = str(data.get("status") or "").strip().lower()
+    if inner_status in {"failed", "expired", "unpaid", "cancelled", "canceled", "pending"}:
+        return True, 200, f"Status transaksi Mayar {inner_status} diabaikan tanpa aktivasi."
+
     raw_amt = data.get("amount") if data.get("amount") is not None else payload.get("amount")
-    exp_amt = None
-    if raw_amt is not None:
-        try:
-            exp_amt = int(round(float(raw_amt)))
-        except (TypeError, ValueError):
-            return False, 400, "Nominal Mayar tidak valid."
+    if raw_amt is None:
+        return False, 400, "Nominal pembayaran Mayar wajib disertakan."
+    try:
+        exp_amt = int(round(float(raw_amt)))
+    except (TypeError, ValueError):
+        return False, 400, "Nominal Mayar tidak valid."
+    if exp_amt <= 0:
+        return False, 400, "Nominal pembayaran Mayar harus lebih besar dari nol."
 
     ext_ref = str(data.get("transactionId") or data.get("id") or "")
     ok, res = db_history.mark_payment_order_paid(order_id, external_ref=ext_ref, expected_amount=exp_amt)
     if not ok:
         return False, 400, str(res)
 
-    if callable(send_system_alert):
+    if callable(send_alert_to_phone) and res.get("pro_until"):
         try:
-            send_system_alert(
-                "Pembayaran Pro Mayar Lunas",
-                f"Order {order_id} aktif untuk {res['user_id']} hingga {res.get('pro_until', '-')}.",
-                level="INFO",
-                dedupe_key=f"paid_{order_id}",
+            send_alert_to_phone(
+                f"Order {order_id} (Rp{exp_amt:,}) aktif untuk {res['user_id']} hingga {res.get('pro_until', '-')}.",
+                context=f"Pro Mayar Paid {order_id}",
+                force=True,
             )
         except Exception:
             pass
